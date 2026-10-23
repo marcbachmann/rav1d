@@ -1,7 +1,7 @@
 use std::ffi::{c_int, c_uint};
 use std::mem;
 use std::ops::{Deref, Range};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
@@ -270,6 +270,31 @@ pub(crate) struct TaskThreadData {
     pub delayed_fg_cond: Condvar,
     pub delayed_fg_progress: [AtomicI32; 2], /* [0]=started, [1]=completed */
     pub delayed_fg: RwLock<TaskThreadDataDelayedFg>,
+    /// Workers on the caller's threads that have not returned yet, each counted by a [`Helping`].
+    pub helpers: AtomicUsize,
+    /// Workers waiting on `cond` for a task.
+    pub parked: AtomicUsize,
+    /// Signaled when a worker on the caller's threads returns.
+    pub gone: Condvar,
+}
+
+/// Counts a worker on a caller's thread in [`TaskThreadData::helpers`] until it returns or unwinds,
+/// or the spawner drops it unrun.
+pub(crate) struct Helping(Arc<TaskThreadData>);
+
+impl Helping {
+    pub fn new(ttd: &Arc<TaskThreadData>) -> Self {
+        ttd.helpers.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(ttd))
+    }
+}
+
+impl Drop for Helping {
+    fn drop(&mut self) {
+        let _lock = self.0.lock.lock();
+        self.0.helpers.fetch_sub(1, Ordering::SeqCst);
+        self.0.gone.notify_all();
+    }
 }
 
 #[derive(Default)]
@@ -292,6 +317,12 @@ pub(crate) enum Rav1dContextTaskType {
     // mutability in rav1d_decode_frame_main where we need a mutable reference
     // to this task context along with an immutable reference to Rav1dContext.
     Single(Mutex<Box<Rav1dTaskContext>>),
+    /// Worker on a thread of the caller's [`Spawner`](crate::Spawner), which nobody joins: the
+    /// context counts it in [`TaskThreadData::helpers`] and closing waits until none is left.
+    Helper,
+    /// The calling thread, which works as a worker while it waits for a frame where the others
+    /// run on the caller's threads.
+    Caller(Mutex<Box<Rav1dTaskContext>>),
 }
 
 pub(crate) struct Rav1dContextTaskThread {
@@ -1086,6 +1117,8 @@ pub(crate) struct Rav1dTaskContextTaskThread {
     pub flushed: RelaxedAtomic<bool>,
     pub die: RelaxedAtomic<bool>,
     pub c: Mutex<Option<Arc<Rav1dContext>>>,
+    /// Signaled once `c` is set, or `die` before it is.
+    pub started: Condvar,
 }
 
 impl Rav1dTaskContextTaskThread {
@@ -1096,6 +1129,7 @@ impl Rav1dTaskContextTaskThread {
             flushed: Default::default(),
             die: Default::default(),
             c: Default::default(),
+            started: Default::default(),
         }
     }
 }

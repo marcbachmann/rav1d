@@ -4,6 +4,7 @@ use std::ops::{Add, AddAssign, Deref};
 use std::process::abort;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::{cmp, mem, thread};
 
 use atomig::{Atom, Atomic};
@@ -25,9 +26,9 @@ use crate::include::common::intops::iclip;
 use crate::include::dav1d::headers::Rav1dPixelLayout;
 use crate::include::dav1d::picture::Rav1dPicture;
 use crate::internal::{
-    Grain, Rav1dBitDepthDSPContext, Rav1dContext, Rav1dFrameContext, Rav1dFrameContextTaskThread,
-    Rav1dFrameData, Rav1dTask, Rav1dTaskContext, Rav1dTaskContextTaskThread, TaskThreadData,
-    TaskType,
+    Grain, Rav1dBitDepthDSPContext, Rav1dContext, Rav1dContextTaskType, Rav1dFrameContext,
+    Rav1dFrameContextTaskThread, Rav1dFrameData, Rav1dTask, Rav1dTaskContext,
+    Rav1dTaskContextTaskThread, TaskThreadData, TaskType,
 };
 use crate::iter::wrapping_iter;
 use crate::relaxed_atomic::RelaxedAtomic;
@@ -643,7 +644,7 @@ fn abort_frame(c: &Rav1dContext, fc: &Rav1dFrameContext, error: Rav1dResult) {
         progress[1].store(FRAME_ERROR, Ordering::SeqCst);
     }
     let _ = rav1d_decode_frame_exit(c, fc, error);
-    fc.task_thread.cond.notify_one();
+    frame_done(c, fc);
 }
 
 #[inline]
@@ -763,7 +764,57 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
     thread::park();
     let c = &*task_thread.c.lock().take().unwrap();
     let mut tc = Rav1dTaskContext::new(task_thread);
+    work(c, &mut tc, None);
+}
 
+/// A worker on a thread of the caller's [`Spawner`](crate::Spawner): it waits for its context,
+/// works until the context is closed and lets go of it before it returns.
+pub(crate) fn rav1d_helper_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
+    let c = {
+        let mut slot = task_thread.c.lock();
+        loop {
+            if let Some(c) = slot.take() {
+                break c;
+            }
+            if task_thread.die.get() {
+                return;
+            }
+            task_thread.started.wait(&mut slot);
+        }
+    };
+    let _flushed = Flushed(Arc::clone(&task_thread), true);
+    let mut tc = Rav1dTaskContext::new(task_thread);
+    work(&c, &mut tc, None);
+}
+
+/// The calling thread works on the tasks of `fc` and any other until that frame is decoded.
+pub(crate) fn rav1d_caller_task(c: &Rav1dContext, tc: &mut Rav1dTaskContext, fc: &Rav1dFrameContext) {
+    tc.task_thread.flushed.set(false);
+    let _flushed = Flushed(Arc::clone(&tc.task_thread), false);
+    work(c, tc, Some(fc));
+}
+
+/// Marks a worker that returns or unwinds flushed, so that a flush does not wait for it,
+/// telling a flush that waits where `notify`.
+struct Flushed(Arc<Rav1dTaskContextTaskThread>, bool);
+
+impl Drop for Flushed {
+    fn drop(&mut self) {
+        let _task_thread_lock = self.1.then(|| self.0.ttd.lock.lock());
+        self.0.flushed.set(true);
+        self.0.cond.notify_one();
+    }
+}
+
+/// Wakes the thread that waits for `fc`, and a caller that works while it waits.
+fn frame_done(c: &Rav1dContext, fc: &Rav1dFrameContext) {
+    fc.task_thread.cond.notify_one();
+    if matches!(c.tc.last().map(|tc| &tc.task), Some(Rav1dContextTaskType::Caller(_))) {
+        c.task_thread.cond.notify_all();
+    }
+}
+
+fn work(c: &Rav1dContext, tc: &mut Rav1dTaskContext, until: Option<&Rav1dFrameContext>) {
     // We clone the Arc here for the lifetime of this function to avoid an
     // immutable borrow of tc across the call to park
     let ttd_clone = Arc::clone(&tc.task_thread.ttd);
@@ -774,20 +825,44 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
         tc: &mut Rav1dTaskContext,
         ttd: &TaskThreadData,
         task_thread_lock: &mut MutexGuard<'ttd, ()>,
+        caller: bool,
     ) {
+        // A frame is decoded only by threads that run: with every worker of the caller's waiting
+        // and the caller itself finding no task, none would ever wake.
+        assert!(
+            !caller || ttd.helpers.load(Ordering::SeqCst) > ttd.parked.load(Ordering::SeqCst),
+            "rav1d: the caller waits for a frame and no worker runs ({} workers, {} waiting)",
+            ttd.helpers.load(Ordering::SeqCst),
+            ttd.parked.load(Ordering::SeqCst)
+        );
         tc.task_thread.flushed.set(true);
         tc.task_thread.cond.notify_one();
         // we want to be woken up next time progress is signaled
         ttd.cond_signaled.store(0, Ordering::SeqCst);
-        ttd.cond.wait(task_thread_lock);
+        // The caller looks again now and then: a frame that ends with nobody to tell it still ends.
+        if caller {
+            ttd.cond.wait_for(task_thread_lock, Duration::from_millis(100));
+        } else {
+            ttd.parked.fetch_add(1, Ordering::SeqCst);
+            ttd.cond.wait(task_thread_lock);
+            ttd.parked.fetch_sub(1, Ordering::SeqCst);
+        }
         tc.task_thread.flushed.set(false);
         reset_task_cur(c, ttd, u32::MAX);
     }
 
+    let caller = until.is_some();
     let mut task_thread_lock = Some(ttd.lock.lock());
     'outer: while !tc.task_thread.die.get() {
+        if let Some(fc) = until {
+            if fc.task_thread.done[0].load(Ordering::SeqCst) != 0
+                && fc.task_thread.task_counter.load(Ordering::SeqCst) <= 0
+            {
+                break 'outer;
+            }
+        }
         if c.flush.load(Ordering::SeqCst) {
-            park(c, &mut tc, ttd, task_thread_lock.as_mut().unwrap());
+            park(c, tc, ttd, task_thread_lock.as_mut().unwrap(), caller);
             continue 'outer;
         }
 
@@ -952,7 +1027,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
             if merge_pending(c) != 0 {
                 continue 'outer;
             }
-            park(c, &mut tc, ttd, task_thread_lock.as_mut().unwrap());
+            park(c, tc, ttd, task_thread_lock.as_mut().unwrap(), caller);
             continue 'outer;
         };
         // found:
@@ -1072,7 +1147,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                                             fc,
                                             Err(Rav1dError::OutOfMemory),
                                         );
-                                        fc.task_thread.cond.notify_one();
+                                        frame_done(c, fc);
                                     } else {
                                         drop(
                                             task_thread_lock
@@ -1108,7 +1183,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                             1 as c_int + (t.type_0 == TaskType::TileReconstruction) as c_int
                         };
                         if error_0 == 0 {
-                            error_0 = match rav1d_decode_tile_sbrow(c, &mut tc, &f) {
+                            error_0 = match rav1d_decode_tile_sbrow(c, tc, &f) {
                                 Ok(()) => 0,
                                 Err(()) => 1,
                             };
@@ -1182,7 +1257,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                                         Ok(())
                                     },
                                 );
-                                fc.task_thread.cond.notify_one();
+                                frame_done(c, fc);
                             }
                             if !(fc.task_thread.task_counter.load(Ordering::SeqCst) >= 0) {
                                 unreachable!();
@@ -1197,7 +1272,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                         {
                             let f = fc.data.try_read().unwrap();
                             if fc.task_thread.error.load(Ordering::SeqCst) == 0 {
-                                (f.bd_fn().filter_sbrow_deblock_cols)(c, &f, &mut tc, sby);
+                                (f.bd_fn().filter_sbrow_deblock_cols)(c, &f, tc, sby);
                             }
                         }
                         if ensure_progress(
@@ -1217,7 +1292,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                     TaskType::DeblockRows => {
                         let f = fc.data.try_read().unwrap();
                         if fc.task_thread.error.load(Ordering::SeqCst) == 0 {
-                            (f.bd_fn().filter_sbrow_deblock_rows)(c, &f, &mut tc, sby);
+                            (f.bd_fn().filter_sbrow_deblock_rows)(c, &f, tc, sby);
                         }
                         // signal deblock progress
                         let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
@@ -1265,7 +1340,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                         let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
                         if seq_hdr.cdef != 0 {
                             if fc.task_thread.error.load(Ordering::SeqCst) == 0 {
-                                (f.bd_fn().filter_sbrow_cdef)(c, &f, &mut tc, sby);
+                                (f.bd_fn().filter_sbrow_cdef)(c, &f, tc, sby);
                             }
                             drop(f);
                             reset_task_cur_async(ttd, t.frame_idx, c.fc.len() as u32);
@@ -1281,7 +1356,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                         let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
                         if frame_hdr.size.width[0] != frame_hdr.size.width[1] {
                             if fc.task_thread.error.load(Ordering::SeqCst) == 0 {
-                                (f.bd_fn().filter_sbrow_resize)(c, &f, &mut tc, sby);
+                                (f.bd_fn().filter_sbrow_resize)(c, &f, tc, sby);
                             }
                         }
                         task_type = TaskType::LoopRestoration;
@@ -1292,7 +1367,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                         if fc.task_thread.error.load(Ordering::SeqCst) == 0
                             && !f.lf.restore_planes.is_empty()
                         {
-                            (f.bd_fn().filter_sbrow_lr)(c, &f, &mut tc, sby);
+                            (f.bd_fn().filter_sbrow_lr)(c, &f, tc, sby);
                         }
                         task_type = TaskType::ReconstructionProgress;
                         continue 'fallthrough;
@@ -1357,7 +1432,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                             Ok(())
                         },
                     );
-                    fc.task_thread.cond.notify_one();
+                    frame_done(c, fc);
                 }
                 reset_task_cur(c, ttd, t.frame_idx);
                 continue 'outer;
@@ -1412,7 +1487,7 @@ pub fn rav1d_worker_task(task_thread: Arc<Rav1dTaskContextTaskThread>) {
                         Ok(())
                     },
                 );
-                fc.task_thread.cond.notify_one();
+                frame_done(c, fc);
             }
             reset_task_cur(c, ttd, t.frame_idx);
 

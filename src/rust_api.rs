@@ -156,7 +156,7 @@ pub struct Decoder {
 impl Decoder {
     /// Creates a new [`Decoder`] instance with given [`Settings`].
     pub fn with_settings(settings: &Settings) -> Result<Self, Rav1dError> {
-        rav1d_open(&settings.inner).map(|ctx| Decoder {
+        rav1d_open(&settings.inner, None).map(|ctx| Decoder {
             ctx,
             pending_data: None,
             n_threads: settings.inner.n_threads,

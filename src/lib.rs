@@ -179,16 +179,18 @@ use crate::include::dav1d::dav1d::{
 use crate::include::dav1d::headers::{Dav1dSequenceHeader, Rav1dFilmGrainData};
 use crate::include::dav1d::picture::{Dav1dPicture, Rav1dPicture};
 use crate::internal::{
-    Rav1dBitDepthDSPContext, Rav1dContext, Rav1dContextFrameThread, Rav1dContextTaskThread,
-    Rav1dContextTaskType, Rav1dFrameContext, Rav1dState, Rav1dTaskContext,
-    Rav1dTaskContextTaskThread, TaskThreadData,
+    Helping, Rav1dBitDepthDSPContext, Rav1dContext, Rav1dContextFrameThread,
+    Rav1dContextTaskThread, Rav1dContextTaskType, Rav1dFrameContext, Rav1dState,
+    Rav1dTaskContext, Rav1dTaskContextTaskThread, TaskThreadData,
 };
 use crate::iter::wrapping_iter;
 use crate::log::{Rav1dLog as _, Rav1dLogger};
 use crate::obu::{rav1d_parse_obus, rav1d_parse_sequence_header};
 use crate::picture::{rav1d_picture_alloc_copy, PictureFlags};
 use crate::send_sync_non_null::SendSyncNonNull;
-use crate::thread_task::{rav1d_task_delayed_fg, rav1d_worker_task, FRAME_ERROR};
+use crate::thread_task::{
+    rav1d_helper_task, rav1d_task_delayed_fg, rav1d_worker_task, FRAME_ERROR,
+};
 
 #[cold]
 fn init_internal() {
@@ -306,8 +308,49 @@ pub unsafe extern "C" fn dav1d_get_frame_delay(s: Option<NonNull<Dav1dSettings>>
     .into()
 }
 
+/// Runs a worker on one of the caller's threads and says whether one took it. Work it does not
+/// take is dropped unrun.
+pub type Spawner = Arc<dyn Fn(Box<dyn FnOnce() + Send>) -> bool + Send + Sync>;
+
+/// Workers handed to `spawner`, up to `most`, until it takes no more: those it took.
+fn spawn_helpers(
+    spawner: &Spawner,
+    ttd: &Arc<TaskThreadData>,
+    most: u16,
+) -> Vec<Arc<Rav1dTaskContextTaskThread>> {
+    let mut taken = Vec::new();
+    for _ in 0..most {
+        let thread_data = Arc::new(Rav1dTaskContextTaskThread::new(Arc::clone(ttd)));
+        let (helping, theirs) = (Helping::new(ttd), Arc::clone(&thread_data));
+        if !spawner(Box::new(move || {
+            let _helping = helping;
+            rav1d_helper_task(theirs);
+        })) {
+            break;
+        }
+        taken.push(thread_data);
+    }
+    taken
+}
+
+/// Workers waiting for their context, told to return if it is never made.
+struct Starting(Vec<Arc<Rav1dTaskContextTaskThread>>);
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        for thread_data in &self.0 {
+            let _slot = thread_data.c.lock();
+            thread_data.die.set(true);
+            thread_data.started.notify_all();
+        }
+    }
+}
+
 #[cold]
-pub(crate) fn rav1d_open(s: &Rav1dSettings) -> Rav1dResult<Arc<Rav1dContext>> {
+pub(crate) fn rav1d_open(
+    s: &Rav1dSettings,
+    spawner: Option<&Spawner>,
+) -> Rav1dResult<Arc<Rav1dContext>> {
     static INITTED: Once = Once::new();
     INITTED.call_once(|| init_internal());
 
@@ -334,7 +377,10 @@ pub(crate) fn rav1d_open(s: &Rav1dSettings) -> Rav1dResult<Arc<Rav1dContext>> {
         frame_size_limit = s.frame_size_limit;
     }
 
-    let NumThreads { n_tc, n_fc } = get_num_threads(s);
+    let NumThreads { n_tc, mut n_fc } = get_num_threads(s);
+    if spawner.is_some() {
+        n_fc = 1;
+    }
 
     let ttd = TaskThreadData {
         cur: (n_fc as u32).into(),
@@ -343,6 +389,10 @@ pub(crate) fn rav1d_open(s: &Rav1dSettings) -> Rav1dResult<Arc<Rav1dContext>> {
     };
     // TODO fallible allocation
     let task_thread = Arc::new(ttd);
+    let mut starting = Starting(match spawner {
+        Some(spawner) if n_tc > 1 => spawn_helpers(spawner, &task_thread, n_tc - 1),
+        _ => Vec::new(),
+    });
 
     let fc = (0..n_fc)
         .map(|i| {
@@ -368,28 +418,50 @@ pub(crate) fn rav1d_open(s: &Rav1dSettings) -> Rav1dResult<Arc<Rav1dContext>> {
         ..Default::default()
     });
 
-    let tc = (0..n_tc)
-        .map(|n| {
-            let task_thread = Arc::clone(&task_thread);
-            let thread_data = Arc::new(Rav1dTaskContextTaskThread::new(task_thread));
-            let thread_data_copy = Arc::clone(&thread_data);
-            let task = if n_tc > 1 {
-                let handle = thread::Builder::new()
-                    // Don't set stack size like `dav1d` does.
-                    // See <https://github.com/memorysafety/rav1d/issues/889>.
-                    .name(format!("rav1d-worker-{n}"))
-                    .spawn(|| rav1d_worker_task(thread_data_copy))
-                    .unwrap();
-                Rav1dContextTaskType::Worker(handle)
-            } else {
-                Rav1dContextTaskType::Single(Mutex::new(Box::new(Rav1dTaskContext::new(
-                    thread_data_copy,
-                ))))
-            };
-            Rav1dContextTaskThread { task, thread_data }
-        })
-        // TODO fallible allocation
-        .collect();
+    let tc = if spawner.is_some() {
+        let caller = Arc::new(Rav1dTaskContextTaskThread::new(Arc::clone(&task_thread)));
+        caller.flushed.set(true);
+        let task = Mutex::new(Box::new(Rav1dTaskContext::new(Arc::clone(&caller))));
+        let caller = Rav1dContextTaskThread {
+            task: match starting.0.is_empty() {
+                true => Rav1dContextTaskType::Single(task),
+                false => Rav1dContextTaskType::Caller(task),
+            },
+            thread_data: caller,
+        };
+        starting
+            .0
+            .iter()
+            .map(|thread_data| Rav1dContextTaskThread {
+                task: Rav1dContextTaskType::Helper,
+                thread_data: Arc::clone(thread_data),
+            })
+            .chain([caller])
+            .collect()
+    } else {
+        (0..n_tc)
+            .map(|n| {
+                let task_thread = Arc::clone(&task_thread);
+                let thread_data = Arc::new(Rav1dTaskContextTaskThread::new(task_thread));
+                let thread_data_copy = Arc::clone(&thread_data);
+                let task = if n_tc > 1 {
+                    let handle = thread::Builder::new()
+                        // Don't set stack size like `dav1d` does.
+                        // See <https://github.com/memorysafety/rav1d/issues/889>.
+                        .name(format!("rav1d-worker-{n}"))
+                        .spawn(|| rav1d_worker_task(thread_data_copy))
+                        .unwrap();
+                    Rav1dContextTaskType::Worker(handle)
+                } else {
+                    Rav1dContextTaskType::Single(Mutex::new(Box::new(Rav1dTaskContext::new(
+                        thread_data_copy,
+                    ))))
+                };
+                Rav1dContextTaskThread { task, thread_data }
+            })
+            // TODO fallible allocation
+            .collect()
+    };
 
     let c = Rav1dContext {
         allocator: s.allocator.clone(),
@@ -428,6 +500,10 @@ pub(crate) fn rav1d_open(s: &Rav1dSettings) -> Rav1dResult<Arc<Rav1dContext>> {
             handle.thread().unpark();
         }
     }
+    for thread_data in mem::take(&mut starting.0) {
+        *thread_data.c.lock() = Some(Arc::clone(&c));
+        thread_data.started.notify_one();
+    }
 
     Ok(c)
 }
@@ -442,6 +518,37 @@ pub unsafe extern "C" fn dav1d_open(
     c_out: Option<NonNull<Option<Dav1dContext>>>,
     s: Option<NonNull<Dav1dSettings>>,
 ) -> Dav1dResult {
+    // SAFETY: as this function's.
+    unsafe { open(c_out, s, None) }
+}
+
+/// [`dav1d_open`] with the workers on threads of the caller's `spawner` instead of the
+/// decoder's own: of `n_threads - 1` workers, those it takes when asked, while the calling thread
+/// decodes as a worker too until its frame is done. Frames are decoded one at a time
+/// (`max_frame_delay` 1); with no worker taken it decodes alone. [`dav1d_close`] returns once
+/// every worker has returned and let go of the context, with it the data it was sent.
+///
+/// # Safety
+///
+/// As [`dav1d_open`].
+#[cold]
+pub unsafe fn dav1d_open_with_spawner(
+    c_out: Option<NonNull<Option<Dav1dContext>>>,
+    s: Option<NonNull<Dav1dSettings>>,
+    spawner: &Spawner,
+) -> Dav1dResult {
+    // SAFETY: as this function's.
+    unsafe { open(c_out, s, Some(spawner)) }
+}
+
+/// # Safety
+///
+/// As [`dav1d_open`].
+unsafe fn open(
+    c_out: Option<NonNull<Option<Dav1dContext>>>,
+    s: Option<NonNull<Dav1dSettings>>,
+    spawner: Option<&Spawner>,
+) -> Dav1dResult {
     (|| {
         let mut c_out = validate_input!(c_out.ok_or(Rav1dError::InvalidArgument))?;
         let s = validate_input!(s.ok_or(Rav1dError::InvalidArgument))?;
@@ -450,7 +557,7 @@ pub unsafe extern "C" fn dav1d_open(
         // SAFETY: `s` is safe to read from.
         let s = unsafe { s.as_ptr().read() };
         let s = s.try_into()?;
-        let c = rav1d_open(&s).inspect_err(|_| {
+        let c = rav1d_open(&s, spawner).inspect_err(|_| {
             *c_out = None;
         })?;
         *c_out = Some(RawArc::from_arc(c));
@@ -848,6 +955,11 @@ pub unsafe extern "C" fn dav1d_flush(c: Dav1dContext) {
 pub(crate) fn rav1d_close(c: &Rav1dContext) {
     rav1d_flush(c);
     c.tell_worker_threads_to_die();
+    let ttd = &*c.task_thread;
+    let mut task_thread_lock = ttd.lock.lock();
+    while ttd.helpers.load(Ordering::SeqCst) > 0 {
+        ttd.gone.wait(&mut task_thread_lock);
+    }
 }
 
 /// # Safety

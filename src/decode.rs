@@ -77,7 +77,7 @@ use crate::tables::{
     DAV1D_YMODE_SIZE_CONTEXT, INTERINTRA_ALLOWED_MASK, WEDGE_ALLOWED_MASK,
 };
 use crate::thread_task::{
-    rav1d_task_create_tile_sbrow, rav1d_task_frame_init, FRAME_ERROR, TILE_ERROR,
+    rav1d_caller_task, rav1d_task_create_tile_sbrow, rav1d_task_frame_init, FRAME_ERROR, TILE_ERROR,
 };
 use crate::warpmv::{rav1d_find_affine_int, rav1d_get_shear_params, rav1d_set_affine_mv2d};
 
@@ -4800,6 +4800,11 @@ pub(crate) fn rav1d_decode_frame(c: &Rav1dContext, fc: &Rav1dFrameContext) -> Ra
                 let mut task_thread_lock = (*fc.task_thread.ttd).lock.lock();
                 (*fc.task_thread.ttd).cond.notify_one();
                 if res.is_ok() {
+                    if let Some(Rav1dContextTaskType::Caller(tc)) = c.tc.last().map(|tc| &tc.task) {
+                        drop(task_thread_lock);
+                        rav1d_caller_task(c, &mut tc.lock(), fc);
+                        task_thread_lock = (*fc.task_thread.ttd).lock.lock();
+                    }
                     while fc.task_thread.done[0].load(Ordering::SeqCst) == 0
                         || fc.task_thread.task_counter.load(Ordering::SeqCst) > 0
                     {
