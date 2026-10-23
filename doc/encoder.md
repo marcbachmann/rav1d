@@ -10,7 +10,10 @@ image-processing (`src/engine/avif/aom.rs`). It must:
 - code at least the quality libaom codes, at the same size, on every image the AVIF gates
   cover, photos and graphics alike;
 - be much faster than libaom at the default effort, on one core first, then with helpers;
-- hold far less memory than libaom: today one grid tile costs 48 MB plus 48 bytes a pixel;
+- **keep memory low. This is a hard requirement, not a nice-to-have.** Today a libaom grid tile
+  costs 48 MB plus 48 bytes a pixel, and a picture coded as one frame costs about 47 bytes a
+  pixel: a 4000×3000 screenshot is about 600 MB. The encoder streams: what it holds grows with
+  the width of the image and the size of the output, not with its area (see [Memory](#memory));
 - build without cmake, libclang, llvm-tools or a C library. Only nasm stays, which rav1d's
   assembly already needs.
 
@@ -38,7 +41,7 @@ This is what image-processing asks of libaom today, and what the encoder takes o
 | Tuning | tune IQ | tune PSNR |
 | Speed | cpu-used `9 - effort`, effort 0–9, default 4 (cpu-used 5) | same |
 | Screen content | decided once for the whole image by `aom::Screen`, then forced on each grid tile | same |
-| Q100 | cq-level 0 = qindex 0 = coded lossless (WHT, no filters) | same |
+| Q100 | cq-level 0. Whether libaom codes that lossless under tune IQ (delta q may lift blocks off qindex 0) is checked in M0. The git history has no lossless AVIF path that was dropped | same |
 | Headers | still picture, reduced still-picture header, one key frame | same |
 
 Grid tiles are image-processing's business and stay there: photos are cut into grid tiles of at
@@ -132,27 +135,53 @@ src/enc/
   tokens.rs      compact store of each block's decisions and coefficients until the frame is written
 ```
 
-### Flow of one frame
+### Flow of one frame: a stream of superblock rows
+
+The encoder never holds the frame. It works on a window of superblock rows that moves down the
+image as rows arrive:
 
 1. **Rows in.** The caller pushes rows as they arrive. Image-processing never waits on a slow
-   client, so the encoder can start before the image is complete. Each 64-row band is analysed
-   (screen-content counts, 16×16 activity) as soon as it is complete.
-2. **Search per superblock**, in raster order (or as a wavefront, see Threads): partition, then
-   modes and transforms per block, with the reconstruction written into the frame as each block
-   is decided, so the next block predicts from exactly what the decoder will have. Decisions and
-   quantized coefficients go into `tokens`, compactly: only up to each block's eob.
-3. **Filter searches** once the frame is reconstructed: deblocking levels on the whole frame,
-   then CDEF strengths per 64×64, then loop restoration per unit. Each search measures its
-   candidates locally against the source; the filtered frame is only built where a later search
-   needs it. libaom's `SKIP_POSTPROC_FILTERING` already skips the final filtered output, and so
-   do we.
-4. **Write.** The frame header now has everything (q, delta q, filter levels, CDEF strength set,
+   client, so the encoder starts on the first 64 rows while the rest is still uploading.
+2. **Search per superblock row**, in raster order (or as a wavefront, see Threads): partition,
+   then modes and transforms per block, with the reconstruction written into the window as each
+   block is decided, so the next block predicts from exactly what the decoder will have. AV1
+   intra prediction reads unfiltered pixels, so the search never waits for a filter.
+   Decisions and quantized coefficients go into `tokens`, compactly (see Memory).
+3. **Filter statistics, one row behind.** Once the row below is reconstructed, the window holds
+   everything the filters of a row touch. For that row the encoder runs:
+   - deblocking at the row's level (a per-superblock level through `delta_lf`, or one level from
+     q; M4 measures both);
+   - for each 64×64, the SSE against the source of every CDEF strength candidate. These are
+     numbers, about 1 KB a 64×64;
+   - the Wiener and self-guided statistics of each loop restoration unit, measured after the
+     64×64's best CDEF strength.
+
+   Then the row's source and reconstruction leave the window.
+4. **Frame decisions from statistics.** At the end: the CDEF strength set (up to 8 pairs) and
+   each 64×64's index, from the stored SSEs; each LR unit's filter, from its statistics.
+5. **Write.** The frame header now has everything (q, delta q, filter levels, CDEF strength set,
    LR types). The tile data is written from `tokens` with adapting CDFs. Output: the OBUs and
    the `av1C` record.
 
 Writing at the end, rather than during the search, is needed because CDEF indexes and LR
 coefficients are coded inside the tile data but are chosen per frame. It also keeps the search
 free to try things without touching the writer's state.
+
+The cost of streaming is that loop restoration is measured after a 64×64's own best CDEF
+strength, which may not end up in the frame's set of 8. libaom searches the whole filtered frame
+instead. M4 measures this against a whole-frame search (a test mode that holds the frame), and
+only accepts streaming if it holds the gates.
+
+**No whole-image pre-pass.** libaom decides screen content per frame before coding, so today
+image-processing runs `aom::Screen` over the whole image first and keeps every row aside (on
+disk, or in memory when the temp dir is missing or full) until the grid tiles are coded. Here,
+`allow_screen_content_tools` is a header bit that only allows palette per block: the encoder
+turns it on, and each superblock decides from its own 16×16 counts whether to search palette.
+It is the same estimate, applied locally. On photos the per-block palette flag costs a few bits
+until its CDF adapts. The SSIM rate weighting of tune IQ is the other whole-image input today
+(the frame's mean activity, `aom::Balance`). It becomes a fixed reference, calibrated on the
+corpus, or a running mean. M5 measures which one holds the gates. Without a pre-pass,
+image-processing no longer keeps the rows aside.
 
 ### Rate and distortion
 
@@ -181,12 +210,31 @@ The speed comes from three things:
 
 ### Memory
 
-Target for 8-bit 4:4:4: under 10 bytes a pixel of the frame plus under 4 MB fixed, against
-libaom's 48 MB plus 48 bytes a pixel. The budget: source 3 B/px, reconstruction 3 B/px, mode
-info under 1 B/px, tokens (coefficients up to eob, typically well under 1 B/px at mid quality),
-and the filter search buffers per 64×64. The encoder reports what it will hold before it starts
-(`Encoder::memory(config)`), so image-processing can reserve it from the job's budget the way it
-does for libaom today (`frame_memory`, `context`).
+The encoder holds three things, and none of them grows with the image's area:
+
+| What | Size |
+|---|---|
+| The window: source, reconstruction and the deblocked/CDEF copies of about 2 superblock rows plus filter borders (~144 rows) | width × 144 × 3 planes × 4 copies: **1.7 KB a column**, 7 MB for a 4000 px wide image |
+| Above contexts: one row of 4×4 mode info, partition, skip, tx size, coefficient and palette contexts | a few hundred bytes a column |
+| `tokens`: each block's decisions and its coefficients up to eob, as variable-length bytes (most levels are 0–2) | **in proportion to the output**: about 2–3 times the coded size |
+| Filter statistics: CDEF SSE per 64×64 and candidate, LR statistics per unit | ~0.3 bytes a pixel |
+| Fixed: CDFs, cost tables, scratch for one 64×64 search | under 4 MB |
+
+For a 4000×3000 screenshot coded as one frame, that is about 15 MB plus 2–3 times its output size,
+against about 600 MB with libaom today. For a 1400 px grid tile, it is about 7 MB plus tokens,
+against 48 MB plus 94 MB. A lossless Q100 holds no more than a lossy one beyond its larger
+output: its tokens are bigger, its window is the same.
+
+The weak spot is the tokens at high quality on noise. Every coefficient is non-zero there, so
+the tokens come close to 1 byte per coefficient, about 3 bytes a pixel. If that is too much, the
+fallback is to fix the CDEF strength set and LR types from the first superblock rows. With those
+fixed in advance, the tile data can be written straight away as each row is decided, without
+storing tokens.
+
+The encoder reports the most it will hold before it starts (`Encoder::memory(config)`, from the
+width, the quality and the effort), so image-processing reserves it from the job's budget as it
+does for libaom today (`frame_memory`, `context`). Every bench reports peak memory next to time,
+and a change that raises the peak needs a reason.
 
 ### Threads
 
@@ -241,7 +289,8 @@ Measured on:
 - references: libaom 3.15.1 as configured in `aom.rs`, recorded once as numbers (dB, bytes,
   SSIMULACRA2, time, peak), not files.
 
-Q100 must reconstruct the YUV planes exactly.
+Q100 is held to what libaom does with cq-level 0 today, which M0 measures: whether it reconstructs
+the YUV planes exactly, and how big and how memory-hungry it is.
 
 ## Validation
 
@@ -271,16 +320,16 @@ step, with a running handoff file.
 
 | | What | Done when |
 |---|---|---|
-| M0 | Harness: corpus, libaom reference numbers, metric scripts. Exact tune-IQ and speed settings of 3.15.1 at cpu-used 0–9 written down. Ranking of libaom's tools on graphics (palette, filter-intra, intra edge, CfL, smooth, IDTX, 64-point transforms, QM), each turned off in turn | reference table committed; the ranking says which tools carry the graphics advantage |
-| M1 | Writer and frame skeleton: range encoder, headers, OBUs, `av1C`; every block DC_PRED at a fixed partition and transform; forward transform, quantization, coefficient coding; reconstruction in a rav1d picture | invariants 1–3 hold on the corpus; image-processing can show the output |
-| M2 | Lossless (qindex 0, WHT 4×4) | Q100 exact on the corpus; size compared with libaom's lossless |
+| M0 | Harness: corpus, libaom reference numbers (dB, bytes, SSIMULACRA2, time, **peak**), metric scripts. Exact tune-IQ and speed settings of 3.15.1 at cpu-used 0–9 written down. What libaom does at cq-level 0 (lossless or not, size, peak). Ranking of libaom's tools on graphics (palette, filter-intra, intra edge, CfL, smooth, IDTX, 64-point transforms, QM), each turned off in turn | reference table committed; the ranking says which tools carry the graphics advantage |
+| M1 | Writer and streaming skeleton: range encoder, headers, OBUs, `av1C`, the row window and `tokens`; every block DC_PRED at a fixed partition and transform; forward transform, quantization, coefficient coding; reconstruction in the window | invariants 1–3 hold on the corpus; peak memory independent of the height |
+| M2 | Lossless (qindex 0, WHT 4×4) | Q100 compared with M0's libaom numbers |
 | M3 | Full intra: all modes and angle deltas, filter-intra, CfL, partition RD search, transform size and type search, rate model from CDFs, trellis | photos within the gate at Q30–90, with no filters yet (libaom with filters off as the reference for this step) |
-| M4 | Filter searches: deblocking, CDEF, loop restoration | photos within the gate against libaom as configured today |
-| M5 | Tune IQ: QM, variance-boost delta q, chroma delta q, SSIM rate weighting; tune PSNR for alpha | photos within the gate including SSIMULACRA2; alpha within the gate |
-| M6 | Screen content: the estimate moves in from `aom::Screen`, palette search with the palette cache, screen-content transform choices | every graphics image within the gate |
+| M4 | Filter searches from per-row statistics: deblocking, CDEF, loop restoration; a whole-frame test mode to compare against | photos within the gate against libaom as configured today; streaming loses at most 0.1 dB against the whole-frame mode |
+| M5 | Tune IQ: QM, variance-boost delta q, chroma delta q, SSIM rate weighting with a fixed or running reference; tune PSNR for alpha | photos within the gate including SSIMULACRA2; alpha within the gate |
+| M6 | Screen content per superblock (the `aom::Screen` counts, applied locally), palette search with the palette cache, screen-content transform choices | every graphics image within the gate, with no whole-image pre-pass |
 | M7 | Speed: pruning per effort, AVX2 + NEON kernels, profile-driven | at default effort, single core, the targets below; every effort within the gate |
 | M8 | Threads: wavefront on the caller's helpers | 2 and 3 CPU numbers; output identical to single-threaded |
-| M9 | image-processing: `aom.rs` replaced, `shiguredo_aom` and its cmake/libclang/llvm-tools build removed, `frame_memory`/`context` replaced by `Encoder::memory` | full Rust + JS suite green on worker |
+| M9 | image-processing: `aom.rs` replaced, `shiguredo_aom` and its cmake/libclang/llvm-tools build removed, `frame_memory`/`context` replaced by `Encoder::memory`, the rows no longer kept aside for the screen-content pre-pass; then the grid tile size revisited, since memory no longer forces small tiles and every tile edge costs 100–700 bytes | full Rust + JS suite green on worker |
 
 M1 and M2 make the bitstream correct; M3–M6 bring the quality; M7–M8 bring the speed.
 Speed work before M6 is limited to keeping the search from becoming unusably slow.
@@ -290,7 +339,8 @@ Speed work before M6 is limited to keeping the search from becoming unusably slo
 At default effort 4, against libaom at cpu-used 5 as configured today, on one core:
 
 - **at least 3× faster** on photos and on graphics, at gate quality;
-- **peak memory at most a quarter** of libaom's for the same frame.
+- **peak memory independent of the height**: about 15 MB plus 2–3 times the output for a
+  4000 px wide frame, and never above a tenth of libaom's.
 
 For scale: the 2026-10-18 measurements put a 6000×4000 photo at Q50 at 10.2 s and 493 MB with
 libaom, and at 5.4 s and 265 MB with rav1e at speed 7, which matched libaom's quality on photos
@@ -313,7 +363,9 @@ but not on graphics.
 
 1. **Location.** In the rav1d fork as `src/enc/` behind feature `encoder` (proposed), or a
    separate crate with rav1d's DSP made public?
-2. **Targets.** Are 3× the speed and a quarter of the memory at effort 4 the right bar?
+2. **Targets.** Is 3× the speed at effort 4 the right bar? Memory: is a peak set by the width
+   plus 2–3 times the output enough, or must the tokens go too, by fixing the filter parameters
+   in advance, at some cost in size?
 3. **Metric.** PSNR gate only, or also "SSIMULACRA2 not below libaom at equal size"?
 4. **Scope.** 8-bit 4:4:4 + monochrome only until everything else is done?
 5. **Effort.** Keep effort 0–9 with the same meaning (4 = default), with our own search depths?
