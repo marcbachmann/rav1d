@@ -150,43 +150,71 @@ impl Ctx {
         self.partition.fill(0);
     }
 
-    /// The units in `r` (and their 8×8 partition units), to be put back by `restore`.
-    fn save(&self, r: Range<usize>) -> Ctx {
+    /// The units in `r`, at most 16 (and their 8×8 partition units), to be put back by `restore`.
+    fn save(&self, r: Range<usize>) -> Saved {
         let p = r.start / 2..r.end.div_ceil(2);
-        Ctx {
-            mode: self.mode[r.clone()].to_vec(),
-            uvmode: self.uvmode[r.clone()].to_vec(),
-            skip: self.skip[r.clone()].to_vec(),
-            tx_intra: self.tx_intra[r.clone()].to_vec(),
-            lcoef: self.lcoef[r.clone()].to_vec(),
-            ccoef: [self.ccoef[0][r.clone()].to_vec(), self.ccoef[1][r.clone()].to_vec()],
-            pal_sz: self.pal_sz[r.clone()].to_vec(),
-            pal_sz_uv: self.pal_sz_uv[r.clone()].to_vec(),
-            pal: self.pal[r].to_vec(),
-            partition: self.partition[p].to_vec(),
-        }
+        let mut s = Saved { n: r.len(), np: p.len(), ..Saved::default() };
+        let n = s.n;
+        s.mode[..n].copy_from_slice(&self.mode[r.clone()]);
+        s.uvmode[..n].copy_from_slice(&self.uvmode[r.clone()]);
+        s.skip[..n].copy_from_slice(&self.skip[r.clone()]);
+        s.tx_intra[..n].copy_from_slice(&self.tx_intra[r.clone()]);
+        s.lcoef[..n].copy_from_slice(&self.lcoef[r.clone()]);
+        s.ccoef[0][..n].copy_from_slice(&self.ccoef[0][r.clone()]);
+        s.ccoef[1][..n].copy_from_slice(&self.ccoef[1][r.clone()]);
+        s.pal_sz[..n].copy_from_slice(&self.pal_sz[r.clone()]);
+        s.pal_sz_uv[..n].copy_from_slice(&self.pal_sz_uv[r.clone()]);
+        s.pal[..n].copy_from_slice(&self.pal[r]);
+        s.partition[..s.np].copy_from_slice(&self.partition[p]);
+        s
     }
 
-    fn restore(&mut self, start: usize, s: &Ctx) {
-        let n = s.mode.len();
-        self.mode[start..start + n].copy_from_slice(&s.mode);
-        self.uvmode[start..start + n].copy_from_slice(&s.uvmode);
-        self.skip[start..start + n].copy_from_slice(&s.skip);
-        self.tx_intra[start..start + n].copy_from_slice(&s.tx_intra);
-        self.pal_sz[start..start + n].copy_from_slice(&s.pal_sz);
-        self.pal_sz_uv[start..start + n].copy_from_slice(&s.pal_sz_uv);
-        self.pal[start..start + n].copy_from_slice(&s.pal);
+    /// The coefficient contexts of the units in `r`, at most 16.
+    fn save_coef(&self, r: Range<usize>) -> Saved {
+        let mut s = Saved { n: r.len(), ..Saved::default() };
+        s.lcoef[..s.n].copy_from_slice(&self.lcoef[r.clone()]);
+        s.ccoef[0][..s.n].copy_from_slice(&self.ccoef[0][r.clone()]);
+        s.ccoef[1][..s.n].copy_from_slice(&self.ccoef[1][r]);
+        s
+    }
+
+    fn restore(&mut self, start: usize, s: &Saved) {
+        let n = s.n;
+        self.mode[start..start + n].copy_from_slice(&s.mode[..n]);
+        self.uvmode[start..start + n].copy_from_slice(&s.uvmode[..n]);
+        self.skip[start..start + n].copy_from_slice(&s.skip[..n]);
+        self.tx_intra[start..start + n].copy_from_slice(&s.tx_intra[..n]);
+        self.pal_sz[start..start + n].copy_from_slice(&s.pal_sz[..n]);
+        self.pal_sz_uv[start..start + n].copy_from_slice(&s.pal_sz_uv[..n]);
+        self.pal[start..start + n].copy_from_slice(&s.pal[..n]);
         self.restore_coef(start, s);
         let p = start / 2;
-        self.partition[p..p + s.partition.len()].copy_from_slice(&s.partition);
+        self.partition[p..p + s.np].copy_from_slice(&s.partition[..s.np]);
     }
 
-    fn restore_coef(&mut self, start: usize, s: &Ctx) {
-        let n = s.lcoef.len();
-        self.lcoef[start..start + n].copy_from_slice(&s.lcoef);
-        self.ccoef[0][start..start + n].copy_from_slice(&s.ccoef[0]);
-        self.ccoef[1][start..start + n].copy_from_slice(&s.ccoef[1]);
+    fn restore_coef(&mut self, start: usize, s: &Saved) {
+        let n = s.n;
+        self.lcoef[start..start + n].copy_from_slice(&s.lcoef[..n]);
+        self.ccoef[0][start..start + n].copy_from_slice(&s.ccoef[0][..n]);
+        self.ccoef[1][start..start + n].copy_from_slice(&s.ccoef[1][..n]);
     }
+}
+
+/// Up to 16 units of a `Ctx`, copied out without allocating.
+#[derive(Clone, Default)]
+struct Saved {
+    n: usize,
+    np: usize,
+    mode: [u8; 16],
+    uvmode: [u8; 16],
+    skip: [u8; 16],
+    tx_intra: [i8; 16],
+    lcoef: [u8; 16],
+    ccoef: [[u8; 16]; 2],
+    pal_sz: [u8; 16],
+    pal_sz_uv: [u8; 16],
+    pal: [[[u8; 8]; 3]; 16],
+    partition: [u8; 9],
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -327,8 +355,8 @@ struct Snap {
     w4: usize,
     h4: usize,
     pixels: Vec<u8>,
-    above: Ctx,
-    left: Ctx,
+    above: Saved,
+    left: Saved,
 }
 
 /// A transform block decided while predicting, before its symbols are written.
@@ -1056,8 +1084,8 @@ impl<D: Decide> Encoder<D> {
         let h4 = cmp::min(bh4, self.bh - y);
         let (tx, uvtx) = self.tx_sizes(bs, depth);
         let (ax, ly) = (x as usize, (y & 15) as usize);
-        let saved_a = self.above.save(ax..ax + bw4 as usize);
-        let saved_l = self.left.save(ly..ly + bh4 as usize);
+        let saved_a = self.above.save_coef(ax..ax + bw4 as usize);
+        let saved_l = self.left.save_coef(ly..ly + bh4 as usize);
         let edge_filter = (self.seq.edge_filter as i32) << 10;
         let mut txs = Vec::new();
         if planes.contains(&0) {
@@ -1910,8 +1938,8 @@ fn coef_bits<D: Decide>(e: &mut Encoder<D>, txs: &[TxDone], bs: BlockSize, intra
     let Some(first) = txs.first() else { return 0 };
     let b_dim = bs.dimensions();
     let (ax, ly) = (first.x4 as usize, (first.y4 & 15) as usize);
-    let saved_a = e.above.save(ax..ax + b_dim[0] as usize);
-    let saved_l = e.left.save(ly..ly + b_dim[1] as usize);
+    let saved_a = e.above.save_coef(ax..ax + b_dim[0] as usize);
+    let saved_l = e.left.save_coef(ly..ly + b_dim[1] as usize);
     let mut c = Counter::default();
     let lossless = e.frame.quant.lossless();
     for t in txs {
@@ -2315,12 +2343,35 @@ fn scan_rc(tx: TxfmSize, class: TxClass, i: usize) -> (usize, u8, u8) {
     }
 }
 
+/// Scan index by coefficient index, the inverse of `scan_rc`, per transform size and class.
+fn scan_index(tx: TxfmSize, class: TxClass) -> &'static [u16] {
+    static TABLES: std::sync::OnceLock<Vec<Vec<u16>>> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        (0..TxfmSize::COUNT * 3)
+            .map(|k| {
+                let tx = TxfmSize::from_repr(k / 3).unwrap();
+                let class = [TxClass::TwoD, TxClass::H, TxClass::V][k % 3];
+                let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
+                let n = cmp::min(t_dim.w as usize * 4, 32) * cmp::min(t_dim.h as usize * 4, 32);
+                let mut inv = vec![0u16; n];
+                for i in 0..n {
+                    inv[scan_rc(tx, class, i).0] = i as u16;
+                }
+                inv
+            })
+            .collect()
+    });
+    let c = match class {
+        TxClass::TwoD => 0,
+        TxClass::H => 1,
+        TxClass::V => 2,
+    };
+    &tables[tx as usize * 3 + c]
+}
+
 fn eob_of(tx: TxfmSize, txtp: TxfmType, levels: &[i32]) -> i32 {
-    let class = DAV1D_TX_TYPE_CLASS[txtp as usize];
-    (0..levels.len())
-        .rev()
-        .find(|&i| levels[scan_rc(tx, class, i).0] != 0)
-        .map_or(-1, |i| i as i32)
+    let index = scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]);
+    levels.iter().zip(index).filter(|(&l, _)| l != 0).map(|(_, &i)| i as i32).max().unwrap_or(-1)
 }
 
 #[allow(clippy::too_many_arguments)]
