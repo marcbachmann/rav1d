@@ -36,6 +36,17 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-24, search speed.** Pinned on 13 crops of 384 px: qindex 140 5978 → 5577 ms and
+qindex 32 21231 → 17521 ms with the same or near bytes and dB: symbol costs from a table built at
+compile time (same bytes), libaom's reduced intra transform-type set where the search is not
+full (qindex 140 −1.8%, 0.2% fewer bytes; at 32 it lost 0.034 dB, so off there), coefficient
+costs from tables filled per superblock as `av1_fill_coeff_costs` (same bytes, −4.6% and
+−13%), transform types ranked by their coefficients' error with only the winner reconstructed
+(−0.3% and −3.4%, ±0.006 dB). The quantizer's u64 division is the hottest line in a profile,
+yet three replacements lost: a 32-bit division +6.5%, reciprocal tables rebuilt per superblock
++4.5%, reciprocal tables cached per qindex +7.5% (16 KB per transform size crowd L1). At qindex
+32 a final code takes about 190 residual searches per 8×8: ranking 60, depths 46, chroma 68.
+
 **2026-10-24, the gate misses on synthetic patterns.** The strip pattern of the AVIF gates
 (sawtooth R, diagonal G, XOR B) loses 1.9 dB at libaom's bytes at effort 4 and gains 0.1 at
 effort 9. Settings one at a time on a 1024×256 crop at Q50 (−3.20 dB): all luma or chroma
