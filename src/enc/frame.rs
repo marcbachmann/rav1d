@@ -360,6 +360,14 @@ struct Snap {
     left: Saved,
 }
 
+/// A block's palette map and the bits of its indexes, kept while the block is searched: both
+/// depend only on the source and the colours.
+struct PalKept {
+    key: (bool, u8, i32, i32, i32, i32, [[u8; 8]; 2]),
+    map: Vec<u8>,
+    bits: Option<u32>,
+}
+
 /// A transform block decided while predicting, before its symbols are written.
 #[derive(Clone)]
 struct TxDone {
@@ -465,6 +473,7 @@ pub struct Encoder<D: Decide> {
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
     /// the block's width at a time.
     pal_map: [Vec<u8>; 2],
+    pal_kept: Vec<PalKept>,
     bufs: Option<Box<Bufs>>,
     /// Which part of the search runs, for `stats`.
     stage: usize,
@@ -595,6 +604,7 @@ impl<D: Decide> Encoder<D> {
             sb_lambda: 1.0,
 
             pal_map: [Vec::new(), Vec::new()],
+            pal_kept: Vec::new(),
             bufs: Some(Box::new(Bufs {
                 src: [0; 64 * 64],
                 pred: [0; 64 * 64],
@@ -1187,7 +1197,43 @@ impl<D: Decide> Encoder<D> {
         let n = intra.pal_sz[chroma as usize] as usize;
         let mut map = std::mem::take(&mut self.pal_map[chroma as usize]);
         map.clear();
-        map.resize(bw * bh, 0);
+        let key = pal_key(chroma, x, y, bw4, bh4, intra);
+        if let Some(kept) = self.pal_kept.iter().find(|k| k.key == key) {
+            map.extend_from_slice(&kept.map);
+        } else {
+            map.resize(bw * bh, 0);
+            self.palette_map(chroma, x0, wy, w, h, bw, bh, n, intra, &mut map);
+            self.pal_kept.push(PalKept { key, map: map.clone(), bits: None });
+        }
+        let planes = if chroma { 1..3 } else { 0..1 };
+        for p in planes {
+            let rec = &self.rec[p];
+            for r in 0..bh {
+                let mut dst = rec.comp.slice_mut::<BD, _>(((wy + r) * rec.stride + x0.., ..bw));
+                for c in 0..bw {
+                    dst[c] = intra.pal[p][map[r * bw + c] as usize];
+                }
+            }
+        }
+        self.pal_map[chroma as usize] = map;
+    }
+
+    /// The bits of a block's palette indexes in `pal_map`, counted once per palette.
+    fn palette_bits(&mut self, chroma: bool, x: i32, y: i32, bw4: i32, bh4: i32, vw: usize, vh: usize, intra: &Intra) -> u32 {
+        let key = pal_key(chroma, x, y, bw4, bh4, intra);
+        let at = self.pal_kept.iter().position(|k| k.key == key).expect("the palette was predicted");
+        if let Some(bits) = self.pal_kept[at].bits {
+            return bits;
+        }
+        let n = intra.pal_sz[chroma as usize];
+        let mut c = Counter::default();
+        palette::write_indices(&mut c, &mut self.cost_cdf.m.color_map[chroma as usize][n as usize - 2], &self.pal_kept[at].map, bw4 as usize * 4, vw, vh, n);
+        self.pal_kept[at].bits = Some(c.bits);
+        c.bits
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn palette_map(&self, chroma: bool, x0: usize, wy: usize, w: usize, h: usize, bw: usize, bh: usize, n: usize, intra: &Intra, map: &mut [u8]) {
         for r in 0..h {
             let at = (wy + r) * self.src[0].stride + x0;
             if chroma {
@@ -1208,17 +1254,6 @@ impl<D: Decide> Encoder<D> {
         for r in h..bh {
             map.copy_within((h - 1) * bw..h * bw, r * bw);
         }
-        let planes = if chroma { 1..3 } else { 0..1 };
-        for p in planes {
-            let rec = &self.rec[p];
-            for r in 0..bh {
-                let mut dst = rec.comp.slice_mut::<BD, _>(((wy + r) * rec.stride + x0.., ..bw));
-                for c in 0..bw {
-                    dst[c] = intra.pal[p][map[r * bw + c] as usize];
-                }
-            }
-        }
-        self.pal_map[chroma as usize] = map;
     }
 
     fn sm_flag(&self, ax: usize, ly: usize) -> i32 {
@@ -1936,6 +1971,7 @@ impl<D: Decide> Encoder<D> {
     /// Finds the best modes of a block and leaves them applied; its node goes on the plan and its
     /// bits on the counter.
     fn pick_block(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
+        self.pal_kept.clear();
         let b_dim = bs.dimensions();
         let (w4, h4) = (b_dim[0] as usize, b_dim[1] as usize);
         self.block_lambda(x, y, w4, h4);
@@ -1953,8 +1989,7 @@ impl<D: Decide> Encoder<D> {
             }
             write_filter(&mut c, &mut e.cost_cdf, bs, intra, &limits);
             if intra.pal_sz[0] > 0 {
-                let n = intra.pal_sz[0];
-                palette::write_indices(&mut c, &mut e.cost_cdf.m.color_map[0][n as usize - 2], &e.pal_map[0], w4 * 4, vw, vh, n);
+                c.bits += e.palette_bits(false, x, y, w4 as i32, h4 as i32, vw, vh, intra);
             }
             write_depth(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, depth, max_tx, tx_select);
             c.bits
@@ -2082,8 +2117,7 @@ impl<D: Decide> Encoder<D> {
                     write_pal_uv(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, bs, intra);
                 }
                 if intra.pal_sz[1] > 0 {
-                    let n = intra.pal_sz[1];
-                    palette::write_indices(&mut c, &mut e.cost_cdf.m.color_map[1][n as usize - 2], &e.pal_map[1], w4 * 4, vw, vh, n);
+                    c.bits += e.palette_bits(true, x, y, w4 as i32, h4 as i32, vw, vh, intra);
                 }
                 let bits = c.bits + coef_bits(e, &txs, bs, intra);
                 let dist = e.sse(x, y, w4, h4, 1..3);
@@ -2706,6 +2740,11 @@ fn lo_ctx(levels: &[u8], off: usize, offsets: Option<&[[LoCtxOffset; 32]; 32]>, 
         }
     };
     (offset + if mag > 512 { 4 } else { ((mag + 64) >> 7) as usize }, hi)
+}
+
+fn pal_key(chroma: bool, x: i32, y: i32, bw4: i32, bh4: i32, intra: &Intra) -> (bool, u8, i32, i32, i32, i32, [[u8; 8]; 2]) {
+    let colours = if chroma { [intra.pal[1], intra.pal[2]] } else { [intra.pal[0], [0; 8]] };
+    (chroma, intra.pal_sz[chroma as usize], x, y, bw4, bh4, colours)
 }
 
 fn eob_of(tx: TxfmSize, txtp: TxfmType, levels: &[i32]) -> i32 {
