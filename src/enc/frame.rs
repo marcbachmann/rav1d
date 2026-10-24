@@ -2912,10 +2912,23 @@ fn write_coefs<S: Sink>(
     } else {
         None
     };
+    // Counted, the AC signs and Golomb tails cost the same wherever they fall, so they are
+    // added in this pass; the AC levels' sum is kept for the contexts.
+    let (mut tail_sum, mut tail_bits) = (0u32, 0u32);
+    let mut tail = |lv: u32| {
+        tail_sum = tail_sum.wrapping_add(lv);
+        if lv != 0 {
+            tail_bits += 512;
+            if lv >= 15 {
+                tail_bits += 512 * (2 * (31 - (lv - 14).leading_zeros()) + 1);
+            }
+        }
+    };
     let dc_level;
     if eob > 0 {
         let (_, x, y, off) = scan[eob as usize];
         let lv = level_at(eob as usize);
+        tail(lv);
         let ctx = 1 + (eob > (2 << tx2dszctx)) as usize + (eob > (4 << tx2dszctx)) as usize;
         w.symbol((cmp::min(lv, 3) - 1) as u8, &mut cdf.coef.eob_base_tok[t_dim.ctx as usize][chroma][ctx], 2);
         if lv >= 3 {
@@ -2929,6 +2942,7 @@ fn write_coefs<S: Sink>(
             let off = off as usize;
             let (lo, mag) = lo_ctx(&levels, off, offsets, x, y, stride);
             let lv = coefs[rc as usize].unsigned_abs();
+            tail(lv);
             base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, lo, cmp::min(lv, 3) as u8);
             if class == TxClass::TwoD {
                 y |= x;
@@ -2975,17 +2989,22 @@ fn write_coefs<S: Sink>(
         dc_sign_level = if dc < 0 { 0 } else { 0x80 };
         cul_level = dc_level;
     }
-    for &(rc, ..) in &scan[1..=eob as usize] {
-        let v = coefs[rc as usize];
-        if v == 0 {
-            continue;
+    if costs.is_some() {
+        w.add(tail_bits);
+        cul_level = cul_level.wrapping_add(tail_sum);
+    } else {
+        for &(rc, ..) in &scan[1..=eob as usize] {
+            let v = coefs[rc as usize];
+            if v == 0 {
+                continue;
+            }
+            w.bool_equi(v < 0);
+            let lv = v.unsigned_abs();
+            if lv >= 15 {
+                w.golomb(lv - 15);
+            }
+            cul_level = cul_level.wrapping_add(lv);
         }
-        w.bool_equi(v < 0);
-        let lv = v.unsigned_abs();
-        if lv >= 15 {
-            w.golomb(lv - 15);
-        }
-        cul_level = cul_level.wrapping_add(lv);
     }
     set_ctx(a, l, (cmp::min(cul_level, 63) | dc_sign_level) as u8);
 }
