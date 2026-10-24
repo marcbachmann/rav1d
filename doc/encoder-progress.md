@@ -5,13 +5,14 @@ and one paragraph per step, newest first.
 
 ## State
 
-- Branch `encoder`, M3 in progress. Built: range encoder (`ec.rs`), sequence and frame headers
-  (`header.rs`), the frame coder for every intra tool but palette (`frame.rs`), libaom's forward
-  transforms (`fdct.rs`), rate counting and λ (`rd.rs`), the RD search, and `enc::still`.
-- Not yet: deblocking, CDEF, restoration, quantizer matrices and delta q chosen by the search,
-  trellis quantization, palette, threads, speed work.
-- image-processing branch `integrate-high-quality-avif` holds `src/engine/avif/own.rs` with a
-  calibration test against libaom (`own::compare`, `AVIF_CORPUS` of PPMs).
+- Branch `encoder`. Built: range encoder, headers, every intra tool with palettes, libaom's
+  forward transforms, the RD search with RDOQ, tune IQ (Variance Boost, SSIM λ, quantizer
+  matrices, chroma delta q), deblocking and CDEF strengths searched on the decoded picture.
+- Not yet: restoration, threads, SIMD for the search, alpha and lossless parity checks.
+- image-processing branch `integrate-high-quality-avif` codes AVIF colour with it
+  (`src/engine/avif/own.rs`, calibration `own::compare` with `AVIF_CORPUS` of PPMs). AVIF gates
+  188/195 at rav1d a12c8720: misses at libaom's bytes on the strip pattern, Q90 fine texture,
+  antialiased text Q80; noise is 63% larger at its quality.
 - Open decisions in `doc/encoder.md` are taken at their proposed defaults (Marc started the
   implementation on 2026-10-24 without answering them): in the fork, 3× at effort 4, peak by
   width plus tokens, PSNR gate plus SSIMULACRA2, 8-bit 4:4:4 and monochrome first, effort 0–9
@@ -34,6 +35,22 @@ docker run --rm --cgroup-parent="$COMMANDQUEUE_SLICE" -v "$PWD":/work -v $D:/dep
 An incremental build takes about 17 s.
 
 ## Log
+
+**2026-10-24, speed.** On 13 crops of 384 px at qindex 140, effort 4: 8535 → 5690 ms. The
+chroma palette search keeps a bitmap of colour pairs and stops past 64 (857fbe94, same bytes);
+effort ≤5 compares depths with DCT only and searches transform types at the chosen depth
+(b982f643, 96623 B at 42.738 dB); context snapshots are a fixed struct and the end of block
+comes from a cached inverse scan (a12c8720, same bytes). A 32-bit quantizer division was 6.5%
+slower on a pinned A/B (6001 against 6394 ms, three rounds) and was dropped. Profile now:
+`predict_plane` 24%, `write_coefs` 12%, `rd_residual` 5.5%, the scalar SATD 5%.
+
+**2026-10-24, filters searched on the decoded picture.** The frame header is written last, so
+`filters::search` decodes the coded tiles with rav1d under candidate headers: deblocking levels
+per plane by steps of 8, 4, 2, 1 and off, then CDEF primary and secondary strengths for luma
+and chroma, about 20 decodes. Mean at libaom's bytes +1.01 → +1.10 dB; a HEIC pattern 45.26 →
+49.71 dB. Tune IQ's filter rules (no CDEF to qindex 32, sharpness 7 to 112 and 1 to 160) come
+first. libaom's `predict_skip_txfm` (level 1) skips the residual search where the prediction
+error is under its DC and AC limits: −4% time, same quality.
 
 **2026-10-24, tune IQ complete for the quantizer.** `Options::tune_iq` turns on what libaom's
 tune IQ changes and the encoder has: Variance Boost, the SSIM rate weighting
