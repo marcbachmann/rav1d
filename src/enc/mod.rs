@@ -54,7 +54,7 @@ fn cdef_from_q(qidx: u8) -> Cdef {
     c
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     /// 0 is lossless.
     pub qidx: u8,
@@ -66,8 +66,25 @@ pub struct Options {
     pub rect: u8,
     /// Transform types are searched for the chosen depth only.
     pub late_txtp: bool,
+    /// See `Encoder::levels`: 0 is 64×64, 4 the 4×4 blocks of a split 8×8.
+    pub levels: std::ops::Range<u8>,
     /// See `Encoder::prune`; 0 tries every partition.
     pub prune: f64,
+}
+
+impl Options {
+    /// The search for an effort of 0 (fastest) to 9, as libaom's `cpu-used` of 9 − effort.
+    /// Measured on 256 px crops at qidx 120 against the full search (`doc/encoder-progress.md`).
+    pub fn effort(qidx: u8, effort: u8, screen: bool) -> Self {
+        let (keep_modes, rect, levels, prune) = match effort {
+            8.. => (0, 1, 0..5, 0.0),
+            6..=7 => (4, 1, 0..5, 0.0),
+            4..=5 => (4, 2, 0..4, 0.0),
+            2..=3 => (3, 0, 0..4, 0.0),
+            _ => (2, 0, 0..4, 1.0),
+        };
+        Self { qidx, keep_modes, screen, rect, late_txtp: false, levels, prune }
+    }
 }
 
 /// A still picture of 8-bit planes: one plane is monochrome, three are 4:4:4 YCbCr, BT.601 full
@@ -79,6 +96,7 @@ pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Co
     e.keep_modes = options.keep_modes;
     e.rect = options.rect;
     e.late_txtp = options.late_txtp;
+    e.levels = options.levels.clone();
     e.prune = options.prune;
     let w = width as usize;
     for y in 0..height as usize {

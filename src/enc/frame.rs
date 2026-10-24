@@ -381,6 +381,8 @@ pub struct Encoder<D: Decide> {
     pub rect: u8,
     /// Transform depths are compared with `DCT_DCT` only; the chosen one searches every type.
     pub late_txtp: bool,
+    /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
+    pub levels: Range<u8>,
     /// A block whose unsplit distortion is under `prune` bits' worth per 4×4 unit is not split.
     pub prune: f64,
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
@@ -446,6 +448,7 @@ impl<D: Decide> Encoder<D> {
             keep_modes: 0,
             rect: 1,
             late_txtp: false,
+            levels: 0..5,
             prune: 0.0,
             pal_map: [Vec::new(), Vec::new()],
             bufs: Some(Box::new(Bufs {
@@ -1398,6 +1401,16 @@ impl<D: Decide> Encoder<D> {
         };
         let mut best: Option<(f64, u32, Snap, Vec<Node>)> = Option::None;
         for &bp in cands {
+            if halves == Halves::Both && cands.len() > 1 {
+                let level = bl as u8 - BlockLevel::Bl64x64 as u8;
+                let skip = match bp {
+                    Split => level + 1 >= self.levels.end,
+                    _ => level < self.levels.start && level + 1 < self.levels.end,
+                };
+                if skip {
+                    continue;
+                }
+            }
             if matches!(bp, H | V) && halves == Halves::Both && self.rect == 2 && best.as_ref().is_some_and(|b| b.3.first().is_some_and(|n| matches!(n, Node::Part(None)))) {
                 break;
             }
@@ -2702,6 +2715,10 @@ pub(crate) mod tests {
             screen: std::env::var("ENC_SCREEN").map_or(true, |v| v != "0"),
             rect: std::env::var("ENC_RECT").map_or(1, |v| v.parse().unwrap()),
             late_txtp: std::env::var("ENC_LATE").is_ok_and(|v| v == "1"),
+            levels: std::env::var("ENC_LEVELS").map_or(0..5, |v| {
+                let (a, b) = v.split_once("..").unwrap();
+                a.parse().unwrap()..b.parse().unwrap()
+            }),
             prune: std::env::var("ENC_PRUNE").map_or(0.0, |v| v.parse().unwrap()),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
