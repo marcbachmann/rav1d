@@ -367,6 +367,8 @@ struct TxDone {
     tx: TxfmSize,
     coefs: Coefs,
     eob: i32,
+    /// The coefficient bits the residual search counted, in the contexts `coef_bits` sees.
+    bits: Option<u32>,
 }
 
 pub struct Encoder<D: Decide> {
@@ -385,6 +387,8 @@ pub struct Encoder<D: Decide> {
     scratch: Plane,
     /// `scratch` holds the reconstruction of the levels `rd_residual` chose.
     recon_ready: bool,
+    /// The bits of the levels `rd_residual` chose.
+    residual_bits: Option<u32>,
     edge: DisjointMut<AlignedVec64<u8>>,
     edge_stride: usize,
     above: Ctx,
@@ -535,6 +539,7 @@ impl<D: Decide> Encoder<D> {
             rec,
             scratch: Plane::new(SB, SB),
             recon_ready: false,
+            residual_bits: None,
             edge: DisjointMut::new(edge),
             edge_stride: stride,
             above: Ctx::new(bw as usize),
@@ -1356,6 +1361,7 @@ impl<D: Decide> Encoder<D> {
                 let levels = &mut lv[..n];
                 levels.fill(0);
                 self.recon_ready = false;
+                self.residual_bits = None;
                 let decided = if self.predict_only {
                     Some(fixed_txtp)
                 } else if self.dry || self.decide.searches() {
@@ -1416,7 +1422,7 @@ impl<D: Decide> Encoder<D> {
                 let ch = cmp::min(th, self.bh - py) as usize;
                 a[px as usize..][..cw].fill(v);
                 l[(py & 15) as usize..][..ch].fill(v);
-                out.push(TxDone { plane, x4: px, y4: py, tx, coefs: Coefs { txtp, levels }, eob });
+                out.push(TxDone { plane, x4: px, y4: py, tx, coefs: Coefs { txtp, levels }, eob, bits: self.residual_bits });
                 x += tw;
             }
             y += th;
@@ -1537,6 +1543,7 @@ impl<D: Decide> Encoder<D> {
             c.bits
         };
         let zero_rate = rate(self, cands[0], &[], -1);
+        self.residual_bits = Some(zero_rate);
         let zero = if lossless { f64::MAX } else { sse(&src[..], &pred[..], pw) as f64 + self.lambda * zero_rate as f64 / 512.0 };
         let mut best = (zero, cands[0]);
         levels.fill(0);
@@ -1575,6 +1582,7 @@ impl<D: Decide> Encoder<D> {
                 let dist = sse(&src[..], &self.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB);
                 if dist as f64 + self.lambda * bits as f64 / 512.0 < zero {
                     self.recon_ready = true;
+                    self.residual_bits = Some(bits);
                     self.bufs = Some(b);
                     return txtp;
                 }
@@ -1651,6 +1659,7 @@ impl<D: Decide> Encoder<D> {
             if cost < best.0 {
                 best = (cost, txtp);
                 levels.copy_from_slice(&trial[..n]);
+                self.residual_bits = Some(bits);
             }
         }
         self.recon_ready = best.0 < zero && last == Some(best.1);
@@ -2087,6 +2096,9 @@ impl<D: Decide> Encoder<D> {
 /// The bits of a block's coefficients in the order the decoder reads them; the contexts are
 /// left as they were.
 fn coef_bits<D: Decide>(e: &mut Encoder<D>, txs: &[TxDone], bs: BlockSize, intra: &Intra) -> u32 {
+    if let Some(bits) = txs.iter().map(|t| t.bits).sum::<Option<u32>>() {
+        return bits;
+    }
     let Some(first) = txs.first() else { return 0 };
     let b_dim = bs.dimensions();
     let (ax, ly) = (first.x4 as usize, (first.y4 & 15) as usize);
