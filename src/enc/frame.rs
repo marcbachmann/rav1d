@@ -441,6 +441,10 @@ pub struct Encoder<D: Decide> {
     /// Residual searches and the coefficients they transformed, per stage: luma ranking, luma
     /// depths, chroma, CfL, the block's final dry code, coding.
     pub stats: [[u64; 2]; 6],
+    /// The search's rate estimate of the coded superblocks, in 1/512 bits.
+    pub estimated: u64,
+    /// The search's squared error of the coded superblocks, before the in-loop filters.
+    pub estimated_sse: u64,
     lv: Option<Box<[i32; 32 * 32]>>,
     counter: Counter,
     cost_cdf: Box<CdfContext>,
@@ -558,6 +562,8 @@ impl<D: Decide> Encoder<D> {
             lv: Some(Box::new([0; 32 * 32])),
             stage: 5,
             stats: [[0; 2]; 6],
+            estimated: 0,
+            estimated_sse: 0,
             counter: Counter::default(),
             cost_cdf,
             trial: None,
@@ -1634,6 +1640,8 @@ impl<D: Decide> Encoder<D> {
         self.dry = true;
         self.counter = Counter::default();
         self.pick_partition(ti, BlockLevel::Bl64x64, x, y, EdgeIndex::root());
+        self.estimated += self.counter.bits as u64;
+        self.estimated_sse += self.sse(x, y, 16, 16, 0..self.planes);
         self.dry = false;
         self.restore(&s);
     }
@@ -3120,6 +3128,8 @@ pub(crate) mod tests {
             let t = std::time::Instant::now();
             let mut e = crate::enc::still_with(w as u32, h as u32, &rows, &options);
             let stats = e.stats;
+            let estimated = e.estimated as f64 / 4096.0;
+            let estimated_db = 10.0 * (65025.0 * (w * h * 3) as f64 / e.estimated_sse.max(1) as f64).log10();
             if options.filter_search {
                 e.flush();
                 crate::enc::filters::search(&mut e, &rows);
@@ -3129,6 +3139,7 @@ pub(crate) mod tests {
             if std::env::var("ENC_STATS").is_ok() {
                 let px = (w * h) as f64;
                 let per = stats.map(|[n, c]| format!("{:.2}/{:.1}", n as f64 * 64.0 / px, c as f64 / px));
+                println!("  estimated {estimated:.0} B {estimated_db:.2} dB unfiltered");
                 println!("  searches per 8x8 / coefficients per pixel: rank {} depth {} chroma {} final {} code {}", per[0], per[1], per[2], per[4], per[5]);
             }
             let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));
