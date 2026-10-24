@@ -49,6 +49,11 @@ the decoded picture's within 0.2 dB, with H/V or without; the extra blocks move 
 along λ, and the tune-IQ λ weight (×1.56 at qindex 133) makes that a poor trade on text.
 Without the weight: text +1.5 dB at libaom's bytes, photos at Q90 −0.1 to −0.3, mean +0.24 →
 +0.30 over 28 codes, bytes at a qindex up to 18% higher; kept, as libaom's tune IQ has it.
+Antialiased text (grey levels 26 apart) is not monotonic in qindex: 49147 B at 48, 56810 at 54,
+49321 at 60, 54919 at 64, with or without quantizer matrices, IQ filters, Variance Boost, SSIM λ
+or skip prediction, and in the search's own estimate; without palettes the curve is smooth and
+2.6× larger, and searching transform types at every depth fixes 54 but not 64. The quantizer
+steps resonate with the level grid; the gate's Q80 lands on 54.
 RDOQ does not bring grey noise near libaom's bytes (53 KB against 32 KB at qindex 144, the
 same at 2, 8 and 64 coefficients); at equal bytes it is +0.2 to +1.4 dB ahead.
 

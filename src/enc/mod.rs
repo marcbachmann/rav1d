@@ -100,7 +100,8 @@ pub struct Options {
 
 impl Options {
     /// The search for an effort of 0 (fastest) to 9, as libaom's `cpu-used` of 9 − effort.
-    /// Measured on 256 px crops at qidx 120 against the full search (`doc/encoder-progress.md`).
+    /// Measured on 256 px crops at qidx 120 against the full search (`doc/encoder-progress.md`);
+    /// from effort 4 qindexes to 64 keep every mode and search transform types at every depth.
     pub fn effort(qidx: u8, effort: u8, screen: bool) -> Self {
         let (keep_modes, keep_chroma, rect, levels, prune) = match effort {
             8.. => (0, 0, 1, 0..5, 0.0),
@@ -109,8 +110,10 @@ impl Options {
             2..=3 => (3, 3, 0, 0..4, 0.0),
             _ => (2, 2, 0, 0..4, 1.0),
         };
+        let fine = effort >= 4 && qidx <= 64;
+        let (keep_modes, keep_chroma) = if fine { (0, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
     }
 }
 
