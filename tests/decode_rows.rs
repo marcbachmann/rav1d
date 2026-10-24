@@ -359,3 +359,36 @@ fn reads_no_row_once_final() {
     assert!(by_rows * 10 > firsts * 8, "{by_rows} of {firsts} by rows");
 }
 
+/// A tile group after the frame fails the data at the `dav1d_get_picture` after the picture's, by
+/// rows as when the frame is decoded whole.
+#[test]
+fn fails_a_tile_group_after_the_frame_as_whole() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dav1d-test-data/8-bit/intra/av1-1-b8-02-allintra.ivf");
+    let data = std::fs::read(file).unwrap();
+    let mut frame = ivf_frames(&data)[0].to_vec();
+    frame.extend_from_slice(&[0x22, 0x01, 0x00]);
+    let calls = |by_rows: bool| unsafe {
+        let ctx = open(true, by_rows);
+        let mut d = Dav1dData::default();
+        let buf = dav1d_data_create(NonNull::new(&mut d), frame.len());
+        std::ptr::copy_nonoverlapping(frame.as_ptr(), buf, frame.len());
+        let mut results = vec![dav1d_send_data(Some(ctx), NonNull::new(&mut d)).0];
+        let mut rows = 0;
+        while dav1d_decode_rows(ctx, &mut rows).0 == 0 {}
+        for _ in 0..3 {
+            let mut p = Dav1dPicture::default();
+            results.push(dav1d_get_picture(Some(ctx), NonNull::new(&mut p)).0);
+            dav1d_picture_unref(NonNull::new(&mut p));
+        }
+        if d.sz > 0 {
+            dav1d_data_unref(NonNull::new(&mut d));
+        }
+        dav1d_close(NonNull::new(&mut Some(ctx)));
+        (results, rows)
+    };
+    let (whole, _) = calls(false);
+    assert!(whole[0] == 0 && whole[1] == 0 && whole[2] < 0 && whole[2] != EAGAIN, "{whole:?}");
+    let (by_rows, rows) = calls(true);
+    assert_eq!(by_rows, whole);
+    assert!(rows > 0);
+}
