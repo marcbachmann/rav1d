@@ -17,6 +17,18 @@ pub trait Sink {
         }
     }
 
+    fn uniform(&mut self, v: u32, n: u32) {
+        let l = (31 - n.leading_zeros()) as u8 + 1;
+        let m = (1 << l) - n;
+        if v < m {
+            self.bools(v, l - 1);
+        } else {
+            let w = v + m;
+            self.bools(w >> 1, l - 1);
+            self.bool_equi(w & 1 != 0);
+        }
+    }
+
     fn hi_tok(&mut self, tok: u8, cdf: &mut [u16; 4]) {
         let mut rest = tok - 3;
         for _ in 0..4 {

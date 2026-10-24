@@ -35,6 +35,18 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-24, palettes.** `palette.rs` writes what `read_pal_plane`, `read_pal_uv` and
+`read_pal_indices` read: cache reuse flags, delta-coded sorted colours (raw or signed deltas for
+V), and wavefront index maps with `order_palette`'s contexts. The search tries a block's own
+colours when it has 2 to 8, else k-means palettes of 8 and 4 when it has up to 64, for luma as a
+mode and for chroma (U, V pairs) beside the chroma modes. On a synthetic graphic: 3368 bytes at
+43.8 dB without, 1336 at 70.6 dB with. The random-decision fuzzer draws palettes from a small
+colour set so caches are reused.
+
+**2026-10-24, first comparison with libaom** (image-processing `own::compare`, before
+palettes): at libaom's bytes the own encoder is +0.11 to +1.83 dB on photos, a hard-edged logo
+-5 to -11 dB, and 60-100x slower. Allocation-free residual search halved the time.
+
 **2026-10-24, RD search.** Each superblock is searched dry: blocks are coded into a `Counter`
 on a copy of the CDFs from the superblock's start, against snapshots of the reconstruction and
 contexts, then the winning plan is coded by the same code into the range writer. Partitions

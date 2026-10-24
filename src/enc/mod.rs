@@ -4,6 +4,7 @@ pub mod ec;
 pub mod fdct;
 pub mod frame;
 pub mod header;
+pub mod palette;
 pub mod rd;
 
 use crate::dequant_tables::DAV1D_DQ_TBL;
@@ -53,13 +54,23 @@ fn cdef_from_q(qidx: u8) -> Cdef {
     c
 }
 
-/// A still picture of 8-bit planes coded at `qidx` (0 is lossless): one plane is monochrome,
-/// three are 4:4:4 YCbCr, BT.601 full range, sRGB. `keep_modes` luma modes of the SATD ranking
-/// go on to rate and distortion, all of them when 0.
-pub fn still(width: u32, height: u32, planes: &[&[u8]], qidx: u8, keep_modes: usize) -> Coded {
-    let (seq, frame) = headers(width, height, planes.len() == 1, qidx);
+#[derive(Clone, Copy, Default)]
+pub struct Options {
+    /// 0 is lossless.
+    pub qidx: u8,
+    /// Luma modes of the SATD ranking that go on to rate and distortion, all of them when 0.
+    pub keep_modes: usize,
+    /// Screen content tools: palettes.
+    pub screen: bool,
+}
+
+/// A still picture of 8-bit planes: one plane is monochrome, three are 4:4:4 YCbCr, BT.601 full
+/// range, sRGB.
+pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Coded {
+    let (seq, mut frame) = headers(width, height, planes.len() == 1, options.qidx);
+    frame.screen_content = options.screen;
     let mut e = Encoder::new(seq, frame, Rd);
-    e.keep_modes = keep_modes;
+    e.keep_modes = options.keep_modes;
     let w = width as usize;
     for y in 0..height as usize {
         let rows: Vec<&[u8]> = planes.iter().map(|p| &p[y * w..][..w]).collect();

@@ -19,6 +19,7 @@ use crate::dequant_tables::DAV1D_DQ_TBL;
 use crate::disjoint_mut::DisjointMut;
 use crate::enc::ec::Writer;
 use crate::enc::fdct;
+use crate::enc::palette;
 use crate::enc::header::{obu, BitWriter, Frame, Sequence, OBU_FRAME, OBU_SEQUENCE_HEADER};
 use crate::enc::rd::{lambda, Counter, Sink};
 use crate::enum_map::DefaultValue;
@@ -114,6 +115,9 @@ struct Ctx {
     lcoef: Vec<u8>,
     ccoef: [Vec<u8>; 2],
     pal_sz: Vec<u8>,
+    pal_sz_uv: Vec<u8>,
+    /// Palette colours per plane where `pal_sz` (`pal_sz_uv` for U and V) is not 0.
+    pal: Vec<[[u8; 8]; 3]>,
     partition: Vec<u8>,
 }
 
@@ -128,6 +132,8 @@ impl Ctx {
             lcoef: vec![0x40; n],
             ccoef: [vec![0x40; n], vec![0x40; n]],
             pal_sz: vec![0; n],
+            pal_sz_uv: vec![0; n],
+            pal: vec![[[0; 8]; 3]; n],
             partition: vec![0; n / 2 + 16],
         }
     }
@@ -140,6 +146,7 @@ impl Ctx {
         self.lcoef.fill(0x40);
         self.ccoef.iter_mut().for_each(|c| c.fill(0x40));
         self.pal_sz.fill(0);
+        self.pal_sz_uv.fill(0);
         self.partition.fill(0);
     }
 
@@ -153,7 +160,9 @@ impl Ctx {
             tx_intra: self.tx_intra[r.clone()].to_vec(),
             lcoef: self.lcoef[r.clone()].to_vec(),
             ccoef: [self.ccoef[0][r.clone()].to_vec(), self.ccoef[1][r.clone()].to_vec()],
-            pal_sz: self.pal_sz[r].to_vec(),
+            pal_sz: self.pal_sz[r.clone()].to_vec(),
+            pal_sz_uv: self.pal_sz_uv[r.clone()].to_vec(),
+            pal: self.pal[r].to_vec(),
             partition: self.partition[p].to_vec(),
         }
     }
@@ -165,6 +174,8 @@ impl Ctx {
         self.skip[start..start + n].copy_from_slice(&s.skip);
         self.tx_intra[start..start + n].copy_from_slice(&s.tx_intra);
         self.pal_sz[start..start + n].copy_from_slice(&s.pal_sz);
+        self.pal_sz_uv[start..start + n].copy_from_slice(&s.pal_sz_uv);
+        self.pal[start..start + n].copy_from_slice(&s.pal);
         self.restore_coef(start, s);
         let p = start / 2;
         self.partition[p..p + s.partition.len()].copy_from_slice(&s.partition);
@@ -186,6 +197,10 @@ pub struct Intra {
     pub uv_mode: u8,
     pub uv_angle: i8,
     pub cfl: [i8; 2],
+    /// Palette sizes for luma and chroma, 0 for none; then the colours of each plane, sorted
+    /// for luma and U, V alongside U.
+    pub pal_sz: [u8; 2],
+    pub pal: [[u8; 8]; 3],
 }
 
 /// The quantized coefficients of one transform block, in rav1d's coefficient layout.
@@ -213,6 +228,7 @@ pub struct Limits {
     pub cfl: bool,
     pub filter: bool,
     pub chroma: bool,
+    pub palette: bool,
     pub max_depth: u8,
 }
 
@@ -361,6 +377,9 @@ pub struct Encoder<D: Decide> {
     predict_only: bool,
     /// Luma modes kept from the SATD ranking for rate and distortion, all when 0.
     pub keep_modes: usize,
+    /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
+    /// the block's width at a time.
+    pal_map: [Vec<u8>; 2],
     counter: Counter,
     cost_cdf: Box<CdfContext>,
     trial: Option<(Intra, u8)>,
@@ -417,6 +436,7 @@ impl<D: Decide> Encoder<D> {
             dct_only: false,
             predict_only: false,
             keep_modes: 0,
+            pal_map: [Vec::new(), Vec::new()],
             counter: Counter::default(),
             cost_cdf,
             trial: None,
@@ -765,6 +785,7 @@ impl<D: Decide> Encoder<D> {
             cfl: if lossless { bw4 == 1 && bh4 == 1 } else { CFL_ALLOWED_MASK & (1 << bs as u8) != 0 },
             filter: cmp::max(b_dim[2], b_dim[3]) <= 3 && self.seq.filter_intra,
             chroma: self.planes > 1,
+            palette: self.frame.screen_content && cmp::max(bw4, bh4) <= 16 && bw4 + bh4 >= 4,
             max_depth: if self.frame.tx_select && !lossless { cmp::min(max_dim.max, 2) } else { 0 },
         };
         (limits, max_tx)
@@ -809,7 +830,6 @@ impl<D: Decide> Encoder<D> {
             delta: (x & 15 == 0 && y & 15 == 0 && (bs != BlockSize::Bs64x64 || !skip))
                 .then_some(self.sb_delta)
                 .flatten(),
-            screen_content: self.frame.screen_content,
             tx_select: self.frame.tx_select,
             lossless: self.frame.quant.lossless(),
             qidx: self.frame.quant.base,
@@ -818,10 +838,10 @@ impl<D: Decide> Encoder<D> {
             bh: self.bh,
         };
         if self.dry {
-            b.write(&mut self.counter, &mut self.cost_cdf, &mut self.above, &mut self.left, &txs);
+            b.write(&mut self.counter, &mut self.cost_cdf, &mut self.above, &mut self.left, &txs, &self.pal_map);
         } else {
             let tile = &mut self.tiles[ti];
-            b.write(&mut tile.w, &mut tile.cdf, &mut self.above, &mut self.left, &txs);
+            b.write(&mut tile.w, &mut tile.cdf, &mut self.above, &mut self.left, &txs, &self.pal_map);
             if b.delta.is_some() {
                 tile.last_qidx = self.sb_qidx;
             }
@@ -854,21 +874,72 @@ impl<D: Decide> Encoder<D> {
         let mut txs = Vec::new();
         if planes.contains(&0) {
             let flags = self.sm_flag(ax, ly) | edge_filter;
-            self.predict_plane(ti, bs, 0, x, y, w4, h4, tx, intra, edge_flags, flags, true, &mut txs);
+            let pal = intra.pal_sz[0] > 0;
+            if pal {
+                self.predict_palette(false, x, y, w4, h4, bw4, bh4, intra);
+            }
+            self.predict_plane(ti, bs, 0, x, y, w4, h4, tx, intra, edge_flags, flags, !pal, &mut txs);
         }
         if planes.contains(&1) {
+            if intra.pal_sz[1] > 0 {
+                self.predict_palette(true, x, y, w4, h4, bw4, bh4, intra);
+            }
             if intra.uv_mode == CFL_PRED {
                 self.predict_cfl(ti, x, y, w4, h4, bw4, bh4, tx, uvtx, intra);
             }
             let flags = self.sm_uv_flag(ax, ly) | edge_filter;
             for p in 1..3 {
-                let predict = !(intra.uv_mode == CFL_PRED && intra.cfl[p - 1] != 0);
+                let predict = !(intra.uv_mode == CFL_PRED && intra.cfl[p - 1] != 0) && intra.pal_sz[1] == 0;
                 self.predict_plane(ti, bs, p, x, y, w4, h4, uvtx, intra, edge_flags, flags, predict, &mut txs);
             }
         }
         self.above.restore_coef(ax, &saved_a);
         self.left.restore_coef(ly, &saved_l);
         txs
+    }
+
+    /// Fills a block with its palette colours, each pixel the nearest to the source, and keeps
+    /// the indexes; past the visible `w4`×`h4` they repeat the last column and row, as
+    /// `read_pal_indices` fills them.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_palette(&mut self, chroma: bool, x: i32, y: i32, w4: i32, h4: i32, bw4: i32, bh4: i32, intra: &Intra) {
+        let (w, h, bw, bh) = (w4 as usize * 4, h4 as usize * 4, bw4 as usize * 4, bh4 as usize * 4);
+        let (x0, wy) = (x as usize * 4, (y as usize * 4) % SB);
+        let n = intra.pal_sz[chroma as usize] as usize;
+        let mut map = std::mem::take(&mut self.pal_map[chroma as usize]);
+        map.clear();
+        map.resize(bw * bh, 0);
+        for r in 0..h {
+            let at = (wy + r) * self.src[0].stride + x0;
+            if chroma {
+                let u = self.src[1].comp.slice::<BD, _>((at.., ..w));
+                let v = self.src[2].comp.slice::<BD, _>((at.., ..w));
+                for c in 0..w {
+                    map[r * bw + c] = palette::nearest2(&intra.pal[1][..n], &intra.pal[2][..n], (u[c], v[c]));
+                }
+            } else {
+                let px = self.src[0].comp.slice::<BD, _>((at.., ..w));
+                for c in 0..w {
+                    map[r * bw + c] = palette::nearest(&intra.pal[0][..n], px[c]);
+                }
+            }
+            let last = map[r * bw + w - 1];
+            map[r * bw + w..][..bw - w].fill(last);
+        }
+        for r in h..bh {
+            map.copy_within((h - 1) * bw..h * bw, r * bw);
+        }
+        let planes = if chroma { 1..3 } else { 0..1 };
+        for p in planes {
+            let rec = &self.rec[p];
+            for r in 0..bh {
+                let mut dst = rec.comp.slice_mut::<BD, _>(((wy + r) * rec.stride + x0.., ..bw));
+                for c in 0..bw {
+                    dst[c] = intra.pal[p][map[r * bw + c] as usize];
+                }
+            }
+        }
+        self.pal_map[chroma as usize] = map;
     }
 
     fn sm_flag(&self, ax: usize, ly: usize) -> i32 {
@@ -1207,6 +1278,13 @@ impl<D: Decide> Encoder<D> {
         total
     }
 
+    /// The source pixels of a plane in `w`×`h` at a block's corner.
+    fn source(&self, plane: usize, x: i32, y: i32, w: usize, h: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(w * h);
+        self.src[plane].read(x as usize * 4, (y as usize * 4) % SB, w, h, &mut out);
+        out
+    }
+
     /// The sum of absolute 4×4 Hadamard coefficients of the luma residual in a block's visible
     /// area, rounded out to whole 4×4 blocks.
     fn satd(&self, x: i32, y: i32, w4: usize, h4: usize) -> u64 {
@@ -1328,15 +1406,26 @@ impl<D: Decide> Encoder<D> {
         let (ax, ly) = (x as usize, (y & 15) as usize);
         let lossless = self.frame.quant.lossless();
         let tx_select = self.frame.tx_select && !lossless;
-        let screen = self.frame.screen_content;
+        let (vw, vh) = ((cmp::min(w4 as i32, self.bw - x) * 4) as usize, (cmp::min(h4 as i32, self.bh - y) * 4) as usize);
+        let mode_bits = |e: &mut Self, intra: &Intra, depth: u8| -> u32 {
+            let mut c = Counter::default();
+            write_luma_modes(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, intra, &limits);
+            if limits.palette {
+                write_pal_y(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, bs, intra);
+            }
+            write_filter(&mut c, &mut e.cost_cdf, bs, intra, &limits);
+            if intra.pal_sz[0] > 0 {
+                let n = intra.pal_sz[0];
+                palette::write_indices(&mut c, &mut e.cost_cdf.m.color_map[0][n as usize - 2], &e.pal_map[0], w4 * 4, vw, vh, n);
+            }
+            write_depth(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, depth, max_tx, tx_select);
+            c.bits
+        };
 
         let luma = |e: &mut Self, intra: &Intra, depth: u8| -> f64 {
             e.restore(&start);
             let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 0..1);
-            let mut c = Counter::default();
-            write_luma_modes(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, intra, &limits);
-            write_luma_rest(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, bs, intra, depth, &limits, max_tx, screen, tx_select);
-            let bits = c.bits + coef_bits(e, &txs, bs, intra);
+            let bits = mode_bits(e, intra, depth) + coef_bits(e, &txs, bs, intra);
             let dist = e.sse(x, y, w4, h4, 0..1);
             e.rd_cost(dist, bits)
         };
@@ -1351,10 +1440,8 @@ impl<D: Decide> Encoder<D> {
             e.predict_only = true;
             e.predict_block(ti, bs, x, y, edge_flags, intra, 0, 0..1);
             e.predict_only = false;
-            let mut c = Counter::default();
-            write_luma_modes(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, intra, &limits);
-            write_luma_rest(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, bs, intra, 0, &limits, max_tx, screen, tx_select);
-            e.satd(x, y, w4, h4) as f64 + sad_lambda * c.bits as f64 / 512.0
+            let bits = mode_bits(e, intra, 0);
+            e.satd(x, y, w4, h4) as f64 + sad_lambda * bits as f64 / 512.0
         };
 
         self.dct_only = true;
@@ -1382,6 +1469,14 @@ impl<D: Decide> Encoder<D> {
         if limits.filter {
             for f in 0..5 {
                 let c = Intra { y_mode: FILTER_PRED, y_angle: f, ..Default::default() };
+                scored.push((score(self, &c), c));
+            }
+        }
+        if limits.palette {
+            for pal in palette::candidates_y(&self.source(0, x, y, vw, vh)) {
+                let mut c = Intra { y_mode: DC_PRED, ..Default::default() };
+                c.pal_sz[0] = pal.len() as u8;
+                c.pal[0][..pal.len()].copy_from_slice(&pal);
                 scored.push((score(self, &c), c));
             }
         }
@@ -1414,13 +1509,21 @@ impl<D: Decide> Encoder<D> {
                 let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 1..3);
                 let mut c = Counter::default();
                 write_chroma_modes(&mut c, &mut e.cost_cdf, intra, &limits);
+                if limits.palette {
+                    write_pal_uv(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, bs, intra);
+                }
+                if intra.pal_sz[1] > 0 {
+                    let n = intra.pal_sz[1];
+                    palette::write_indices(&mut c, &mut e.cost_cdf.m.color_map[1][n as usize - 2], &e.pal_map[1], w4 * 4, vw, vh, n);
+                }
                 let bits = c.bits + coef_bits(e, &txs, bs, intra);
                 let dist = e.sse(x, y, w4, h4, 1..3);
                 e.rd_cost(dist, bits)
             };
             let mut best = (f64::MAX, intra);
             for m in 0..N_UV_INTRA_PRED_MODES as u8 - 1 {
-                let c = Intra { uv_mode: m, uv_angle: 0, cfl: [0; 2], ..intra };
+                let mut c = Intra { uv_mode: m, uv_angle: 0, cfl: [0; 2], ..intra };
+                c.pal_sz[1] = 0;
                 let cost = chroma(self, &c);
                 if cost < best.0 {
                     best = (cost, c);
@@ -1430,6 +1533,19 @@ impl<D: Decide> Encoder<D> {
                 let d = best.1;
                 for a in [-3, -2, -1, 1, 2, 3] {
                     let c = Intra { uv_angle: a, ..d };
+                    let cost = chroma(self, &c);
+                    if cost < best.0 {
+                        best = (cost, c);
+                    }
+                }
+            }
+            if limits.palette {
+                let (u, v) = (self.source(1, x, y, vw, vh), self.source(2, x, y, vw, vh));
+                for (pu, pv) in palette::candidates_uv(&u, &v) {
+                    let mut c = Intra { uv_mode: DC_PRED, uv_angle: 0, cfl: [0; 2], ..intra };
+                    c.pal_sz[1] = pu.len() as u8;
+                    c.pal[1][..pu.len()].copy_from_slice(&pu);
+                    c.pal[2][..pv.len()].copy_from_slice(&pv);
                     let cost = chroma(self, &c);
                     if cost < best.0 {
                         best = (cost, c);
@@ -1582,7 +1698,6 @@ struct BlockWrite {
     max_tx: TxfmSize,
     limits: Limits,
     delta: Option<i32>,
-    screen_content: bool,
     tx_select: bool,
     lossless: bool,
     qidx: u8,
@@ -1592,7 +1707,8 @@ struct BlockWrite {
 }
 
 impl BlockWrite {
-    fn write<S: Sink>(&self, s: &mut S, cdf: &mut CdfContext, above: &mut Ctx, left: &mut Ctx, txs: &[TxDone]) {
+    #[allow(clippy::too_many_arguments)]
+    fn write<S: Sink>(&self, s: &mut S, cdf: &mut CdfContext, above: &mut Ctx, left: &mut Ctx, txs: &[TxDone], maps: &[Vec<u8>; 2]) {
         let (ax, ly) = (self.x as usize, (self.y & 15) as usize);
         let b_dim = self.bs.dimensions();
         let (bw4, bh4) = (b_dim[0] as usize, b_dim[1] as usize);
@@ -1615,17 +1731,21 @@ impl BlockWrite {
             write_chroma_modes(s, cdf, &self.intra, &self.limits);
         }
         let y_mode = if self.intra.y_mode == FILTER_PRED { DC_PRED } else { self.intra.y_mode };
-        if self.screen_content && cmp::max(bw4, bh4) <= 16 && bw4 + bh4 >= 4 {
-            let sz_ctx = (b_dim[2] + b_dim[3] - 2) as usize;
-            if y_mode == DC_PRED {
-                let pal_ctx = (above.pal_sz[ax] > 0) as usize + (left.pal_sz[ly] > 0) as usize;
-                s.bool_adapt(false, &mut cdf.m.pal_y[sz_ctx][pal_ctx]);
-            }
-            if self.limits.chroma && self.intra.uv_mode == DC_PRED {
-                s.bool_adapt(false, &mut cdf.m.pal_uv[0]);
+        if self.limits.palette {
+            write_pal_y(s, cdf, above, left, ax, ly, self.bs, &self.intra);
+            if self.limits.chroma {
+                write_pal_uv(s, cdf, above, left, ax, ly, self.bs, &self.intra);
             }
         }
-        write_luma_rest(s, cdf, above, left, ax, ly, self.bs, &self.intra, self.depth, &self.limits, self.max_tx, false, self.tx_select && !self.lossless);
+        write_filter(s, cdf, self.bs, &self.intra, &self.limits);
+        let (w, h) = ((cmp::min(bw4 as i32, self.bw - self.x) * 4) as usize, (cmp::min(bh4 as i32, self.bh - self.y) * 4) as usize);
+        for pl in 0..2 {
+            if self.intra.pal_sz[pl] > 0 {
+                let n = self.intra.pal_sz[pl];
+                palette::write_indices(s, &mut cdf.m.color_map[pl][n as usize - 2], &maps[pl], bw4 * 4, w, h, n);
+            }
+        }
+        write_depth(s, cdf, above, left, ax, ly, self.depth, self.max_tx, self.tx_select && !self.lossless);
         if !self.skip {
             for t in txs {
                 let (a, l) = coef_ctx(above, left, t.plane);
@@ -1667,13 +1787,24 @@ impl BlockWrite {
         left.tx_intra[ly..ly + bh4].fill(t_dim.lh as i8);
         above.mode[ax..ax + bw4].fill(y_mode);
         left.mode[ly..ly + bh4].fill(y_mode);
-        above.pal_sz[ax..ax + bw4].fill(0);
-        left.pal_sz[ly..ly + bh4].fill(0);
+        above.pal_sz[ax..ax + bw4].fill(self.intra.pal_sz[0]);
+        left.pal_sz[ly..ly + bh4].fill(self.intra.pal_sz[0]);
+        if self.intra.pal_sz[0] > 0 {
+            above.pal[ax..ax + bw4].iter_mut().for_each(|p| p[0] = self.intra.pal[0]);
+            left.pal[ly..ly + bh4].iter_mut().for_each(|p| p[0] = self.intra.pal[0]);
+        }
         above.skip[ax..ax + bw4].fill(self.skip as u8);
         left.skip[ly..ly + bh4].fill(self.skip as u8);
         if self.limits.chroma {
             above.uvmode[ax..ax + bw4].fill(self.intra.uv_mode);
             left.uvmode[ly..ly + bh4].fill(self.intra.uv_mode);
+            above.pal_sz_uv[ax..ax + bw4].fill(self.intra.pal_sz[1]);
+            left.pal_sz_uv[ly..ly + bh4].fill(self.intra.pal_sz[1]);
+            if self.intra.pal_sz[1] > 0 {
+                let [_, u, v] = self.intra.pal;
+                above.pal[ax..ax + bw4].iter_mut().for_each(|p| (p[1], p[2]) = (u, v));
+                left.pal[ly..ly + bh4].iter_mut().for_each(|p| (p[1], p[2]) = (u, v));
+            }
         }
     }
 }
@@ -1691,38 +1822,58 @@ fn write_luma_modes<S: Sink>(s: &mut S, cdf: &mut CdfContext, above: &Ctx, left:
     }
 }
 
-/// What follows the modes for luma: the palette flag when `palette_flag`, filter-intra and,
-/// when `tx_select`, the transform depth.
+/// The luma palette flag and, with a palette, its size and colours.
 #[allow(clippy::too_many_arguments)]
-fn write_luma_rest<S: Sink>(
-    s: &mut S,
-    cdf: &mut CdfContext,
-    above: &Ctx,
-    left: &Ctx,
-    ax: usize,
-    ly: usize,
-    bs: BlockSize,
-    intra: &Intra,
-    depth: u8,
-    limits: &Limits,
-    max_tx: TxfmSize,
-    palette_flag: bool,
-    tx_select: bool,
-) {
-    let b_dim = bs.dimensions();
-    let y_mode = if intra.y_mode == FILTER_PRED { DC_PRED } else { intra.y_mode };
-    if palette_flag && cmp::max(b_dim[0], b_dim[1]) <= 16 && b_dim[0] + b_dim[1] >= 4 && y_mode == DC_PRED {
-        let sz_ctx = (b_dim[2] + b_dim[3] - 2) as usize;
-        let pal_ctx = (above.pal_sz[ax] > 0) as usize + (left.pal_sz[ly] > 0) as usize;
-        s.bool_adapt(false, &mut cdf.m.pal_y[sz_ctx][pal_ctx]);
+fn write_pal_y<S: Sink>(s: &mut S, cdf: &mut CdfContext, above: &Ctx, left: &Ctx, ax: usize, ly: usize, bs: BlockSize, intra: &Intra) {
+    if !matches!(intra.y_mode, DC_PRED | FILTER_PRED) {
+        return;
     }
-    if y_mode == DC_PRED && limits.filter {
+    let b_dim = bs.dimensions();
+    let sz_ctx = (b_dim[2] + b_dim[3] - 2) as usize;
+    let pal_ctx = (above.pal_sz[ax] > 0) as usize + (left.pal_sz[ly] > 0) as usize;
+    let n = intra.pal_sz[0] as usize;
+    s.bool_adapt(n > 0, &mut cdf.m.pal_y[sz_ctx][pal_ctx]);
+    if n > 0 {
+        s.symbol(n as u8 - 2, &mut cdf.m.pal_sz[0][sz_ctx], 6);
+        let a_n = if ly != 0 { above.pal_sz[ax] as usize } else { 0 };
+        let (cache, c_n) = palette::cache(&above.pal[ax][0][..a_n], &left.pal[ly][0][..left.pal_sz[ly] as usize]);
+        palette::write_colors(s, &intra.pal[0][..n], &cache[..c_n], false);
+    }
+}
+
+/// The chroma palette flag and, with a palette, its size and U and V colours.
+#[allow(clippy::too_many_arguments)]
+fn write_pal_uv<S: Sink>(s: &mut S, cdf: &mut CdfContext, above: &Ctx, left: &Ctx, ax: usize, ly: usize, bs: BlockSize, intra: &Intra) {
+    if intra.uv_mode != DC_PRED {
+        return;
+    }
+    let b_dim = bs.dimensions();
+    let sz_ctx = (b_dim[2] + b_dim[3] - 2) as usize;
+    let n = intra.pal_sz[1] as usize;
+    s.bool_adapt(n > 0, &mut cdf.m.pal_uv[(intra.pal_sz[0] > 0) as usize]);
+    if n > 0 {
+        s.symbol(n as u8 - 2, &mut cdf.m.pal_sz[1][sz_ctx], 6);
+        let a_n = if ly != 0 { above.pal_sz_uv[ax] as usize } else { 0 };
+        let (cache, c_n) = palette::cache(&above.pal[ax][1][..a_n], &left.pal[ly][1][..left.pal_sz_uv[ly] as usize]);
+        palette::write_colors(s, &intra.pal[1][..n], &cache[..c_n], true);
+        palette::write_v(s, &intra.pal[2][..n]);
+    }
+}
+
+fn write_filter<S: Sink>(s: &mut S, cdf: &mut CdfContext, bs: BlockSize, intra: &Intra, limits: &Limits) {
+    let y_mode = if intra.y_mode == FILTER_PRED { DC_PRED } else { intra.y_mode };
+    if y_mode == DC_PRED && intra.pal_sz[0] == 0 && limits.filter {
         let filter = (intra.y_mode == FILTER_PRED).then_some(intra.y_angle as u8);
         s.bool_adapt(filter.is_some(), &mut cdf.m.use_filter_intra[bs as usize]);
         if let Some(f) = filter {
             s.symbol(f, &mut cdf.m.filter_intra.0, 4);
         }
     }
+}
+
+/// The transform depth, when the frame selects it.
+#[allow(clippy::too_many_arguments)]
+fn write_depth<S: Sink>(s: &mut S, cdf: &mut CdfContext, above: &Ctx, left: &Ctx, ax: usize, ly: usize, depth: u8, max_tx: TxfmSize, tx_select: bool) {
     let max_dim = &DAV1D_TXFM_DIMENSIONS[max_tx as usize];
     if tx_select && max_dim.max > 0 {
         let tctx = (left.tx_intra[ly] as i32 >= max_dim.lh as i32) as usize + (above.tx_intra[ax] as i32 >= max_dim.lw as i32) as usize;
@@ -2044,6 +2195,17 @@ pub(crate) mod tests {
                 m.y_mode = FILTER_PRED;
                 m.y_angle = r.below(5) as i8;
             }
+            if l.palette && m.y_mode == DC_PRED && r.below(2) == 0 {
+                let n = 2 + r.below(7) as usize;
+                let mut pal = random_colors(r, n);
+                pal.dedup();
+                while pal.len() < 2 {
+                    pal = random_colors(r, n);
+                    pal.dedup();
+                }
+                m.pal_sz[0] = pal.len() as u8;
+                m.pal[0][..pal.len()].copy_from_slice(&pal);
+            }
             if l.chroma {
                 m.uv_mode = r.below(13 + l.cfl as u32) as u8;
                 if m.uv_mode == CFL_PRED {
@@ -2055,6 +2217,14 @@ pub(crate) mod tests {
                     }
                 } else if l.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&m.uv_mode) {
                     m.uv_angle = r.below(7) as i8 - 3;
+                }
+                if l.palette && m.uv_mode == DC_PRED && r.below(2) == 0 {
+                    let n = 2 + r.below(7) as usize;
+                    m.pal_sz[1] = n as u8;
+                    m.pal[1][..n].copy_from_slice(&random_colors(r, n));
+                    for v in &mut m.pal[2][..n] {
+                        *v = [0, 255, 7, 128, 129][r.below(5) as usize] ^ (r.below(4) as u8 * 50);
+                    }
                 }
             }
             (m, r.below(l.max_depth as u32 + 1) as u8)
@@ -2074,6 +2244,14 @@ pub(crate) mod tests {
             }
             Some(txtp)
         }
+    }
+
+    /// Sorted colours from a small set, so neighbouring palettes share some.
+    fn random_colors(r: &mut Rng, n: usize) -> Vec<u8> {
+        const SET: [u8; 12] = [0, 1, 37, 74, 127, 128, 191, 200, 223, 239, 254, 255];
+        let mut c: Vec<u8> = (0..n).map(|_| SET[r.below(12) as usize] ^ (r.below(3) as u8 * 2)).collect();
+        c.sort_unstable();
+        c
     }
 
     pub fn sequence(width: u32, height: u32, mono: bool) -> Sequence {
@@ -2204,6 +2382,7 @@ pub(crate) mod tests {
                 random(w, h, seed % 3 == 2, s, |f| {
                     f.tx_select = seed % 2 == 0;
                     f.reduced_tx_set = seed % 4 == 1;
+                    f.screen_content = seed % 3 != 1;
                 });
             }
         }
@@ -2380,6 +2559,80 @@ pub(crate) mod tests {
         let full = run(0);
         let kept = run(4);
         eprintln!("satd ranking: all modes {full:?}, 4 kept {kept:?}");
-        assert!(kept.2 < full.2 && kept.0 as f64 <= full.0 as f64 * 1.04 && kept.1 >= full.1 - 0.15, "{full:?} {kept:?}");
+        assert!(kept.0 as f64 <= full.0 as f64 * 1.04 && kept.1 >= full.1 - 0.15, "{full:?} {kept:?}");
+    }
+
+    /// A picture of flat shapes and one-pixel lines in a few colours.
+    fn graphic(w: usize, h: usize) -> Vec<Vec<u8>> {
+        let colours = [[235u8, 128, 128], [40, 160, 110], [120, 90, 200], [200, 30, 150], [16, 128, 128]];
+        let mut planes = vec![vec![0u8; w * h]; 3];
+        for y in 0..h {
+            for x in 0..w {
+                let k = if (x / 3 + y / 7) % 11 == 0 || y % 17 == 0 {
+                    4
+                } else if (x as i32 - 60).pow(2) + (y as i32 - 40).pow(2) < 900 {
+                    1
+                } else if x > 100 && y > 20 && y < 90 {
+                    2
+                } else if (x + y) % 37 < 3 {
+                    3
+                } else {
+                    0
+                };
+                for p in 0..3 {
+                    planes[p][y * w + x] = colours[k][p];
+                }
+            }
+        }
+        planes
+    }
+
+    /// On flat colours, palettes code fewer bytes at a higher PSNR than the other intra tools.
+    #[test]
+    fn palette_on_graphics() {
+        let (w, h) = (160, 112);
+        let img = graphic(w, h);
+        let (seq, fr) = crate::enc::headers(w as u32, h as u32, false, 100);
+        let mut screen = fr.clone();
+        screen.screen_content = true;
+        let plain = round_trip_with(&img, w, h, seq.clone(), fr, Rd);
+        let pal = round_trip_with(&img, w, h, seq, screen, Rd);
+        let db = |c: &Coded| psnr(&img, &decode_with(c.data.clone(), w, h, 3, true));
+        let (a, b) = ((plain.data.len(), db(&plain)), (pal.data.len(), db(&pal)));
+        eprintln!("graphic: without palette {a:?}, with {b:?}");
+        assert!(b.0 < a.0 && b.1 > a.1, "{a:?} {b:?}");
+    }
+
+    /// Every 16×16 block takes the same palettes; the luma colours shrink the delta width after
+    /// 223 (254 − 223 needs 5 bits where the first deltas need 7) and V is delta coded.
+    #[test]
+    fn palette_colour_widths() {
+        struct Fixed;
+        impl Decide for Fixed {
+            fn partition(&mut self, bl: BlockLevel, x: i32, y: i32, h: Halves) -> BlockPartition {
+                Skip(BlockLevel::Bl16x16).partition(bl, x, y, h)
+            }
+            fn mode(&mut self, _: BlockSize, x: i32, _: i32, l: &Limits) -> (Intra, u8) {
+                let mut m = Intra::default();
+                if l.palette {
+                    let y = [[0, 100, 223, 240], [3, 60, 191, 250]][(x / 4 % 2) as usize];
+                    m.pal_sz = [4, 3];
+                    m.pal[0][..4].copy_from_slice(&y);
+                    m.pal[1][..3].copy_from_slice(&[10, 127, 200]);
+                    m.pal[2][..3].copy_from_slice(&[128, 140, 120]);
+                }
+                (m, 0)
+            }
+            fn residual(&mut self, _: usize, _: TxfmSize, set: &[TxfmType], levels: &mut [i32]) -> Option<TxfmType> {
+                levels.fill(0);
+                Some(set.first().copied().unwrap_or(DCT_DCT))
+            }
+        }
+        let (w, h) = (72, 40);
+        let img = graphic(w, h);
+        let seq = sequence(w as u32, h as u32, false);
+        let mut fr = frame(&seq, 90);
+        fr.screen_content = true;
+        round_trip(&img, w, h, fr, Fixed);
     }
 }

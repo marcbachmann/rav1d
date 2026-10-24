@@ -554,7 +554,7 @@ fn findoddzero(buf: &[u8]) -> bool {
         .is_some()
 }
 
-fn order_palette(
+pub(crate) fn order_palette(
     pal_idx: &[u8],
     stride: usize,
     i: usize,
