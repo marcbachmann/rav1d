@@ -3036,6 +3036,7 @@ pub(crate) mod tests {
             chroma_delta_q: std::env::var("ENC_CHROMA_DQ").is_ok_and(|v| v == "1"),
             iq_rdmult: std::env::var("ENC_IQ_RDMULT").is_ok_and(|v| v == "1"),
             skip_prediction: std::env::var("ENC_SKIP_PRED").map_or(true, |v| v != "0"),
+            iq_filters: std::env::var("ENC_IQ_FILTERS").is_ok_and(|v| v == "1"),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
         files.sort();
@@ -3065,6 +3066,9 @@ pub(crate) mod tests {
             }
             let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));
             println!("{:20} {t:6} ms {:7} B {d:6.2} dB", path.file_stem().unwrap().to_string_lossy(), c.data.len());
+            if std::env::var("ENC_UNFILTERED").is_ok() {
+                println!("  before the in-loop filters {:.2} dB", psnr(&planes, &decode_with(c.data.clone(), w, h, 3, false)));
+            }
             ms += t;
             bytes += c.data.len();
             db += d;

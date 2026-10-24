@@ -89,6 +89,9 @@ pub struct Options {
     pub iq_rdmult: bool,
     /// See `Encoder::skip_prediction`; libaom predicts skips at every speed.
     pub skip_prediction: bool,
+    /// libaom's tune-IQ filters: no CDEF up to qindex 32 (`CDEF_ADAPTIVE`), deblocking sharpness
+    /// 7 up to qindex 112 and 1 up to 160 (adaptive sharpness).
+    pub iq_filters: bool,
 }
 
 impl Options {
@@ -103,14 +106,14 @@ impl Options {
             _ => (2, 2, 0, 0..4, 1.0),
         };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false }
     }
 }
 
 impl Options {
     /// Everything libaom's tune IQ changes that the encoder has.
     pub fn tune_iq(self) -> Self {
-        Self { variance_boost: true, ssim: true, quant_matrices: true, chroma_delta_q: true, iq_rdmult: true, ..self }
+        Self { variance_boost: true, ssim: true, quant_matrices: true, chroma_delta_q: true, iq_rdmult: true, iq_filters: true, ..self }
     }
 }
 
@@ -153,6 +156,16 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
     let (seq, mut frame) = headers(width, height, planes.len() == 1, options.qidx);
     frame.screen_content = options.screen;
     let lossy = options.qidx != 0;
+    if lossy && options.iq_filters {
+        frame.sharpness = match options.qidx {
+            ..=112 => 7,
+            ..=160 => 1,
+            _ => 0,
+        };
+        if options.qidx <= 32 {
+            frame.cdef = Some(Cdef { damping: 3, ..Default::default() });
+        }
+    }
     if lossy && options.chroma_delta_q && planes.len() == 3 {
         frame.quant.u_ac = cmp::min(options.qidx / 2, 24) as i8;
     }
