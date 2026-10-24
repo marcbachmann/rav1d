@@ -87,6 +87,8 @@ pub struct Options {
     pub chroma_delta_q: bool,
     /// libaom's tune-IQ weight on λ, up to 72/128 more at low qindexes.
     pub iq_rdmult: bool,
+    /// See `Encoder::skip_prediction`; libaom predicts skips at every speed.
+    pub skip_prediction: bool,
 }
 
 impl Options {
@@ -101,7 +103,7 @@ impl Options {
             _ => (2, 2, 0, 0..4, 1.0),
         };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true }
     }
 }
 
@@ -169,6 +171,7 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
     }
     let mut e = Encoder::new(seq, frame, Rd);
     e.iq = options.iq_rdmult;
+    e.skip_prediction = options.skip_prediction;
     e.keep_modes = options.keep_modes;
     e.keep_chroma = options.keep_chroma;
     e.rect = options.rect;

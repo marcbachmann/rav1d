@@ -395,6 +395,11 @@ pub struct Encoder<D: Decide> {
     /// The geometric mean of `ssim_factor` over the frame: λ is scaled per 16×16 block by its
     /// factor over this, libaom's tune-IQ rate weighting.
     pub ssim_reference: Option<f64>,
+    /// libaom's `predict_skip_txfm`: a luma block whose residual is small at its largest
+    /// transform is coded without residual, and no smaller transform is searched.
+    pub skip_prediction: bool,
+    /// Whether the last luma residual searched was predicted to skip.
+    skip_predicted: bool,
     /// The superblock's 16×16 blocks' factors over `ssim_reference`, and its λ before them.
     ssim: [f64; 16],
     sb_lambda: f64,
@@ -508,6 +513,8 @@ impl<D: Decide> Encoder<D> {
             variance_boost: false,
             rdoq: 0,
             ssim_reference: None,
+            skip_prediction: false,
+            skip_predicted: false,
             ssim: [1.0; 16],
             sb_lambda: 1.0,
 
@@ -1361,6 +1368,17 @@ impl<D: Decide> Encoder<D> {
         for i in 0..pw * ph {
             residual[i] = src[i] as i16 - pred[i] as i16;
         }
+        let block = bs.dimensions();
+        self.skip_predicted = plane == 0
+            && self.skip_prediction
+            && !self.frame.quant.lossless()
+            && (t_dim.w, t_dim.h) == (block[0], block[1])
+            && predicts_skip(&residual[..pw * ph], pw, ph, vw, vh, self.dq[0]);
+        if self.skip_predicted {
+            levels.fill(0);
+            self.bufs = Some(b);
+            return cands[0];
+        }
         let sse = |a: &[u8], b: &[u8], stride: usize| -> u64 {
             let mut s = 0;
             for r in 0..vh {
@@ -1744,6 +1762,9 @@ impl<D: Decide> Encoder<D> {
                 if cost < best_luma.0 {
                     best_luma = (cost, c, depth);
                 }
+                if self.skip_predicted {
+                    break;
+                }
             }
         }
         self.dct_only = false;
@@ -1945,6 +1966,51 @@ fn delta_steps(res: i32, last: u8, want: u8) -> i32 {
 }
 
 /// The quantized level of each coefficient: `rounding` in 1/128 of a step.
+/// libaom's `predict_skip_txfm` at level 1 for an 8-bit luma residual of `pw`×`ph`, `vw`×`vh`
+/// of it visible: a mean square error under (dc_q / 8)² / 8 and DCT coefficients, in tiles of up
+/// to 16×16, all under a block-size multiple of the quantizer.
+fn predicts_skip(residual: &[i16], pw: usize, ph: usize, vw: usize, vh: usize, dq: [u32; 2]) -> bool {
+    let mut se = 0u64;
+    for r in 0..vh {
+        for &d in &residual[r * pw..][..vw] {
+            se += (d as i64 * d as i64) as u64;
+        }
+    }
+    let n = (dq[0] >> 3) as u64;
+    if se / (pw * ph) as u64 > n * n / 8 {
+        return false;
+    }
+    use TxfmSize::*;
+    let (thresh, tx) = match (pw, ph) {
+        (4, 4) => (64, S4x4),
+        (4, 8) => (64, R4x8),
+        (8, 4) => (64, R8x4),
+        (8, 8) => (70, S8x8),
+        (8, 16) => (60, R8x16),
+        (16, 8) => (60, R16x8),
+        (4, 16) => (64, R4x16),
+        (16, 4) => (64, R16x4),
+        (8, 32) | (32, 8) => (70, S8x8),
+        _ => (68, S16x16),
+    };
+    let t = &DAV1D_TXFM_DIMENSIONS[tx as usize];
+    let (tw, th) = (t.w as usize * 4, t.h as usize * 4);
+    let mut tile = [0i16; 256];
+    let mut coefs = [0i32; 256];
+    for y in (0..ph).step_by(th) {
+        for x in (0..pw).step_by(tw) {
+            for r in 0..th {
+                tile[r * tw..][..tw].copy_from_slice(&residual[(y + r) * pw + x..][..tw]);
+            }
+            fdct_fast::forward(&tile[..tw * th], tw, &mut coefs[..tw * th], tx, DCT_DCT);
+            if coefs[0].unsigned_abs() << 7 >= thresh * dq[0] || coefs[1..tw * th].iter().any(|c| c.unsigned_abs() << 7 >= thresh * dq[1]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32) {
     for (rc, (&c, l)) in coefs.iter().zip(levels.iter_mut()).enumerate() {
         let mut q = dq[(rc != 0) as usize];
@@ -2969,6 +3035,7 @@ pub(crate) mod tests {
             quant_matrices: std::env::var("ENC_QM").is_ok_and(|v| v == "1"),
             chroma_delta_q: std::env::var("ENC_CHROMA_DQ").is_ok_and(|v| v == "1"),
             iq_rdmult: std::env::var("ENC_IQ_RDMULT").is_ok_and(|v| v == "1"),
+            skip_prediction: std::env::var("ENC_SKIP_PRED").map_or(true, |v| v != "0"),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
         files.sort();
@@ -3085,5 +3152,17 @@ pub(crate) mod tests {
         let (a, b) = (code(&plain), code(&iq));
         eprintln!("tune iq: plain {} B {:.2} dB, tune iq {} B {:.2} dB", a.0, a.1, b.0, b.1);
         assert!(b.0 < a.0 && b.1 > a.1 - 3.0);
+    }
+
+    /// libaom's limits: a 16×16 DC of 128 per level against 68/128 of the DC step, and a mean
+    /// square error against (dc_q / 8)² / 8, 703 at a DC step of 600.
+    #[test]
+    fn skip_prediction() {
+        let flat = |r: i16| vec![r; 64 * 64];
+        let checker = |r: i16| (0..64 * 64).map(|i| if (i / 64 + i % 64) % 2 == 0 { r } else { -r }).collect::<Vec<i16>>();
+        let skip = |res: &[i16], dq| predicts_skip(res, 64, 64, 64, 64, dq);
+        assert_eq!((skip(&flat(2), [600, 600]), skip(&flat(3), [600, 600])), (true, false));
+        assert_eq!((skip(&checker(26), [600, 1 << 20]), skip(&checker(27), [600, 1 << 20])), (true, false));
+        assert!(!skip(&checker(2), [600, 20]));
     }
 }
