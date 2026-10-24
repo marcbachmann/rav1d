@@ -66,6 +66,13 @@ speed features listed what its search skips; taken so far:
   content. Also not worth it: an f32 quantizer in the estimate (no faster than the integer
   one), exact rate for only the best 1-2 transform types by a crude estimate (-3% for +0.6%
   bytes).
+- Memory: a 1400x1400 frame (the largest single frame) peaks at 31 MB for the whole bench
+  process without the filter search and 41 MB with it, about 25 MB of it the bench's own
+  source; the encoder holds about 6-16 MB.
+- Search time by block side at qindex 32: 8 px 22%, 16 px 29%, 32 px 26%, 64 px 13%. No 8x8
+  above qindex 100 measured -37.6% at qindex 140 on the crops for -0.04 dB, yet failed four
+  more AVIF gates (alpha PNG, grey ramp, HEIC, text page); a stronger whole-cost split prune
+  at 16x16 changed almost nothing. Partition pruning needs a predictor (libaom's intra CNN).
 - Trap: the image-processing calibration in the dev profile compiles `Encoder<Rd>` at
   opt-level 0 and timed the encoder 4-5x too slow.
 
