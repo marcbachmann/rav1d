@@ -421,6 +421,8 @@ pub struct Encoder<D: Decide> {
     pub uv_from_luma: bool,
     /// See `Options::prune_intra`.
     pub prune_intra: bool,
+    /// See `Options::rank_rd`.
+    pub rank_rd: bool,
     /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
     pub levels: Range<u8>,
     /// A block whose unsplit cost, distortion and rate, is under `prune` bits' worth per 4×4 unit
@@ -557,6 +559,7 @@ impl<D: Decide> Encoder<D> {
             tx_domain_dist: false,
             uv_from_luma: false,
             prune_intra: false,
+            rank_rd: false,
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
@@ -1420,6 +1423,50 @@ impl<D: Decide> Encoder<D> {
         }
     }
 
+    /// A luma block's cost at depth 0 by its DCT alone, the prediction in place: the quantized
+    /// coefficients' error and their counted rate, for ranking modes.
+    fn luma_estimate(&mut self, bs: BlockSize, x: i32, y: i32, intra: &Intra) -> f64 {
+        let (tx, _) = self.tx_sizes(bs, 0);
+        let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
+        let (pw, ph) = (t_dim.w as usize * 4, t_dim.h as usize * 4);
+        let n = cmp::min(pw, 32) * cmp::min(ph, 32);
+        let (x0, wy) = (x as usize * 4, (y as usize * 4) % SB);
+        let mut b = self.bufs.take().unwrap();
+        let Bufs { residual, coefs, trial, .. } = &mut *b;
+        let (src, rec) = (&self.src[0], &self.rec[0]);
+        for r in 0..ph {
+            let at = (wy + r) * src.stride + x0;
+            let s = src.comp.slice::<BD, _>((at.., ..pw));
+            let p = rec.comp.slice::<BD, _>((at.., ..pw));
+            for c in 0..pw {
+                residual[r * pw + c] = s[c] as i16 - p[c] as i16;
+            }
+        }
+        fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, DCT_DCT);
+        let qm = self.qm[tx as usize][0];
+        let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
+        quantize(&coefs[..n], &mut trial[..n], self.dq[0], qm, shift, 48);
+        let eob = eob_of(tx, DCT_DCT, &trial[..n]);
+        let dq = self.dq[0];
+        let err: i64 = (0..n)
+            .map(|rc| {
+                let q = dq[(rc != 0) as usize];
+                let q = qm.map_or(q, |m| q * m[rc] as u32 + 16 >> 5) as i64;
+                let d = ((coefs[rc].unsigned_abs() as i64) << shift) - q * trial[rc].unsigned_abs() as i64;
+                d * d
+            })
+            .sum();
+        let (ax, ly) = (x as usize, (y & 15) as usize);
+        let (mut a, mut l) = ([0x40u8; 48], [0x40u8; 48]);
+        a[..16].copy_from_slice(&self.above.lcoef[ax..][..16]);
+        l[..16].copy_from_slice(&self.left.lcoef[ly..][..16]);
+        let mut c = Counter::default();
+        let (qidx, reduced) = (self.frame.quant.base, self.frame.reduced_tx_set);
+        write_coefs(&mut c, &mut self.cost_cdf, Some(&self.coef_costs), &mut a, &mut l, 0, 0, 0, tx, bs, DCT_DCT, &trial[..n], eob, intra, false, qidx, reduced, i32::MAX, i32::MAX);
+        self.bufs = Some(b);
+        err as f64 / 64.0 + self.lambda * c.bits as f64 / 512.0
+    }
+
     /// Chooses a transform type from `cands` and its levels by rate and distortion; the
     /// prediction is in place in the reconstruction.
     #[allow(clippy::too_many_arguments)]
@@ -1837,6 +1884,9 @@ impl<D: Decide> Encoder<D> {
             e.predict_block(ti, bs, x, y, edge_flags, intra, 0, 0..1);
             e.predict_only = false;
             let bits = mode_bits(e, intra, 0);
+            if e.rank_rd && !e.frame.quant.lossless() {
+                return e.luma_estimate(bs, x, y, intra) + e.lambda * bits as f64 / 512.0;
+            }
             e.satd(x, y, w4, h4) as f64 + sad_lambda * bits as f64 / 512.0
         };
 
@@ -3266,6 +3316,7 @@ pub(crate) mod tests {
             tx_domain_dist: std::env::var("ENC_TX_DOMAIN").is_ok_and(|v| v == "1"),
             uv_from_luma: std::env::var("ENC_UV_FROM_LUMA").is_ok_and(|v| v == "1"),
             prune_intra: std::env::var("ENC_PRUNE_INTRA").is_ok_and(|v| v == "1"),
+            rank_rd: std::env::var("ENC_RANK_RD").is_ok_and(|v| v == "1"),
             levels: std::env::var("ENC_LEVELS").map_or(0..5, |v| {
                 let (a, b) = v.split_once("..").unwrap();
                 a.parse().unwrap()..b.parse().unwrap()

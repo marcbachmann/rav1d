@@ -84,6 +84,8 @@ pub struct Options {
     /// libaom's `disable_smooth_intra` and `prune_filter_intra_level` 1: no SMOOTH_V or SMOOTH_H,
     /// and filter intra only as DC or the filter mode of the best mode so far.
     pub prune_intra: bool,
+    /// Luma modes are ranked by their DCT's quantization error and rate instead of SATD.
+    pub rank_rd: bool,
     /// See `Encoder::levels`: 0 is 64×64, 4 the 4×4 blocks of a split 8×8.
     pub levels: std::ops::Range<u8>,
     /// See `Encoder::prune`; 0 tries every partition.
@@ -113,8 +115,8 @@ pub struct Options {
 impl Options {
     /// The search for an effort of 0 (fastest) to 9, as libaom's `cpu-used` of 9 − effort.
     /// Measured on 256 px crops at qidx 120 against the full search (`doc/encoder-progress.md`);
-    /// from effort 4 qindexes to 64 and pictures to 512×512 keep every mode and search transform
-    /// types at every depth.
+    /// from effort 4 qindexes to 64 and pictures to 512×512 keep 4 luma modes ranked by
+    /// `luma_estimate`, every chroma mode, and search transform types at every depth.
     pub fn effort(qidx: u8, effort: u8, screen: bool, pixels: u64) -> Self {
         let (keep_modes, keep_chroma, rect, levels, prune) = match effort {
             8.. => (0, 0, 1, 0..5, 0.0),
@@ -124,9 +126,9 @@ impl Options {
             _ => (2, 2, 0, 0..4, 4.0),
         };
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
-        let (keep_modes, keep_chroma) = if fine { (0, 0) } else { (keep_modes, keep_chroma) };
+        let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
     }
 }
 
@@ -218,6 +220,7 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
     e.tx_domain_dist = options.tx_domain_dist;
     e.uv_from_luma = options.uv_from_luma;
     e.prune_intra = options.prune_intra;
+    e.rank_rd = options.rank_rd;
     e.levels = options.levels.clone();
     e.variance_boost = boost;
     e.rdoq = options.rdoq;
