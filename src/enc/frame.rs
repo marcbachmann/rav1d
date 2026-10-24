@@ -1547,8 +1547,7 @@ impl<D: Decide> Encoder<D> {
         fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, DCT_DCT);
         let qm = self.qm[tx as usize][0];
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
-        quantize(&coefs[..n], &mut trial[..n], self.dq[0], qm, shift, 48);
-        let eob = eob_of(tx, DCT_DCT, &trial[..n]);
+        let eob = quantize(&coefs[..n], &mut trial[..n], self.dq[0], qm, shift, 48, scan_index(tx, TxClass::TwoD));
         let dq = self.dq[0];
         let err: i64 = (0..n)
             .map(|rc| {
@@ -1651,8 +1650,7 @@ impl<D: Decide> Encoder<D> {
             for &txtp in cands {
                 fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
                 let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
-                quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, 48);
-                let eob = eob_of(tx, txtp, &trial[..n]);
+                let eob = quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, 48, scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]));
                 if eob < 0 {
                     continue;
                 }
@@ -1694,8 +1692,8 @@ impl<D: Decide> Encoder<D> {
         for &txtp in cands {
             fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
-            quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 });
-            let eob = eob_of(tx, txtp, &trial[..n]);
+            let index = scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]);
+            let eob = quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 }, index);
             if eob < 0 {
                 continue;
             }
@@ -2407,8 +2405,11 @@ fn predicts_skip(residual: &[i16], pw: usize, ph: usize, vw: usize, vh: usize, d
     true
 }
 
-fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32) {
-    for (rc, (&c, l)) in coefs.iter().zip(levels.iter_mut()).enumerate() {
+/// Returns the end of block, the last nonzero level's position in `index` (the scan), or -1.
+#[allow(clippy::too_many_arguments)]
+fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> i32 {
+    let mut eob = -1;
+    for (rc, ((&c, l), &i)) in coefs.iter().zip(levels.iter_mut()).zip(index).enumerate() {
         let mut q = dq[(rc != 0) as usize];
         if let Some(qm) = qm {
             q = q * qm[rc] as u32 + 16 >> 5;
@@ -2416,7 +2417,11 @@ fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, 
         let a = (c.unsigned_abs() as u64) << shift;
         let v = ((a * 128 + q as u64 * rounding as u64) / (q as u64 * 128)) as i32;
         *l = if c < 0 { -v } else { v };
+        if v != 0 {
+            eob = cmp::max(eob, i as i32);
+        }
     }
+    eob
 }
 
 /// The context a transform block leaves for its neighbours: the sum of its levels, capped, and
