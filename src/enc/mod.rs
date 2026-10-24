@@ -75,6 +75,9 @@ pub struct Options {
     /// libaom's `use_reduced_intra_txset`: under 16×16 the four DCT and ADST types and the one
     /// of IDTX, V_DCT, H_DCT the luma mode suits; to effort 7 where the search is not full.
     pub reduced_txtp: bool,
+    /// libaom's transform-domain distortion: transform types are ranked by their coefficients'
+    /// error, and only the winner is reconstructed.
+    pub tx_domain_dist: bool,
     /// See `Encoder::levels`: 0 is 64×64, 4 the 4×4 blocks of a split 8×8.
     pub levels: std::ops::Range<u8>,
     /// See `Encoder::prune`; 0 tries every partition.
@@ -117,7 +120,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (0, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 7 && !fine, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 7 && !fine, tx_domain_dist: effort <= 7, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
     }
 }
 
@@ -206,6 +209,7 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
     e.rect = options.rect;
     e.late_txtp = options.late_txtp;
     e.reduced_txtp = options.reduced_txtp;
+    e.tx_domain_dist = options.tx_domain_dist;
     e.levels = options.levels.clone();
     e.variance_boost = boost;
     e.rdoq = options.rdoq;

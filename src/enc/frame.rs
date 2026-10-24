@@ -413,6 +413,8 @@ pub struct Encoder<D: Decide> {
     pub late_txtp: bool,
     /// See `Options::reduced_txtp`.
     pub reduced_txtp: bool,
+    /// See `Options::tx_domain_dist`.
+    pub tx_domain_dist: bool,
     /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
     pub levels: Range<u8>,
     /// A block whose unsplit distortion is under `prune` bits' worth per 4×4 unit is not split.
@@ -544,6 +546,7 @@ impl<D: Decide> Encoder<D> {
             rect: 1,
             late_txtp: false,
             reduced_txtp: false,
+            tx_domain_dist: false,
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
@@ -1474,6 +1477,47 @@ impl<D: Decide> Encoder<D> {
         let mut best = (zero, cands[0]);
         levels.fill(0);
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
+        if self.tx_domain_dist && cands.len() > 1 && self.rdoq == 0 && !lossless {
+            let mut winner: Option<(f64, TxfmType, i32, u32)> = None;
+            for &txtp in cands {
+                fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
+                let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
+                quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, 48);
+                let eob = eob_of(tx, txtp, &trial[..n]);
+                if eob < 0 {
+                    continue;
+                }
+                let bits = rate(self, txtp, &trial[..n], eob);
+                let dq = self.dq[plane];
+                let err: i64 = (0..n)
+                    .map(|rc| {
+                        let q = dq[(rc != 0) as usize];
+                        let q = qm.map_or(q, |m| q * m[rc] as u32 + 16 >> 5) as i64;
+                        let d = ((coefs[rc].unsigned_abs() as i64) << shift) - q * trial[rc].unsigned_abs() as i64;
+                        d * d
+                    })
+                    .sum();
+                let cost = err as f64 / 64.0 + self.lambda * bits as f64 / 512.0;
+                if winner.is_none_or(|w| cost < w.0) {
+                    winner = Some((cost, txtp, eob, bits));
+                    levels.copy_from_slice(&trial[..n]);
+                }
+            }
+            if let Some((_, txtp, eob, bits)) = winner {
+                self.dequant(plane, tx, txtp, levels, &mut cf.0[..n]);
+                self.scratch.write(0, 0, pw, ph, &pred[..pw * ph]);
+                let dst = self.scratch.comp.with_offset::<BD>();
+                self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
+                let dist = sse(&src[..], &self.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB);
+                if dist as f64 + self.lambda * bits as f64 / 512.0 < zero {
+                    self.bufs = Some(b);
+                    return txtp;
+                }
+                levels.fill(0);
+            }
+            self.bufs = Some(b);
+            return cands[0];
+        }
         for &txtp in cands {
             fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
@@ -3180,6 +3224,7 @@ pub(crate) mod tests {
             rect: std::env::var("ENC_RECT").map_or(1, |v| v.parse().unwrap()),
             late_txtp: std::env::var("ENC_LATE").is_ok_and(|v| v == "1"),
             reduced_txtp: std::env::var("ENC_REDUCED_TXTP").is_ok_and(|v| v == "1"),
+            tx_domain_dist: std::env::var("ENC_TX_DOMAIN").is_ok_and(|v| v == "1"),
             levels: std::env::var("ENC_LEVELS").map_or(0..5, |v| {
                 let (a, b) = v.split_once("..").unwrap();
                 a.parse().unwrap()..b.parse().unwrap()
