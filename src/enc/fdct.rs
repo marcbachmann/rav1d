@@ -297,22 +297,24 @@ fn fidentity32(input: &[i32], output: &mut [i32], _cos_bit: i8) {
     }
 }
 
-/// The `eob` rav1d's inverse transforms take: the position of the last nonzero
-/// coefficient in the decoder's scan order, `None` when all are zero.
+/// Where the decoder stores the `i`th coefficient of its scan order.
+pub fn scan_rc(size: TxfmSize, ty: TxfmType, i: usize) -> usize {
+    let (cw, ch) = coded_dimensions(size);
+    match DAV1D_TX_TYPE_CLASS[ty as usize] {
+        TxClass::TwoD => DAV1D_SCANS[size as usize][i].get() as usize,
+        TxClass::H => i,
+        TxClass::V => (i % cw) * ch + i / cw,
+    }
+}
+
+/// The `eob` rav1d's inverse transforms take: the scan position of the last
+/// nonzero coefficient, `None` when all are zero.
 pub fn last_nonzero(coefs: &[i32], size: TxfmSize, ty: TxfmType) -> Option<u16> {
     let (cw, ch) = coded_dimensions(size);
-    let coefs = &coefs[..cw * ch];
-    match DAV1D_TX_TYPE_CLASS[ty as usize] {
-        TxClass::TwoD => DAV1D_SCANS[size as usize]
-            .iter()
-            .rposition(|rc| coefs[rc.get() as usize] != 0)
-            .map(|i| i as u16),
-        TxClass::H => coefs.iter().rposition(|&c| c != 0).map(|i| i as u16),
-        TxClass::V => (0..cw * ch)
-            .rev()
-            .find(|&i| coefs[(i % cw) * ch + i / cw] != 0)
-            .map(|i| i as u16),
-    }
+    (0..cw * ch)
+        .rev()
+        .find(|&i| coefs[scan_rc(size, ty, i)] != 0)
+        .map(|i| i as u16)
 }
 
 const COSPI: [[i32; 64]; 4] = [
@@ -1800,6 +1802,7 @@ mod tests {
         size: TxfmSize,
         ty: TxfmType,
         coefs: &[i32],
+        eob: i32,
     ) -> Vec<i32> {
         let (w, h) = dimensions(size);
         let (cw, ch) = coded_dimensions(size);
@@ -1807,7 +1810,6 @@ mod tests {
         for (c, &v) in cf.0.iter_mut().zip(&coefs[..cw * ch]) {
             *c = i16::try_from(v).expect("coefficient beyond 16 bits");
         }
-        let eob = last_nonzero(coefs, size, ty).map_or(0, |e| e as i32);
         let mut px = Align64([128u8; 64 * 64]);
         {
             let pic = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(&mut px.0, w);
@@ -1819,6 +1821,10 @@ mod tests {
             );
         }
         px.0[..w * h].iter().map(|&p| p as i32 - 128).collect()
+    }
+
+    fn eob(coefs: &[i32], size: TxfmSize, ty: TxfmType) -> i32 {
+        last_nonzero(coefs, size, ty).map_or(0, |e| e as i32)
     }
 
     /// 64-point sides drop the upper half of the frequencies, so their blocks
@@ -1836,7 +1842,7 @@ mod tests {
         {
             if band_limited {
                 forward(&block, w, &mut coefs, size, ty);
-                let recon = reconstruct(itx, size, ty, &coefs);
+                let recon = reconstruct(itx, size, ty, &coefs, eob(&coefs, size, ty));
                 let (lo, hi) = (recon.iter().min().unwrap(), recon.iter().max().unwrap());
                 assert!(
                     *lo > -128 && *hi < 127,
@@ -1846,7 +1852,7 @@ mod tests {
                 block = recon.iter().map(|&r| r as i16).collect();
             }
             forward(&block, w, &mut coefs, size, ty);
-            let recon = reconstruct(itx, size, ty, &coefs);
+            let recon = reconstruct(itx, size, ty, &coefs, eob(&coefs, size, ty));
             for (&r, &b) in recon.iter().zip(&block[..w * h]) {
                 worst = worst.max((r - b as i32).abs());
             }
@@ -2155,6 +2161,42 @@ mod tests {
         }
         assert!(expected.next().is_none());
         assert!(wrong.is_empty(), "differ from libaom: {wrong:?}");
+    }
+
+    /// Coefficients cut after scan position `k`: the kernels' `eob` shortcuts
+    /// must give what the full transform gives.
+    #[test]
+    fn sparse_blocks_take_the_shortcuts() {
+        for flags in cpu_levels() {
+            let itx = Rav1dInvTxfmDSPContext::new::<BitDepth8>(flags, 8);
+            for size in sizes() {
+                let (w, _) = dimensions(size);
+                let (cw, ch) = coded_dimensions(size);
+                let n = cw * ch;
+                for ty in (0..WHT_WHT).filter(|&ty| decodable(size, ty)) {
+                    let seed = 0x2545_f491_4f6c_dd1d ^ ((size as u64) << 8 | ty as u64);
+                    let block = &blocks(size, seed, 1, 127)[3];
+                    let mut full = [0; 32 * 32];
+                    forward(block, w, &mut full, size, ty);
+                    for k in [0, 1, 2, 5, 9, 15, 35, 63, 99, 135, 255, 299, 511, n - 1] {
+                        if k >= n {
+                            continue;
+                        }
+                        let mut coefs = full;
+                        for i in k + 1..n {
+                            coefs[scan_rc(size, ty, i)] = 0;
+                        }
+                        let fast = reconstruct(&itx, size, ty, &coefs, eob(&coefs, size, ty));
+                        let slow = reconstruct(&itx, size, ty, &coefs, n as i32 - 1);
+                        assert!(
+                            fast == slow,
+                            "{size:?} {ty} k {k} flags {:#x}",
+                            flags.bits()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
