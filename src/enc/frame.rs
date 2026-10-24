@@ -2032,8 +2032,12 @@ pub(crate) mod tests {
             .collect()
     }
 
-    pub fn decode(data: Vec<u8>, w: usize, h: usize, planes: usize) -> Vec<Vec<u8>> {
+    /// The planes rav1d decodes, with or without its in-loop filters.
+    pub fn decode_with(data: Vec<u8>, w: usize, h: usize, planes: usize, filters: bool) -> Vec<Vec<u8>> {
         let mut s = Settings::new();
+        if !filters {
+            s.set_inloop_filters(crate::InloopFilterType::empty());
+        }
         s.set_n_threads(1);
         s.set_max_frame_delay(1);
         s.set_strict_std_compliance(true);
@@ -2051,10 +2055,18 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Codes `img`, decodes it with rav1d and checks the planes equal the encoder's reconstruction.
+    pub fn decode(data: Vec<u8>, w: usize, h: usize, planes: usize) -> Vec<Vec<u8>> {
+        decode_with(data, w, h, planes, false)
+    }
+
     pub fn round_trip<D: Decide>(img: &[Vec<u8>], w: usize, h: usize, frame: Frame, decide: D) -> Coded {
+        round_trip_with(img, w, h, sequence(w as u32, h as u32, img.len() == 1), frame, decide)
+    }
+
+    /// Codes `img`, decodes it with rav1d's in-loop filters off and checks the planes equal the
+    /// encoder's reconstruction.
+    pub fn round_trip_with<D: Decide>(img: &[Vec<u8>], w: usize, h: usize, seq: Sequence, frame: Frame, decide: D) -> Coded {
         let planes = img.len();
-        let seq = sequence(w as u32, h as u32, planes == 1);
         let mut e = Encoder::new(seq.clone(), frame, decide);
         e.recon = Some(vec![Vec::new(); planes]);
         for y in 0..h {
@@ -2236,5 +2248,28 @@ pub(crate) mod tests {
         let rd = cost(&round_trip(&img, w, h, frame(&seq, 120), Rd));
         eprintln!("dc {dc:?} rd {rd:?}");
         assert!(rd.0 >= dc.0 - 0.3 && rd.1 < dc.1, "dc {dc:?} rd {rd:?}");
+    }
+
+    /// Deblocking and CDEF at libaom's strengths for the qindex lift the decoded picture above the
+    /// reconstruction, and cost no bytes in the tiles.
+    #[test]
+    fn filters_from_q() {
+        let (w, h) = (192, 128);
+        for (mono, qidx) in [(false, 160), (true, 200), (false, 60)] {
+            let planes = if mono { 1 } else { 3 };
+            let img = photo(w, h, planes, 3);
+            let (seq, fr) = crate::enc::headers(w as u32, h as u32, mono, qidx);
+            assert!(fr.lf[0] > 0 && fr.cdef.is_some_and(|c| c.y[0] > 0), "{:?}", fr.lf);
+            let mut unfiltered_fr = fr.clone();
+            unfiltered_fr.lf = [0; 4];
+            unfiltered_fr.cdef = None;
+            let plain = round_trip_with(&img, w, h, seq.clone(), unfiltered_fr, Rd);
+            let coded = round_trip_with(&img, w, h, seq, fr, Rd);
+            let unfiltered = psnr(&img, coded.recon.as_ref().unwrap());
+            let filtered = psnr(&img, &decode_with(coded.data.clone(), w, h, planes, true));
+            eprintln!("filters q {qidx} mono {mono}: {unfiltered:.3} -> {filtered:.3} dB, {} -> {} bytes", plain.data.len(), coded.data.len());
+            assert!(filtered > unfiltered + 0.05);
+            assert!(coded.data.len() <= plain.data.len() + 8);
+        }
     }
 }
