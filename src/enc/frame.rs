@@ -383,6 +383,8 @@ pub struct Encoder<D: Decide> {
     src: Vec<Plane>,
     rec: Vec<Plane>,
     scratch: Plane,
+    /// `scratch` holds the reconstruction of the levels `rd_residual` chose.
+    recon_ready: bool,
     edge: DisjointMut<AlignedVec64<u8>>,
     edge_stride: usize,
     above: Ctx,
@@ -526,6 +528,7 @@ impl<D: Decide> Encoder<D> {
             src,
             rec,
             scratch: Plane::new(SB, SB),
+            recon_ready: false,
             edge: DisjointMut::new(edge),
             edge_stride: stride,
             above: Ctx::new(bw as usize),
@@ -1343,6 +1346,7 @@ impl<D: Decide> Encoder<D> {
                 let mut lv = self.lv.take().unwrap();
                 let levels = &mut lv[..n];
                 levels.fill(0);
+                self.recon_ready = false;
                 let decided = if self.predict_only {
                     Some(fixed_txtp)
                 } else if self.dry || self.decide.searches() {
@@ -1381,7 +1385,13 @@ impl<D: Decide> Encoder<D> {
                     }
                 };
                 let eob = eob_of(tx, txtp, levels);
-                if eob >= 0 {
+                if eob >= 0 && self.recon_ready {
+                    let rec = &self.rec[plane];
+                    for r in 0..ph {
+                        let row = self.scratch.comp.slice::<BD, _>((r * self.scratch.stride.., ..pw));
+                        rec.comp.slice_mut::<BD, _>(((wy + r) * rec.stride + px as usize * 4.., ..pw)).copy_from_slice(&row);
+                    }
+                } else if eob >= 0 {
                     let mut b = self.bufs.take().unwrap();
                     self.dequant(plane, tx, txtp, levels, &mut b.cf.0[..n]);
                     let rec = &self.rec[plane];
@@ -1511,6 +1521,7 @@ impl<D: Decide> Encoder<D> {
                 self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
                 let dist = sse(&src[..], &self.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB);
                 if dist as f64 + self.lambda * bits as f64 / 512.0 < zero {
+                    self.recon_ready = true;
                     self.bufs = Some(b);
                     return txtp;
                 }
@@ -1519,6 +1530,7 @@ impl<D: Decide> Encoder<D> {
             self.bufs = Some(b);
             return cands[0];
         }
+        let mut last = None;
         for &txtp in cands {
             fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
@@ -1537,6 +1549,7 @@ impl<D: Decide> Encoder<D> {
                 sse(&src[..], &e.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB)
             };
             let mut dist = reconstruct(self, &trial[..n], eob, cf);
+            last = Some(txtp);
             if self.rdoq > 0 && !self.dct_only && !lossless {
                 let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
                 let dqp = self.dq[plane];
@@ -1587,6 +1600,7 @@ impl<D: Decide> Encoder<D> {
                 levels.copy_from_slice(&trial[..n]);
             }
         }
+        self.recon_ready = best.0 < zero && last == Some(best.1);
         self.bufs = Some(b);
         best.1
     }
