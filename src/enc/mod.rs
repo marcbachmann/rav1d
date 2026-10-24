@@ -73,6 +73,8 @@ pub struct Options {
     pub levels: std::ops::Range<u8>,
     /// See `Encoder::prune`; 0 tries every partition.
     pub prune: f64,
+    /// libaom's Variance Boost: lower qindexes for flat superblocks, as its tune IQ codes them.
+    pub variance_boost: bool,
 }
 
 impl Options {
@@ -86,7 +88,7 @@ impl Options {
             2..=3 => (3, 3, 0, 0..4, 0.0),
             _ => (2, 2, 0, 0..4, 1.0),
         };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false }
     }
 }
 
@@ -100,12 +102,22 @@ pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Co
 pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Encoder<Rd> {
     let (seq, mut frame) = headers(width, height, planes.len() == 1, options.qidx);
     frame.screen_content = options.screen;
+    let boost = options.variance_boost && options.qidx != 0;
+    if boost {
+        frame.delta_q_log2 = Some(match options.qidx {
+            160.. => 3,
+            120.. => 2,
+            80.. => 1,
+            _ => 0,
+        });
+    }
     let mut e = Encoder::new(seq, frame, Rd);
     e.keep_modes = options.keep_modes;
     e.keep_chroma = options.keep_chroma;
     e.rect = options.rect;
     e.late_txtp = options.late_txtp;
     e.levels = options.levels.clone();
+    e.variance_boost = boost;
     e.prune = options.prune;
     let w = width as usize;
     for y in 0..height as usize {

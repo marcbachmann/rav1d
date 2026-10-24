@@ -387,6 +387,8 @@ pub struct Encoder<D: Decide> {
     pub levels: Range<u8>,
     /// A block whose unsplit distortion is under `prune` bits' worth per 4×4 unit is not split.
     pub prune: f64,
+    /// Superblock qindexes from libaom's Variance Boost; needs `Frame::delta_q_log2`.
+    pub variance_boost: bool,
 
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
     /// the block's width at a time.
@@ -459,6 +461,7 @@ impl<D: Decide> Encoder<D> {
             late_txtp: false,
             levels: 0..5,
             prune: 0.0,
+            variance_boost: false,
 
             pal_map: [Vec::new(), Vec::new()],
             bufs: Some(Box::new(Bufs {
@@ -485,6 +488,36 @@ impl<D: Decide> Encoder<D> {
         };
         e.set_qidx(q.base);
         e
+    }
+
+    /// libaom's Variance Boost for a still picture at its default strength: superblocks whose
+    /// 8×8 luma variances are low at the fifth octile get a lower qindex.
+    fn boost_qidx(&self, x: i32) -> u8 {
+        let base = self.frame.quant.base as i32;
+        let src = &self.src[0];
+        let x0 = x as usize * 4;
+        let mut variances = [0u32; 64];
+        for (i, v) in variances.iter_mut().enumerate() {
+            let (bx, by) = (x0 + (i % 8) * 8, (i / 8) * 8);
+            let (mut sum, mut sse) = (0i64, 0u64);
+            for r in 0..8 {
+                let row = src.comp.slice::<BD, _>(((by + r) * src.stride + bx.., ..8));
+                for &p in row.iter() {
+                    sum += p as i64;
+                    sse += (p as u64) * (p as u64);
+                }
+            }
+            *v = ((sse as u32).wrapping_sub(((sum * sum) >> 6) as u32)) / 64;
+        }
+        variances.sort_unstable();
+        let variance = ((variances[31] + 2 * variances[39] + variances[47] + 2) / 4).max(1);
+        let strength = 3.0;
+        let ratio = (0.15 * strength * (10.0 - (variance as f64).log2()) + 1.0).clamp(1.0, 8.0);
+        let q = |qidx: i32| DAV1D_DQ_TBL[0][qidx as usize][1] as f64 / 4.0;
+        let target_q = q(base) / ratio;
+        let target = (1..255).find(|&i| q(i) >= target_q).unwrap_or(255);
+        let boost = (((base as f64 + 544.0) * (base - target) as f64 / 1279.0).round() as i32).min(80);
+        cmp::max(base - boost, 1) as u8
     }
 
     fn set_qidx(&mut self, qidx: u8) {
@@ -594,14 +627,24 @@ impl<D: Decide> Encoder<D> {
                 let last = self.tiles[ti].last_qidx;
                 self.sb_delta = None;
                 let mut qidx = last;
+                let mut target = None;
                 if let Some(log2) = self.frame.delta_q_log2 {
-                    let want = if self.decide.searches() { last } else { self.decide.qidx(x, y, last) };
-                    let delta = (want as i32 - last as i32) >> log2;
+                    let delta = if self.variance_boost {
+                        let want = self.boost_qidx(x);
+                        target = Some(want);
+                        delta_steps(1 << log2, last, want)
+                    } else {
+                        let want = if self.decide.searches() { last } else { self.decide.qidx(x, y, last) };
+                        (want as i32 - last as i32) >> log2
+                    };
                     qidx = (last as i32 + (delta << log2)).clamp(1, 255) as u8;
                     self.sb_delta = Some(delta);
                 }
                 self.sb_qidx = qidx;
                 self.set_qidx(qidx);
+                if let Some(target) = target {
+                    self.lambda = lambda(target, self.iq);
+                }
                 if self.decide.searches() {
                     *self.cost_cdf = self.tiles[ti].cdf.clone();
                     self.search_sb(ti, x, y);
@@ -1745,6 +1788,19 @@ fn smooth(m: u8) -> i32 {
     }
 }
 
+/// The coded delta q, in steps of `res`, that brings the last qidx nearest `want`, as libaom's
+/// `av1_adjust_q_from_delta_q_res` rounds it.
+fn delta_steps(res: i32, last: u8, want: u8) -> i32 {
+    let want = (want as i32).clamp(res, 256 - res);
+    let diff = want - last as i32;
+    let steps = (diff.abs() + res / 4) / res;
+    if diff >= 0 {
+        steps
+    } else {
+        -steps
+    }
+}
+
 /// The quantized level of each coefficient: `rounding` in 1/128 of a step.
 fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32) {
     for (rc, (&c, l)) in coefs.iter().zip(levels.iter_mut()).enumerate() {
@@ -2764,6 +2820,7 @@ pub(crate) mod tests {
                 a.parse().unwrap()..b.parse().unwrap()
             }),
             prune: std::env::var("ENC_PRUNE").map_or(0.0, |v| v.parse().unwrap()),
+            variance_boost: std::env::var("ENC_BOOST").is_ok_and(|v| v == "1"),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
         files.sort();
@@ -2798,5 +2855,39 @@ pub(crate) mod tests {
             db += d;
         }
         println!("total {ms} ms {bytes} B mean {:.3} dB", db / files.len() as f64);
+    }
+
+    /// Variance Boost lowers the qindex of flat superblocks: a picture half photo, half gradient
+    /// decodes to the reconstruction, with the gradient's superblocks coded finer.
+    #[test]
+    fn variance_boost() {
+        let (w, h) = (256, 128);
+        let mut img = photo(w, h, 3, 4);
+        for p in img.iter_mut() {
+            for y in 0..h {
+                for x in w / 2..w {
+                    p[y * w + x] = (60 + x / 4 + y / 8) as u8;
+                }
+            }
+        }
+        let (seq, mut fr) = crate::enc::headers(w as u32, h as u32, false, 160);
+        let plain = round_trip_with(&img, w, h, seq.clone(), fr.clone(), Rd);
+        fr.delta_q_log2 = Some(3);
+        let mut e = Encoder::new(seq, fr, Rd);
+        e.variance_boost = true;
+        e.recon = Some(vec![Vec::new(); 3]);
+        for y in 0..h {
+            let rows: Vec<&[u8]> = img.iter().map(|p| &p[y * w..][..w]).collect();
+            e.push(&rows);
+        }
+        let boosted = e.finish();
+        assert!(boosted.recon.as_ref().unwrap() == &decode(boosted.data.clone(), w, h, 3));
+        let db = |c: &Coded, half: usize| {
+            let d = decode_with(c.data.clone(), w, h, 3, true);
+            let pick = |v: &Vec<Vec<u8>>| v.iter().map(|p| (0..h).flat_map(|y| p[y * w + half * w / 2..][..w / 2].to_vec()).collect()).collect::<Vec<Vec<u8>>>();
+            psnr(&pick(&img), &pick(&d))
+        };
+        eprintln!("variance boost: plain {} B {:.2}/{:.2} dB, boosted {} B {:.2}/{:.2} dB", plain.data.len(), db(&plain, 0), db(&plain, 1), boosted.data.len(), db(&boosted, 0), db(&boosted, 1));
+        assert!(db(&boosted, 1) > db(&plain, 1) + 0.5);
     }
 }
