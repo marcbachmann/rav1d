@@ -417,7 +417,8 @@ pub struct Encoder<D: Decide> {
     pub tx_domain_dist: bool,
     /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
     pub levels: Range<u8>,
-    /// A block whose unsplit distortion is under `prune` bits' worth per 4×4 unit is not split.
+    /// A block whose unsplit cost, distortion and rate, is under `prune` bits' worth per 4×4 unit
+    /// is not split.
     pub prune: f64,
     /// Superblock qindexes from libaom's Variance Boost; needs `Frame::delta_q_log2`.
     pub variance_boost: bool,
@@ -1477,7 +1478,7 @@ impl<D: Decide> Encoder<D> {
         let mut best = (zero, cands[0]);
         levels.fill(0);
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
-        if self.tx_domain_dist && cands.len() > 1 && self.rdoq == 0 && !lossless {
+        if self.tx_domain_dist && cands.len() > 1 && self.rdoq == 0 && !lossless && (vw, vh) == (pw, ph) {
             let mut winner: Option<(f64, TxfmType, i32, u32)> = None;
             for &txtp in cands {
                 fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
@@ -1745,7 +1746,7 @@ impl<D: Decide> Encoder<D> {
             if matches!(bp, H | V) && halves == Halves::Both && self.rect == 2 && best.as_ref().is_some_and(|b| b.3.first().is_some_and(|n| matches!(n, Node::Part(None)))) {
                 break;
             }
-            if bp != None && self.prune > 0.0 && best.as_ref().is_some_and(|b| b.0 - self.lambda * b.1 as f64 / 512.0 < self.prune * self.lambda * (n4 * n4) as f64) {
+            if bp != None && self.prune > 0.0 && best.as_ref().is_some_and(|b| b.0 < self.prune * self.lambda * (n4 * n4) as f64) {
                 break;
             }
             self.restore(&start);

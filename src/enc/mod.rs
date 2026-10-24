@@ -113,9 +113,9 @@ impl Options {
         let (keep_modes, keep_chroma, rect, levels, prune) = match effort {
             8.. => (0, 0, 1, 0..5, 0.0),
             6..=7 => (4, 0, 1, 0..5, 0.0),
-            4..=5 => (4, 4, 2, 0..4, 0.0),
-            2..=3 => (3, 3, 0, 0..4, 0.0),
-            _ => (2, 2, 0, 0..4, 1.0),
+            4..=5 => (4, 4, 2, 0..4, 1.0),
+            2..=3 => (3, 3, 0, 0..4, 2.0),
+            _ => (2, 2, 0, 0..4, 4.0),
         };
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (0, 0) } else { (keep_modes, keep_chroma) };
