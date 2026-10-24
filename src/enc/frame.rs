@@ -384,6 +384,8 @@ pub struct Encoder<D: Decide> {
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
     /// the block's width at a time.
     pal_map: [Vec<u8>; 2],
+    bufs: Option<Box<Bufs>>,
+    lv: Option<Box<[i32; 32 * 32]>>,
     counter: Counter,
     cost_cdf: Box<CdfContext>,
     trial: Option<(Intra, u8)>,
@@ -443,6 +445,15 @@ impl<D: Decide> Encoder<D> {
             rect: true,
             prune: 0.0,
             pal_map: [Vec::new(), Vec::new()],
+            bufs: Some(Box::new(Bufs {
+                src: [0; 64 * 64],
+                pred: [0; 64 * 64],
+                residual: [0; 64 * 64],
+                coefs: [0; 32 * 32],
+                trial: [0; 32 * 32],
+                cf: Coef([0; 32 * 32]),
+            })),
+            lv: Some(Box::new([0; 32 * 32])),
             counter: Counter::default(),
             cost_cdf,
             trial: None,
@@ -1114,13 +1125,15 @@ impl<D: Decide> Encoder<D> {
                 }
                 let (pw, ph) = (tw as usize * 4, th as usize * 4);
                 let n = cmp::min(pw, 32) * cmp::min(ph, 32);
-                let mut levels = vec![0i32; n];
+                let mut lv = self.lv.take().unwrap();
+                let levels = &mut lv[..n];
+                levels.fill(0);
                 let decided = if self.predict_only {
                     Some(fixed_txtp)
                 } else if self.dry || self.decide.searches() {
                     None
                 } else {
-                    self.decide.residual(plane, tx, set, &mut levels)
+                    self.decide.residual(plane, tx, set, levels)
                 };
                 let txtp = match decided {
                     Some(t) if self.predict_only => t,
@@ -1135,18 +1148,21 @@ impl<D: Decide> Encoder<D> {
                     None => {
                         let all = if set.is_empty() { std::slice::from_ref(&fixed_txtp) } else { set };
                         let cands = if self.dct_only && !set.is_empty() { &all[1..2] } else { all };
-                        self.rd_residual(bs, plane, px, py, tx, cands, intra, &mut levels)
+                        self.rd_residual(bs, plane, px, py, tx, cands, intra, levels)
                     }
                 };
-                let eob = eob_of(tx, txtp, &levels);
+                let eob = eob_of(tx, txtp, levels);
                 if eob >= 0 {
-                    let mut cf = Coef([0; 32 * 32]);
-                    self.dequant(plane, tx, txtp, &levels, &mut cf.0[..n]);
+                    let mut b = self.bufs.take().unwrap();
+                    self.dequant(plane, tx, txtp, levels, &mut b.cf.0[..n]);
                     let rec = &self.rec[plane];
                     let dst = rec.comp.with_offset::<BD>() + (wy * rec.stride + px as usize * 4);
-                    self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
+                    self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut b.cf.0[..n], eob, BD::new(()));
+                    self.bufs = Some(b);
                 }
-                let v = res_ctx(&levels, eob);
+                let v = res_ctx(levels, eob);
+                let levels = if eob >= 0 { levels.to_vec() } else { Vec::new() };
+                self.lv = Some(lv);
                 let (a, l) = coef_ctx(&mut self.above, &mut self.left, plane);
                 let cw = cmp::min(tw, self.bw - px) as usize;
                 let ch = cmp::min(th, self.bh - py) as usize;
@@ -1180,16 +1196,15 @@ impl<D: Decide> Encoder<D> {
         let vw = cmp::min(pw, (self.seq.width as usize).saturating_sub(x0));
         let vh = cmp::min(ph, (self.seq.height as usize).saturating_sub(py as usize * 4));
         let n = levels.len();
-        let mut src = Px([0; 64 * 64]);
-        let mut pred = Px([0; 64 * 64]);
-        let mut residual = Res([0; 64 * 64]);
+        let mut b = self.bufs.take().unwrap();
+        let Bufs { src, pred, residual, coefs, trial, cf } = &mut *b;
         for r in 0..ph {
             let at = (wy + r) * self.src[plane].stride + x0;
-            src.0[r * pw..][..pw].copy_from_slice(&self.src[plane].comp.slice::<BD, _>((at.., ..pw)));
-            pred.0[r * pw..][..pw].copy_from_slice(&self.rec[plane].comp.slice::<BD, _>((at.., ..pw)));
+            src[r * pw..][..pw].copy_from_slice(&self.src[plane].comp.slice::<BD, _>((at.., ..pw)));
+            pred[r * pw..][..pw].copy_from_slice(&self.rec[plane].comp.slice::<BD, _>((at.., ..pw)));
         }
         for i in 0..pw * ph {
-            residual.0[i] = src.0[i] as i16 - pred.0[i] as i16;
+            residual[i] = src[i] as i16 - pred[i] as i16;
         }
         let sse = |a: &[u8], b: &[u8], stride: usize| -> u64 {
             let mut s = 0;
@@ -1217,33 +1232,31 @@ impl<D: Decide> Encoder<D> {
             c.bits
         };
         let zero_rate = rate(self, cands[0], &[], -1);
-        let zero = if lossless { f64::MAX } else { sse(&src.0, &pred.0, pw) as f64 + self.lambda * zero_rate as f64 / 512.0 };
+        let zero = if lossless { f64::MAX } else { sse(&src[..], &pred[..], pw) as f64 + self.lambda * zero_rate as f64 / 512.0 };
         let mut best = (zero, cands[0]);
         levels.fill(0);
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
-        let mut coefs = Lv([0; 32 * 32]);
-        let mut trial = Lv([0; 32 * 32]);
         for &txtp in cands {
-            fdct::forward(&residual.0[..pw * ph], pw, &mut coefs.0[..n], tx, txtp);
+            fdct::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
-            quantize(&coefs.0[..n], &mut trial.0[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 });
-            let eob = eob_of(tx, txtp, &trial.0[..n]);
+            quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 });
+            let eob = eob_of(tx, txtp, &trial[..n]);
             if eob < 0 {
                 continue;
             }
-            let bits = rate(self, txtp, &trial.0[..n], eob);
-            let mut cf = Coef([0; 32 * 32]);
-            self.dequant(plane, tx, txtp, &trial.0[..n], &mut cf.0[..n]);
-            self.scratch.write(0, 0, pw, ph, &pred.0[..pw * ph]);
+            let bits = rate(self, txtp, &trial[..n], eob);
+            self.dequant(plane, tx, txtp, &trial[..n], &mut cf.0[..n]);
+            self.scratch.write(0, 0, pw, ph, &pred[..pw * ph]);
             let dst = self.scratch.comp.with_offset::<BD>();
             self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
-            let dist = sse(&src.0, &self.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB);
+            let dist = sse(&src[..], &self.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB);
             let cost = dist as f64 + self.lambda * bits as f64 / 512.0;
             if cost < best.0 {
                 best = (cost, txtp);
-                levels.copy_from_slice(&trial.0[..n]);
+                levels.copy_from_slice(&trial[..n]);
             }
         }
+        self.bufs = Some(b);
         best.1
     }
 
@@ -1922,11 +1935,15 @@ struct EdgePx([u8; EDGE_LEN]);
 #[repr(C, align(64))]
 struct Coef([i16; 32 * 32]);
 
-struct Px([u8; 64 * 64]);
-
-struct Res([i16; 64 * 64]);
-
-struct Lv([i32; 32 * 32]);
+/// The working arrays of the residual search, allocated once.
+struct Bufs {
+    src: [u8; 64 * 64],
+    pred: [u8; 64 * 64],
+    residual: [i16; 64 * 64],
+    coefs: [i32; 32 * 32],
+    trial: [i32; 32 * 32],
+    cf: Coef,
+}
 
 fn coef_ctx<'a>(above: &'a mut Ctx, left: &'a mut Ctx, plane: usize) -> (&'a mut [u8], &'a mut [u8]) {
     if plane == 0 {
