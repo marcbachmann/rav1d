@@ -1,8 +1,13 @@
 //! One frame coded a superblock row at a time. The source and the reconstruction are held for
 //! one superblock row only; the row above a superblock row is kept as rav1d keeps it, in an edge
 //! buffer, and handed to `rav1d_prepare_intra_edges` the same way.
+//!
+//! When the decider searches, each superblock is searched first: blocks are coded dry, against
+//! snapshots of the reconstruction and the contexts, with costs counted from the CDFs as they
+//! stood when the superblock began. The plan that wins is then coded for real by the same code.
 
 use std::cmp;
+use std::ops::Range;
 use std::sync::Once;
 
 use strum::EnumCount;
@@ -13,11 +18,13 @@ use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
 use crate::dequant_tables::DAV1D_DQ_TBL;
 use crate::disjoint_mut::DisjointMut;
 use crate::enc::ec::Writer;
+use crate::enc::fdct;
 use crate::enc::header::{obu, BitWriter, Frame, Sequence, OBU_FRAME, OBU_SEQUENCE_HEADER};
+use crate::enc::rd::{lambda, Counter, Sink};
 use crate::enum_map::DefaultValue;
 use crate::env::{gather_left_partition_prob, gather_top_partition_prob};
 use crate::include::common::bitdepth::{BitDepth, BitDepth8};
-use crate::include::dav1d::headers::Rav1dPixelLayoutSubSampled;
+use crate::include::dav1d::headers::{Rav1dPixelLayout, Rav1dPixelLayoutSubSampled};
 use crate::include::dav1d::picture::Rav1dPictureDataComponent;
 use crate::internal::SCRATCH_AC_TXTP_LEN;
 use crate::intra_edge::{EdgeFlags, EdgeIndex, IntraEdges};
@@ -82,6 +89,20 @@ impl Plane {
     fn row(&self, y: usize, x: usize, n: usize) -> Vec<u8> {
         self.comp.slice::<BD, _>((y * self.stride + x.., ..n)).to_vec()
     }
+
+    fn read(&self, x: usize, y: usize, w: usize, h: usize, out: &mut Vec<u8>) {
+        for r in 0..h {
+            out.extend_from_slice(&self.comp.slice::<BD, _>(((y + r) * self.stride + x.., ..w)));
+        }
+    }
+
+    fn write(&self, x: usize, y: usize, w: usize, h: usize, data: &[u8]) {
+        for r in 0..h {
+            self.comp
+                .slice_mut::<BD, _>(((y + r) * self.stride + x.., ..w))
+                .copy_from_slice(&data[r * w..][..w]);
+        }
+    }
 }
 
 /// Above or left context, per 4×4 unit, as rav1d's `BlockContext` holds it for intra frames.
@@ -121,17 +142,51 @@ impl Ctx {
         self.pal_sz.fill(0);
         self.partition.fill(0);
     }
+
+    /// The units in `r` (and their 8×8 partition units), to be put back by `restore`.
+    fn save(&self, r: Range<usize>) -> Ctx {
+        let p = r.start / 2..r.end.div_ceil(2);
+        Ctx {
+            mode: self.mode[r.clone()].to_vec(),
+            uvmode: self.uvmode[r.clone()].to_vec(),
+            skip: self.skip[r.clone()].to_vec(),
+            tx_intra: self.tx_intra[r.clone()].to_vec(),
+            lcoef: self.lcoef[r.clone()].to_vec(),
+            ccoef: [self.ccoef[0][r.clone()].to_vec(), self.ccoef[1][r.clone()].to_vec()],
+            pal_sz: self.pal_sz[r].to_vec(),
+            partition: self.partition[p].to_vec(),
+        }
+    }
+
+    fn restore(&mut self, start: usize, s: &Ctx) {
+        let n = s.mode.len();
+        self.mode[start..start + n].copy_from_slice(&s.mode);
+        self.uvmode[start..start + n].copy_from_slice(&s.uvmode);
+        self.skip[start..start + n].copy_from_slice(&s.skip);
+        self.tx_intra[start..start + n].copy_from_slice(&s.tx_intra);
+        self.pal_sz[start..start + n].copy_from_slice(&s.pal_sz);
+        self.restore_coef(start, s);
+        let p = start / 2;
+        self.partition[p..p + s.partition.len()].copy_from_slice(&s.partition);
+    }
+
+    fn restore_coef(&mut self, start: usize, s: &Ctx) {
+        let n = s.lcoef.len();
+        self.lcoef[start..start + n].copy_from_slice(&s.lcoef);
+        self.ccoef[0][start..start + n].copy_from_slice(&s.ccoef[0]);
+        self.ccoef[1][start..start + n].copy_from_slice(&s.ccoef[1]);
+    }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Intra {
     pub y_mode: u8,
+    /// The angle delta, or the filter-intra mode when `y_mode` is `FILTER_PRED`.
     pub y_angle: i8,
     pub uv_mode: u8,
     pub uv_angle: i8,
     pub cfl: [i8; 2],
 }
-
 
 /// The quantized coefficients of one transform block, in rav1d's coefficient layout.
 #[derive(Clone)]
@@ -161,8 +216,13 @@ pub struct Limits {
     pub max_depth: u8,
 }
 
-/// The decisions of a frame, asked in coding order.
+/// The decisions of a frame, asked in coding order. An encoder whose decider `searches` makes
+/// them itself and asks nothing.
 pub trait Decide {
+    fn searches(&self) -> bool {
+        false
+    }
+
     fn partition(&mut self, bl: BlockLevel, x: i32, y: i32, halves: Halves) -> BlockPartition;
 
     /// The superblock's qidx, when the frame codes delta q.
@@ -173,12 +233,11 @@ pub trait Decide {
     /// Modes and the transform depth below the largest transform of the block.
     fn mode(&mut self, bs: BlockSize, x: i32, y: i32, limits: &Limits) -> (Intra, u8);
 
-    fn txtp(&mut self, _tx: TxfmSize, set: &[TxfmType]) -> TxfmType {
-        set[1]
+    /// A transform type from `set` (ignored when `set` is empty and the type is fixed) and its
+    /// levels, or `None` to have them chosen by rate and distortion.
+    fn residual(&mut self, _plane: usize, _tx: TxfmSize, _set: &[TxfmType], _levels: &mut [i32]) -> Option<TxfmType> {
+        None
     }
-
-    /// Levels for one transform block; `src` and `pred` are its pixels, row by row.
-    fn levels(&mut self, plane: usize, tx: TxfmSize, txtp: TxfmType, src: &[u8], pred: &[u8], dq: [u32; 2], levels: &mut [i32]);
 }
 
 /// Every superblock split down to one block level, DC prediction, no residual.
@@ -198,9 +257,33 @@ impl Decide for Skip {
         (Intra::default(), 0)
     }
 
-    fn levels(&mut self, _: usize, _: TxfmSize, _: TxfmType, _: &[u8], _: &[u8], _: [u32; 2], levels: &mut [i32]) {
+    fn residual(&mut self, _: usize, _: TxfmSize, set: &[TxfmType], levels: &mut [i32]) -> Option<TxfmType> {
         levels.fill(0);
+        Some(set.first().copied().unwrap_or(DCT_DCT))
     }
+}
+
+/// Decisions made by rate and distortion.
+pub struct Rd;
+
+impl Decide for Rd {
+    fn searches(&self) -> bool {
+        true
+    }
+
+    fn partition(&mut self, _: BlockLevel, _: i32, _: i32, _: Halves) -> BlockPartition {
+        unreachable!()
+    }
+
+    fn mode(&mut self, _: BlockSize, _: i32, _: i32, _: &Limits) -> (Intra, u8) {
+        unreachable!()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Node {
+    Part(BlockPartition),
+    Block(Intra, u8),
 }
 
 pub struct Coded {
@@ -221,10 +304,33 @@ struct Tile {
     last_qidx: u8,
 }
 
+/// The state of a block's area: its pixels in every plane and its contexts.
+struct Snap {
+    x: i32,
+    y: i32,
+    w4: usize,
+    h4: usize,
+    pixels: Vec<u8>,
+    above: Ctx,
+    left: Ctx,
+}
+
+/// A transform block decided while predicting, before its symbols are written.
+struct TxDone {
+    plane: usize,
+    x4: i32,
+    y4: i32,
+    tx: TxfmSize,
+    coefs: Coefs,
+    eob: i32,
+}
+
 pub struct Encoder<D: Decide> {
     pub seq: Sequence,
     pub frame: Frame,
     pub decide: D,
+    /// λ is libaom's with the tune-IQ weight.
+    pub iq: bool,
     dsp: Dsp,
     planes: usize,
     /// Frame size in 4×4 units, rounded up to 8×8 as the decoder rounds it.
@@ -232,6 +338,7 @@ pub struct Encoder<D: Decide> {
     bh: i32,
     src: Vec<Plane>,
     rec: Vec<Plane>,
+    scratch: Plane,
     edge: DisjointMut<AlignedVec64<u8>>,
     edge_stride: usize,
     above: Ctx,
@@ -245,6 +352,16 @@ pub struct Encoder<D: Decide> {
     sb_delta: Option<i32>,
     dq: [[u32; 2]; 3],
     qm: [[Option<&'static [u8]>; 3]; TxfmSize::COUNT],
+    lambda: f64,
+    /// Searching: blocks are counted, not written, and their modes come from `trial`.
+    dry: bool,
+    /// While searching modes, only `DCT_DCT` is tried where the type is coded.
+    dct_only: bool,
+    counter: Counter,
+    cost_cdf: Box<CdfContext>,
+    trial: Option<(Intra, u8)>,
+    plan: Vec<Node>,
+    next: usize,
     /// The whole reconstruction, kept only when asked for (tests).
     pub recon: Option<Vec<Vec<u8>>>,
 }
@@ -270,12 +387,15 @@ impl<D: Decide> Encoder<D> {
                 ];
             }
         }
+        let cost_cdf = Box::new(rav1d_cdf_thread_copy(&rav1d_cdf_thread_init_static(q.base)));
         let mut e = Self {
+            iq: false,
             planes,
             bw,
             bh,
             src,
             rec,
+            scratch: Plane::new(SB, SB),
             edge: DisjointMut::new(edge),
             edge_stride: stride,
             above: Ctx::new(bw as usize),
@@ -288,22 +408,31 @@ impl<D: Decide> Encoder<D> {
             sb_delta: None,
             dq: [[0; 2]; 3],
             qm,
+            lambda: 1.0,
+            dry: false,
+            dct_only: false,
+            counter: Counter::default(),
+            cost_cdf,
+            trial: None,
+            plan: Vec::new(),
+            next: 0,
             recon: None,
             seq,
             frame,
             decide,
             dsp: Dsp::new(),
         };
-        e.dq = e.dq_for(q.base);
+        e.set_qidx(q.base);
         e
     }
 
-    fn dq_for(&self, qidx: u8) -> [[u32; 2]; 3] {
+    fn set_qidx(&mut self, qidx: u8) {
         let q = self.frame.quant;
         let clip = |d: i8| (qidx as i32 + d as i32).clamp(0, 255) as usize;
         let tbl = &DAV1D_DQ_TBL[0];
         let u = [tbl[clip(q.u_dc)][0] as u32, tbl[clip(q.u_ac)][1] as u32];
-        [[tbl[clip(q.y_dc)][0] as u32, tbl[qidx as usize][1] as u32], u, u]
+        self.dq = [[tbl[clip(q.y_dc)][0] as u32, tbl[qidx as usize][1] as u32], u, u];
+        self.lambda = lambda(qidx, self.iq);
     }
 
     /// One row of each plane, `width` pixels.
@@ -402,16 +531,22 @@ impl<D: Decide> Encoder<D> {
             let (start, end) = (self.tiles[ti].col_start, self.tiles[ti].col_end);
             for x in (start..end).step_by(16) {
                 let last = self.tiles[ti].last_qidx;
-                self.sb_qidx = last;
                 self.sb_delta = None;
+                let mut qidx = last;
                 if let Some(log2) = self.frame.delta_q_log2 {
-                    let want = self.decide.qidx(x, y, last);
+                    let want = if self.decide.searches() { last } else { self.decide.qidx(x, y, last) };
                     let delta = (want as i32 - last as i32) >> log2;
-                    self.sb_qidx = (last as i32 + (delta << log2)).clamp(1, 255) as u8;
+                    qidx = (last as i32 + (delta << log2)).clamp(1, 255) as u8;
                     self.sb_delta = Some(delta);
                 }
-                self.dq = self.dq_for(self.sb_qidx);
+                self.sb_qidx = qidx;
+                self.set_qidx(qidx);
+                if self.decide.searches() {
+                    *self.cost_cdf = self.tiles[ti].cdf.clone();
+                    self.search_sb(ti, x, y);
+                }
                 self.code_sb(ti, BlockLevel::Bl64x64, x, y, EdgeIndex::root());
+                assert_eq!(self.next, self.plan.len());
             }
         }
         if let Some(recon) = &mut self.recon {
@@ -440,136 +575,182 @@ impl<D: Decide> Encoder<D> {
         }
     }
 
-    fn code_sb(&mut self, ti: usize, bl: BlockLevel, x: i32, y: i32, edge_index: EdgeIndex) {
-        let hsz = 16 >> bl as u8;
-        let have_h_split = self.bw > x + hsz;
-        let have_v_split = self.bh > y + hsz;
-        let edges = &IntraEdges::DEFAULT;
-        if !have_h_split && !have_v_split {
-            let next = bl.decrease().unwrap();
-            return self.code_sb(ti, next, x, y, edges.branch(false, edge_index).split[0]);
-        }
-        let bx8 = (x >> 1) as usize;
-        let by8 = ((y & 15) >> 1) as usize;
+    fn partition_ctx(&self, bl: BlockLevel, x: i32, y: i32) -> usize {
         let has_bl = |v: u8| (v >> (4 - bl as u8)) & 1;
-        let ctx = (has_bl(self.above.partition[bx8]) + 2 * has_bl(self.left.partition[by8])) as usize;
-        let halves = match (have_h_split, have_v_split) {
-            (true, true) => Halves::Both,
-            (true, false) => Halves::Top,
-            _ => Halves::Left,
-        };
-        let bp = self.decide.partition(bl, x, y, halves);
-        {
-            let tile = &mut self.tiles[ti];
-            let pc = &mut tile.cdf.m.partition[bl as usize][ctx];
-            match halves {
-                Halves::Both => {
-                    let n = DAV1D_PARTITION_TYPE_COUNT[bl as usize];
-                    assert!((bp as u8) <= n);
-                    tile.w.symbol(bp as u8, pc, n);
-                }
-                Halves::Top => {
-                    assert!(matches!(bp, BlockPartition::Split | BlockPartition::H));
-                    tile.w.bool(bp == BlockPartition::Split, gather_top_partition_prob(pc, bl));
-                }
-                Halves::Left => {
-                    assert!(matches!(bp, BlockPartition::Split | BlockPartition::V));
-                    tile.w.bool(bp == BlockPartition::Split, gather_left_partition_prob(pc, bl));
-                }
+        (has_bl(self.above.partition[(x >> 1) as usize]) + 2 * has_bl(self.left.partition[((y & 15) >> 1) as usize])) as usize
+    }
+
+    fn halves(&self, bl: BlockLevel, x: i32, y: i32) -> Option<Halves> {
+        let hsz = 16 >> bl as u8;
+        match (self.bw > x + hsz, self.bh > y + hsz) {
+            (true, true) => Some(Halves::Both),
+            (true, false) => Some(Halves::Top),
+            (false, true) => Some(Halves::Left),
+            (false, false) => None,
+        }
+    }
+
+    fn write_partition<S: Sink>(s: &mut S, cdf: &mut CdfContext, bl: BlockLevel, ctx: usize, halves: Halves, bp: BlockPartition) {
+        let pc = &mut cdf.m.partition[bl as usize][ctx];
+        match halves {
+            Halves::Both => {
+                let n = DAV1D_PARTITION_TYPE_COUNT[bl as usize];
+                assert!((bp as u8) <= n);
+                s.symbol(bp as u8, pc, n);
+            }
+            Halves::Top => {
+                assert!(matches!(bp, BlockPartition::Split | BlockPartition::H));
+                s.bool(bp == BlockPartition::Split, gather_top_partition_prob(pc, bl));
+            }
+            Halves::Left => {
+                assert!(matches!(bp, BlockPartition::Split | BlockPartition::V));
+                s.bool(bp == BlockPartition::Split, gather_left_partition_prob(pc, bl));
             }
         }
+    }
+
+    fn next_node(&mut self) -> Node {
+        self.next += 1;
+        self.plan[self.next - 1]
+    }
+
+    fn code_sb(&mut self, ti: usize, bl: BlockLevel, x: i32, y: i32, edge_index: EdgeIndex) {
+        let edges = &IntraEdges::DEFAULT;
+        let Some(halves) = self.halves(bl, x, y) else {
+            let next = bl.decrease().unwrap();
+            return self.code_sb(ti, next, x, y, edges.branch(false, edge_index).split[0]);
+        };
+        let ctx = self.partition_ctx(bl, x, y);
+        let bp = if self.decide.searches() {
+            match self.next_node() {
+                Node::Part(bp) => bp,
+                n => panic!("plan has {n:?} where a partition is due"),
+            }
+        } else {
+            self.decide.partition(bl, x, y, halves)
+        };
+        let tile = &mut self.tiles[ti];
+        Self::write_partition(&mut tile.w, &mut tile.cdf, bl, ctx, halves, bp);
+        self.code_partition(ti, bl, bp, x, y, edge_index, halves, &mut |e, ti, bs, x, y, f| {
+            e.code_b(ti, bs, x, y, f)
+        });
+    }
+
+    /// Runs `block` on every block of `bp`, recursing through splits (searching them when dry),
+    /// then sets the partition contexts, as `decode_sb` does.
+    #[allow(clippy::too_many_arguments)]
+    fn code_partition(
+        &mut self,
+        ti: usize,
+        bl: BlockLevel,
+        bp: BlockPartition,
+        x: i32,
+        y: i32,
+        edge_index: EdgeIndex,
+        halves: Halves,
+        block: &mut dyn FnMut(&mut Self, usize, BlockSize, i32, i32, EdgeFlags),
+    ) {
+        let hsz = 16 >> bl as u8;
+        let (have_h_split, have_v_split) = (halves != Halves::Left, halves != Halves::Top);
+        let edges = &IntraEdges::DEFAULT;
         let b = DAV1D_BLOCK_SIZES[bl as usize][bp as usize];
         let node = edges.node(false, edge_index);
         let (nh, nv, no) = (node.h, node.v, node.o);
         use BlockPartition::*;
         match bp {
-            None => self.code_b(ti, b[0], x, y, no),
+            None => block(self, ti, b[0], x, y, no),
             H => {
-                self.code_b(ti, b[0], x, y, nh[0]);
+                block(self, ti, b[0], x, y, nh[0]);
                 if have_v_split {
-                    self.code_b(ti, b[0], x, y + hsz, nh[1]);
+                    block(self, ti, b[0], x, y + hsz, nh[1]);
                 }
             }
             V => {
-                self.code_b(ti, b[0], x, y, nv[0]);
+                block(self, ti, b[0], x, y, nv[0]);
                 if have_h_split {
-                    self.code_b(ti, b[0], x + hsz, y, nv[1]);
+                    block(self, ti, b[0], x + hsz, y, nv[1]);
                 }
             }
             Split if bl == BlockLevel::Bl8x8 => {
                 let tip = edges.tip(false, edge_index).split;
-                self.code_b(ti, BlockSize::Bs4x4, x, y, EdgeFlags::ALL_TR_AND_BL);
-                self.code_b(ti, BlockSize::Bs4x4, x + 1, y, tip[0]);
-                self.code_b(ti, BlockSize::Bs4x4, x, y + 1, tip[1]);
-                self.code_b(ti, BlockSize::Bs4x4, x + 1, y + 1, tip[2]);
+                block(self, ti, BlockSize::Bs4x4, x, y, EdgeFlags::ALL_TR_AND_BL);
+                block(self, ti, BlockSize::Bs4x4, x + 1, y, tip[0]);
+                block(self, ti, BlockSize::Bs4x4, x, y + 1, tip[1]);
+                block(self, ti, BlockSize::Bs4x4, x + 1, y + 1, tip[2]);
             }
             Split => {
                 let next = bl.decrease().unwrap();
                 let split = edges.branch(false, edge_index).split;
-                self.code_sb(ti, next, x, y, split[0]);
+                let sub = |e: &mut Self, x: i32, y: i32, i: usize| {
+                    if e.dry {
+                        e.pick_partition(ti, next, x, y, split[i]);
+                    } else {
+                        e.code_sb(ti, next, x, y, split[i]);
+                    }
+                };
+                sub(self, x, y, 0);
                 if have_h_split {
-                    self.code_sb(ti, next, x + hsz, y, split[1]);
+                    sub(self, x + hsz, y, 1);
                 }
                 if have_v_split {
-                    self.code_sb(ti, next, x, y + hsz, split[2]);
+                    sub(self, x, y + hsz, 2);
                     if have_h_split {
-                        self.code_sb(ti, next, x + hsz, y + hsz, split[3]);
+                        sub(self, x + hsz, y + hsz, 3);
                     }
                 }
             }
             TopSplit => {
-                self.code_b(ti, b[0], x, y, EdgeFlags::ALL_TR_AND_BL);
-                self.code_b(ti, b[0], x + hsz, y, nv[1]);
-                self.code_b(ti, b[1], x, y + hsz, nh[1]);
+                block(self, ti, b[0], x, y, EdgeFlags::ALL_TR_AND_BL);
+                block(self, ti, b[0], x + hsz, y, nv[1]);
+                block(self, ti, b[1], x, y + hsz, nh[1]);
             }
             BottomSplit => {
-                self.code_b(ti, b[0], x, y, nh[0]);
-                self.code_b(ti, b[1], x, y + hsz, nv[0]);
-                self.code_b(ti, b[1], x + hsz, y + hsz, EdgeFlags::empty());
+                block(self, ti, b[0], x, y, nh[0]);
+                block(self, ti, b[1], x, y + hsz, nv[0]);
+                block(self, ti, b[1], x + hsz, y + hsz, EdgeFlags::empty());
             }
             LeftSplit => {
-                self.code_b(ti, b[0], x, y, EdgeFlags::ALL_TR_AND_BL);
-                self.code_b(ti, b[0], x, y + hsz, nh[1]);
-                self.code_b(ti, b[1], x + hsz, y, nv[1]);
+                block(self, ti, b[0], x, y, EdgeFlags::ALL_TR_AND_BL);
+                block(self, ti, b[0], x, y + hsz, nh[1]);
+                block(self, ti, b[1], x + hsz, y, nv[1]);
             }
             RightSplit => {
-                self.code_b(ti, b[0], x, y, nv[0]);
-                self.code_b(ti, b[1], x + hsz, y, nh[0]);
-                self.code_b(ti, b[1], x + hsz, y + hsz, EdgeFlags::empty());
+                block(self, ti, b[0], x, y, nv[0]);
+                block(self, ti, b[1], x + hsz, y, nh[0]);
+                block(self, ti, b[1], x + hsz, y + hsz, EdgeFlags::empty());
             }
             H4 => {
                 let branch = edges.branch(false, edge_index);
                 let (h4, h0, h1) = (branch.h4, branch.node.h[0], branch.node.h[1]);
-                self.code_b(ti, b[0], x, y, h0);
-                self.code_b(ti, b[0], x, y + (hsz >> 1), h4);
-                self.code_b(ti, b[0], x, y + hsz, EdgeFlags::ALL_LEFT_HAS_BOTTOM);
+                block(self, ti, b[0], x, y, h0);
+                block(self, ti, b[0], x, y + (hsz >> 1), h4);
+                block(self, ti, b[0], x, y + hsz, EdgeFlags::ALL_LEFT_HAS_BOTTOM);
                 if y + (hsz * 3 >> 1) < self.bh {
-                    self.code_b(ti, b[0], x, y + (hsz * 3 >> 1), h1);
+                    block(self, ti, b[0], x, y + (hsz * 3 >> 1), h1);
                 }
             }
             V4 => {
                 let branch = edges.branch(false, edge_index);
                 let (v4, v0, v1) = (branch.v4, branch.node.v[0], branch.node.v[1]);
-                self.code_b(ti, b[0], x, y, v0);
-                self.code_b(ti, b[0], x + (hsz >> 1), y, v4);
-                self.code_b(ti, b[0], x + hsz, y, EdgeFlags::ALL_TOP_HAS_RIGHT);
+                block(self, ti, b[0], x, y, v0);
+                block(self, ti, b[0], x + (hsz >> 1), y, v4);
+                block(self, ti, b[0], x + hsz, y, EdgeFlags::ALL_TOP_HAS_RIGHT);
                 if x + (hsz * 3 >> 1) < self.bw {
-                    self.code_b(ti, b[0], x + (hsz * 3 >> 1), y, v1);
+                    block(self, ti, b[0], x + (hsz * 3 >> 1), y, v1);
                 }
             }
         }
         if bp != Split || bl == BlockLevel::Bl8x8 {
             let n = hsz as usize;
+            let (bx8, by8) = ((x >> 1) as usize, ((y & 15) >> 1) as usize);
             self.above.partition[bx8..bx8 + n].fill(DAV1D_AL_PART_CTX[0][bl as usize][bp as usize]);
             self.left.partition[by8..by8 + n].fill(DAV1D_AL_PART_CTX[1][bl as usize][bp as usize]);
         }
     }
 
-    fn code_b(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
+    fn limits(&self, bs: BlockSize) -> (Limits, TxfmSize) {
         let b_dim = bs.dimensions();
         let (bw4, bh4) = (b_dim[0] as i32, b_dim[1] as i32);
-        let w4 = cmp::min(bw4, self.bw - x);
-        let h4 = cmp::min(bh4, self.bh - y);
         let lossless = self.frame.quant.lossless();
         let max_tx = if lossless { TxfmSize::S4x4 } else { DAV1D_MAX_TXFM_SIZE_FOR_BS[bs as usize][0] };
         let max_dim = &DAV1D_TXFM_DIMENSIONS[max_tx as usize];
@@ -580,148 +761,108 @@ impl<D: Decide> Encoder<D> {
             chroma: self.planes > 1,
             max_depth: if self.frame.tx_select && !lossless { cmp::min(max_dim.max, 2) } else { 0 },
         };
-        let (intra, depth) = self.decide.mode(bs, x, y, &limits);
-        assert!(depth <= limits.max_depth);
-        let mut tx = max_tx;
+        (limits, max_tx)
+    }
+
+    fn tx_sizes(&self, bs: BlockSize, depth: u8) -> (TxfmSize, TxfmSize) {
+        if self.frame.quant.lossless() {
+            return (TxfmSize::S4x4, TxfmSize::S4x4);
+        }
+        let mut tx = DAV1D_MAX_TXFM_SIZE_FOR_BS[bs as usize][0];
         for _ in 0..depth {
             tx = DAV1D_TXFM_DIMENSIONS[tx as usize].sub;
         }
-        let uvtx = if lossless { TxfmSize::S4x4 } else { DAV1D_MAX_TXFM_SIZE_FOR_BS[bs as usize][3] };
-        let (ax, ly) = (x as usize, (y & 15) as usize);
-        let edge_filter = (self.seq.edge_filter as i32) << 10;
+        (tx, DAV1D_MAX_TXFM_SIZE_FOR_BS[bs as usize][3])
+    }
 
-        let mut coefs = Vec::new();
-        let y_flags = self.sm_flag(ax, ly) | edge_filter;
-        self.predict_and_choose(ti, 0, x, y, w4, h4, tx, &intra, edge_flags, y_flags, true, lossless, &mut coefs);
-        if self.planes > 1 {
-            if intra.uv_mode == CFL_PRED {
-                self.predict_cfl(ti, x, y, w4, h4, bw4, bh4, tx, uvtx, &intra);
+    /// Codes one block: predicts and reconstructs it, then writes it, or counts it when dry.
+    fn code_b(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
+        let (limits, max_tx) = self.limits(bs);
+        let (intra, depth) = if self.dry {
+            self.trial.unwrap()
+        } else if self.decide.searches() {
+            match self.next_node() {
+                Node::Block(intra, depth) => (intra, depth),
+                n => panic!("plan has {n:?} where a block is due"),
             }
-            let uv_flags = self.sm_uv_flag(ax, ly) | edge_filter;
+        } else {
+            self.decide.mode(bs, x, y, &limits)
+        };
+        assert!(depth <= limits.max_depth);
+        let txs = self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..self.planes);
+        let skip = txs.iter().all(|t| t.eob < 0);
+        let b = BlockWrite {
+            bs,
+            x,
+            y,
+            skip,
+            intra,
+            depth,
+            max_tx,
+            limits,
+            delta: (x & 15 == 0 && y & 15 == 0 && (bs != BlockSize::Bs64x64 || !skip))
+                .then_some(self.sb_delta)
+                .flatten(),
+            screen_content: self.frame.screen_content,
+            tx_select: self.frame.tx_select,
+            lossless: self.frame.quant.lossless(),
+            qidx: self.frame.quant.base,
+            reduced_tx_set: self.frame.reduced_tx_set,
+            bw: self.bw,
+            bh: self.bh,
+        };
+        if self.dry {
+            b.write(&mut self.counter, &mut self.cost_cdf, &mut self.above, &mut self.left, &txs);
+        } else {
+            let tile = &mut self.tiles[ti];
+            b.write(&mut tile.w, &mut tile.cdf, &mut self.above, &mut self.left, &txs);
+            if b.delta.is_some() {
+                tile.last_qidx = self.sb_qidx;
+            }
+        }
+    }
+
+    /// Predicts and reconstructs the given planes of a block, choosing every transform block's
+    /// residual. The coefficient contexts are left as they were.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_block(
+        &mut self,
+        ti: usize,
+        bs: BlockSize,
+        x: i32,
+        y: i32,
+        edge_flags: EdgeFlags,
+        intra: &Intra,
+        depth: u8,
+        planes: Range<usize>,
+    ) -> Vec<TxDone> {
+        let b_dim = bs.dimensions();
+        let (bw4, bh4) = (b_dim[0] as i32, b_dim[1] as i32);
+        let w4 = cmp::min(bw4, self.bw - x);
+        let h4 = cmp::min(bh4, self.bh - y);
+        let (tx, uvtx) = self.tx_sizes(bs, depth);
+        let (ax, ly) = (x as usize, (y & 15) as usize);
+        let saved_a = self.above.save(ax..ax + bw4 as usize);
+        let saved_l = self.left.save(ly..ly + bh4 as usize);
+        let edge_filter = (self.seq.edge_filter as i32) << 10;
+        let mut txs = Vec::new();
+        if planes.contains(&0) {
+            let flags = self.sm_flag(ax, ly) | edge_filter;
+            self.predict_plane(ti, bs, 0, x, y, w4, h4, tx, intra, edge_flags, flags, true, &mut txs);
+        }
+        if planes.contains(&1) {
+            if intra.uv_mode == CFL_PRED {
+                self.predict_cfl(ti, x, y, w4, h4, bw4, bh4, tx, uvtx, intra);
+            }
+            let flags = self.sm_uv_flag(ax, ly) | edge_filter;
             for p in 1..3 {
                 let predict = !(intra.uv_mode == CFL_PRED && intra.cfl[p - 1] != 0);
-                self.predict_and_choose(ti, p, x, y, w4, h4, uvtx, &intra, edge_flags, uv_flags, predict, lossless, &mut coefs);
+                self.predict_plane(ti, bs, p, x, y, w4, h4, uvtx, intra, edge_flags, flags, predict, &mut txs);
             }
         }
-        let skip = coefs.iter().all(|c: &(usize, i32, i32, Coefs, i32)| c.4 < 0);
-
-        let tile = &mut self.tiles[ti];
-        let sctx = (self.above.skip[ax] + self.left.skip[ly]) as usize;
-        tile.w.bool_adapt(skip, &mut tile.cdf.m.skip[sctx]);
-        if x & 15 == 0 && y & 15 == 0 {
-            match self.sb_delta {
-                Some(delta) if bs != BlockSize::Bs64x64 || !skip => {
-                    let abs = delta.unsigned_abs();
-                    tile.w.symbol(cmp::min(abs, 3) as u8, &mut tile.cdf.m.delta_q.0, 3);
-                    if abs >= 3 {
-                        let n_bits = 31 - (abs - 1).leading_zeros();
-                        tile.w.bools(n_bits - 1, 3);
-                        tile.w.bools(abs - 1 - (1 << n_bits), n_bits as u8);
-                    }
-                    if abs != 0 {
-                        tile.w.bool_equi(delta < 0);
-                    }
-                    tile.last_qidx = self.sb_qidx;
-                }
-                _ => {}
-            }
-        }
-        let (y_mode, filter) = if intra.y_mode == FILTER_PRED {
-            (DC_PRED, Some(intra.y_angle as u8))
-        } else {
-            (intra.y_mode, None)
-        };
-        let ymode_cdf = &mut tile.cdf.kfym[DAV1D_INTRA_MODE_CONTEXT[self.above.mode[ax] as usize] as usize]
-            [DAV1D_INTRA_MODE_CONTEXT[self.left.mode[ly] as usize] as usize];
-        tile.w.symbol(y_mode, ymode_cdf, N_INTRA_PRED_MODES as u8 - 1);
-        if limits.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
-            let acdf = &mut tile.cdf.m.angle_delta[(y_mode - VERT_PRED) as usize];
-            tile.w.symbol((intra.y_angle + 3) as u8, acdf, 6);
-        }
-        if limits.chroma {
-            let cdf = &mut tile.cdf.m.uv_mode[limits.cfl as usize][y_mode as usize];
-            tile.w.symbol(intra.uv_mode, cdf, N_UV_INTRA_PRED_MODES as u8 - 1 - !limits.cfl as u8);
-            if intra.uv_mode == CFL_PRED {
-                let sign = intra.cfl.map(|a| if a == 0 { 0u8 } else if a < 0 { 1 } else { 2 });
-                tile.w.symbol(sign[0] * 3 + sign[1] - 1, &mut tile.cdf.m.cfl_sign.0, 7);
-                for i in 0..2 {
-                    if sign[i] != 0 {
-                        let ctx = (sign[i] == 2) as usize * 3 + sign[1 - i] as usize;
-                        tile.w.symbol(intra.cfl[i].unsigned_abs() - 1, &mut tile.cdf.m.cfl_alpha[ctx], 15);
-                    }
-                }
-            } else if limits.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&intra.uv_mode) {
-                let acdf = &mut tile.cdf.m.angle_delta[(intra.uv_mode - VERT_PRED) as usize];
-                tile.w.symbol((intra.uv_angle + 3) as u8, acdf, 6);
-            }
-        }
-        if self.frame.screen_content && cmp::max(bw4, bh4) <= 16 && bw4 + bh4 >= 4 {
-            let sz_ctx = (b_dim[2] + b_dim[3] - 2) as usize;
-            if y_mode == DC_PRED {
-                let pal_ctx = (self.above.pal_sz[ax] > 0) as usize + (self.left.pal_sz[ly] > 0) as usize;
-                tile.w.bool_adapt(false, &mut tile.cdf.m.pal_y[sz_ctx][pal_ctx]);
-            }
-            if limits.chroma && intra.uv_mode == DC_PRED {
-                tile.w.bool_adapt(false, &mut tile.cdf.m.pal_uv[0]);
-            }
-        }
-        if y_mode == DC_PRED && limits.filter {
-            tile.w.bool_adapt(filter.is_some(), &mut tile.cdf.m.use_filter_intra[bs as usize]);
-            if let Some(f) = filter {
-                tile.w.symbol(f, &mut tile.cdf.m.filter_intra.0, 4);
-            }
-        }
-        if self.frame.tx_select && !lossless && max_dim.max > 0 {
-            let tctx = (self.left.tx_intra[ly] as i32 >= max_dim.lh as i32) as usize
-                + (self.above.tx_intra[ax] as i32 >= max_dim.lw as i32) as usize;
-            let cdf = &mut tile.cdf.m.txsz[(max_dim.max - 1) as usize][tctx];
-            tile.w.symbol(depth, cdf, cmp::min(max_dim.max, 2));
-        }
-        if !skip {
-            for (plane, x4, y4, c, eob) in &coefs {
-                let t = if *plane == 0 { tx } else { uvtx };
-                write_coefs(
-                    &mut tile.w,
-                    &mut tile.cdf,
-                    &mut self.above,
-                    &mut self.left,
-                    *plane,
-                    *x4 as usize,
-                    *y4 as usize,
-                    t,
-                    bs,
-                    c,
-                    *eob,
-                    &intra,
-                    lossless,
-                    self.frame.quant.base,
-                    self.frame.reduced_tx_set,
-                    self.bw,
-                    self.bh,
-                );
-            }
-        } else {
-            for (plane, x4, y4, _, _) in &coefs {
-                let t_dim = &DAV1D_TXFM_DIMENSIONS[if *plane == 0 { tx } else { uvtx } as usize];
-                let (a, l) = coef_ctx(&mut self.above, &mut self.left, *plane);
-                a[*x4 as usize..][..t_dim.w as usize].fill(0x40);
-                l[(*y4 & 15) as usize..][..t_dim.h as usize].fill(0x40);
-            }
-        }
-        let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
-        let (n, m) = (bw4 as usize, bh4 as usize);
-        self.above.tx_intra[ax..ax + n].fill(t_dim.lw as i8);
-        self.left.tx_intra[ly..ly + m].fill(t_dim.lh as i8);
-        self.above.mode[ax..ax + n].fill(y_mode);
-        self.left.mode[ly..ly + m].fill(y_mode);
-        self.above.pal_sz[ax..ax + n].fill(0);
-        self.left.pal_sz[ly..ly + m].fill(0);
-        self.above.skip[ax..ax + n].fill(skip as u8);
-        self.left.skip[ly..ly + m].fill(skip as u8);
-        if limits.chroma {
-            self.above.uvmode[ax..ax + n].fill(intra.uv_mode);
-            self.left.uvmode[ly..ly + m].fill(intra.uv_mode);
-        }
+        self.above.restore_coef(ax, &saved_a);
+        self.left.restore_coef(ly, &saved_l);
+        txs
     }
 
     fn sm_flag(&self, ax: usize, ly: usize) -> i32 {
@@ -795,12 +936,13 @@ impl<D: Decide> Encoder<D> {
         }
     }
 
-    /// Predicts every transform block of one plane, chooses its residual and reconstructs it.
-    /// Pushes `(plane, x4, y4, coefs, eob)` per transform block, in coding order.
+    /// Predicts every transform block of one plane, chooses its residual and reconstructs it,
+    /// updating the coefficient contexts as the decoder will.
     #[allow(clippy::too_many_arguments)]
-    fn predict_and_choose(
+    fn predict_plane(
         &mut self,
         ti: usize,
+        bs: BlockSize,
         plane: usize,
         bx: i32,
         by: i32,
@@ -811,9 +953,9 @@ impl<D: Decide> Encoder<D> {
         intra_edge_flags: EdgeFlags,
         intra_flags: i32,
         predict: bool,
-        lossless: bool,
-        out: &mut Vec<(usize, i32, i32, Coefs, i32)>,
+        out: &mut Vec<TxDone>,
     ) {
+        let lossless = self.frame.quant.lossless();
         let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
         let (tw, th) = (t_dim.w as i32, t_dim.h as i32);
         let tile = &self.tiles[ti];
@@ -829,7 +971,9 @@ impl<D: Decide> Encoder<D> {
         };
         let angle0 = if plane == 0 { intra.y_angle } else { intra.uv_angle } as i32;
         let coded_txtp = !lossless && self.frame.quant.base != 0 && plane == 0 && t_dim.max < TxfmSize::S32x32 as u8;
-        let set = if self.frame.reduced_tx_set || t_dim.min == TxfmSize::S16x16 as u8 {
+        let set: &[TxfmType] = if !coded_txtp {
+            &[]
+        } else if self.frame.reduced_tx_set || t_dim.min == TxfmSize::S16x16 as u8 {
             &DAV1D_TX_TYPES_PER_SET[..5]
         } else {
             &DAV1D_TX_TYPES_PER_SET[5..12]
@@ -846,10 +990,10 @@ impl<D: Decide> Encoder<D> {
             let mut x = 0;
             while x < w4 {
                 let (px, py) = (bx + x, by + y);
-                let rec = &self.rec[plane];
                 let wy = (py as usize * 4) % SB;
-                let dst = rec.comp.with_offset::<BD>() + (wy * rec.stride + px as usize * 4);
                 if predict {
+                    let rec = &self.rec[plane];
+                    let dst = rec.comp.with_offset::<BD>() + (wy * rec.stride + px as usize * 4);
                     let edge = EdgeFlags::I444_TOP_HAS_RIGHT.select(!((y > 0 || !sb_has_tr) && x + tw >= w4))
                         | EdgeFlags::I444_LEFT_HAS_BOTTOM.select(!(x > 0 || (!sb_has_bl && y + th >= h4)));
                     let mut topleft = EdgePx([0; EDGE_LEN]);
@@ -886,30 +1030,130 @@ impl<D: Decide> Encoder<D> {
                     );
                 }
                 let (pw, ph) = (tw as usize * 4, th as usize * 4);
-                let mut src = vec![0u8; pw * ph];
-                let mut pred = vec![0u8; pw * ph];
-                for r in 0..ph {
-                    let o = (wy + r) * rec.stride + px as usize * 4;
-                    pred[r * pw..][..pw].copy_from_slice(&rec.comp.slice::<BD, _>((o.., ..pw)));
-                    let s = &self.src[plane];
-                    src[r * pw..][..pw].copy_from_slice(&s.comp.slice::<BD, _>((o.., ..pw)));
-                }
-                let txtp = if coded_txtp { self.decide.txtp(tx, set) } else { fixed_txtp };
-                assert!(!coded_txtp || set.contains(&txtp));
                 let n = cmp::min(pw, 32) * cmp::min(ph, 32);
                 let mut levels = vec![0i32; n];
-                self.decide.levels(plane, tx, txtp, &src, &pred, self.dq[plane], &mut levels);
+                let decided = if self.dry || self.decide.searches() {
+                    None
+                } else {
+                    self.decide.residual(plane, tx, set, &mut levels)
+                };
+                let txtp = match decided {
+                    Some(t) if set.is_empty() => {
+                        let _ = t;
+                        fixed_txtp
+                    }
+                    Some(t) => {
+                        assert!(set.contains(&t));
+                        t
+                    }
+                    None => {
+                        let all = if set.is_empty() { std::slice::from_ref(&fixed_txtp) } else { set };
+                        let cands = if self.dct_only && !set.is_empty() { &all[1..2] } else { all };
+                        self.rd_residual(bs, plane, px, py, tx, cands, intra, &mut levels)
+                    }
+                };
                 let eob = eob_of(tx, txtp, &levels);
                 if eob >= 0 {
                     let mut cf = Coef([0; 32 * 32]);
                     self.dequant(plane, tx, txtp, &levels, &mut cf.0[..n]);
+                    let rec = &self.rec[plane];
+                    let dst = rec.comp.with_offset::<BD>() + (wy * rec.stride + px as usize * 4);
                     self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
                 }
-                out.push((plane, px, py, Coefs { txtp, levels }, eob));
+                let v = res_ctx(&levels, eob);
+                let (a, l) = coef_ctx(&mut self.above, &mut self.left, plane);
+                let cw = cmp::min(tw, self.bw - px) as usize;
+                let ch = cmp::min(th, self.bh - py) as usize;
+                a[px as usize..][..cw].fill(v);
+                l[(py & 15) as usize..][..ch].fill(v);
+                out.push(TxDone { plane, x4: px, y4: py, tx, coefs: Coefs { txtp, levels }, eob });
                 x += tw;
             }
             y += th;
         }
+    }
+
+    /// Chooses a transform type from `cands` and its levels by rate and distortion; the
+    /// prediction is in place in the reconstruction.
+    #[allow(clippy::too_many_arguments)]
+    fn rd_residual(
+        &mut self,
+        bs: BlockSize,
+        plane: usize,
+        px: i32,
+        py: i32,
+        tx: TxfmSize,
+        cands: &[TxfmType],
+        intra: &Intra,
+        levels: &mut [i32],
+    ) -> TxfmType {
+        let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
+        let (pw, ph) = (t_dim.w as usize * 4, t_dim.h as usize * 4);
+        let wy = (py as usize * 4) % SB;
+        let x0 = px as usize * 4;
+        let vw = cmp::min(pw, (self.seq.width as usize).saturating_sub(x0));
+        let vh = cmp::min(ph, (self.seq.height as usize).saturating_sub(py as usize * 4));
+        let mut src = Vec::with_capacity(pw * ph);
+        let mut pred = Vec::with_capacity(pw * ph);
+        self.src[plane].read(x0, wy, pw, ph, &mut src);
+        self.rec[plane].read(x0, wy, pw, ph, &mut pred);
+        let residual: Vec<i16> = src.iter().zip(&pred).map(|(&s, &p)| s as i16 - p as i16).collect();
+        let sse = |a: &[u8], b: &[u8]| -> u64 {
+            let mut s = 0;
+            for r in 0..vh {
+                for c in 0..vw {
+                    let d = a[r * pw + c] as i32 - b[r * pw + c] as i32;
+                    s += (d * d) as u64;
+                }
+            }
+            s
+        };
+        let (a0, l0) = {
+            let (a, l) = coef_ctx(&mut self.above, &mut self.left, plane);
+            let mut a0 = [0x40u8; 48];
+            let mut l0 = [0x40u8; 48];
+            a0[..16].copy_from_slice(&a[px as usize..][..16]);
+            l0[..16].copy_from_slice(&l[(py & 15) as usize..][..16]);
+            (a0, l0)
+        };
+        let n = levels.len();
+        let lossless = self.frame.quant.lossless();
+        let rate = |e: &mut Self, txtp: TxfmType, lv: &[i32], eob: i32| -> u32 {
+            let (mut a, mut l) = (a0, l0);
+            let mut c = Counter::default();
+            let coefs = Coefs { txtp, levels: lv.to_vec() };
+            write_coefs(&mut c, &mut e.cost_cdf, &mut a, &mut l, plane, 0, 0, tx, bs, &coefs, eob, intra, lossless, e.frame.quant.base, e.frame.reduced_tx_set, i32::MAX, i32::MAX);
+            c.bits
+        };
+        let zero_rate = rate(self, cands[0], &vec![0; n], -1);
+        let zero = if lossless { f64::MAX } else { sse(&src, &pred) as f64 + self.lambda * zero_rate as f64 / 512.0 };
+        let mut best = (zero, cands[0], vec![0; n]);
+        let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
+        let mut coefs = vec![0i32; n];
+        let mut trial = vec![0i32; n];
+        for &txtp in cands {
+            fdct::forward(&residual, pw, &mut coefs, tx, txtp);
+            let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
+            quantize(&coefs, &mut trial, self.dq[plane], qm, shift, if lossless { 64 } else { 48 });
+            let eob = eob_of(tx, txtp, &trial);
+            if eob < 0 {
+                continue;
+            }
+            let bits = rate(self, txtp, &trial, eob);
+            let mut cf = Coef([0; 32 * 32]);
+            self.dequant(plane, tx, txtp, &trial, &mut cf.0[..n]);
+            self.scratch.write(0, 0, pw, ph, &pred);
+            let dst = self.scratch.comp.with_offset::<BD>();
+            self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
+            let mut rec = Vec::with_capacity(pw * ph);
+            self.scratch.read(0, 0, pw, ph, &mut rec);
+            let cost = sse(&src, &rec) as f64 + self.lambda * bits as f64 / 512.0;
+            if cost < best.0 {
+                best = (cost, txtp, trial.clone());
+            }
+        }
+        levels.copy_from_slice(&best.2);
+        best.1
     }
 
     fn dequant(&self, plane: usize, tx: TxfmSize, txtp: TxfmType, levels: &[i32], cf: &mut [i16]) {
@@ -931,6 +1175,287 @@ impl<D: Decide> Encoder<D> {
             *c = if l < 0 { -v } else { v } as i16;
         }
     }
+
+    /// The squared error of the reconstruction in a block's visible area, in the given planes.
+    fn sse(&self, x: i32, y: i32, w4: usize, h4: usize, planes: Range<usize>) -> u64 {
+        let x0 = x as usize * 4;
+        let w = cmp::min(w4 * 4, (self.seq.width as usize).saturating_sub(x0));
+        let h = cmp::min(h4 * 4, (self.seq.height as usize).saturating_sub(y as usize * 4));
+        let wy = (y as usize * 4) % SB;
+        let mut total = 0;
+        for p in planes {
+            for r in 0..h {
+                let s = self.src[p].comp.slice::<BD, _>(((wy + r) * self.src[p].stride + x0.., ..w));
+                let d = self.rec[p].comp.slice::<BD, _>(((wy + r) * self.rec[p].stride + x0.., ..w));
+                total += s.iter().zip(d.iter()).map(|(&a, &b)| ((a as i32 - b as i32).pow(2)) as u64).sum::<u64>();
+            }
+        }
+        total
+    }
+
+    fn snap(&self, x: i32, y: i32, w4: usize, h4: usize) -> Snap {
+        let mut pixels = Vec::new();
+        let wy = (y as usize * 4) % SB;
+        for p in &self.rec {
+            p.read(x as usize * 4, wy, w4 * 4, h4 * 4, &mut pixels);
+        }
+        let (ax, ly) = (x as usize, (y & 15) as usize);
+        Snap {
+            x,
+            y,
+            w4,
+            h4,
+            pixels,
+            above: self.above.save(ax..ax + w4),
+            left: self.left.save(ly..ly + h4),
+        }
+    }
+
+    fn restore(&mut self, s: &Snap) {
+        let wy = (s.y as usize * 4) % SB;
+        let n = s.w4 * s.h4 * 16;
+        for (i, p) in self.rec.iter().enumerate() {
+            p.write(s.x as usize * 4, wy, s.w4 * 4, s.h4 * 4, &s.pixels[i * n..][..n]);
+        }
+        self.above.restore(s.x as usize, &s.above);
+        self.left.restore((s.y & 15) as usize, &s.left);
+    }
+
+    fn rd_cost(&self, dist: u64, bits: u32) -> f64 {
+        dist as f64 + self.lambda * bits as f64 / 512.0
+    }
+
+    /// Searches the superblock and leaves its plan to be coded.
+    fn search_sb(&mut self, ti: usize, x: i32, y: i32) {
+        self.plan.clear();
+        self.next = 0;
+        let s = self.snap(x, y, 16, 16);
+        self.dry = true;
+        self.counter = Counter::default();
+        self.pick_partition(ti, BlockLevel::Bl64x64, x, y, EdgeIndex::root());
+        self.dry = false;
+        self.restore(&s);
+    }
+
+    /// Finds the best partition of a block and leaves it applied; its nodes go on the plan and
+    /// its bits on the counter.
+    fn pick_partition(&mut self, ti: usize, bl: BlockLevel, x: i32, y: i32, edge_index: EdgeIndex) {
+        let edges = &IntraEdges::DEFAULT;
+        let Some(halves) = self.halves(bl, x, y) else {
+            return self.pick_partition(ti, bl.decrease().unwrap(), x, y, edges.branch(false, edge_index).split[0]);
+        };
+        let n4 = 32 >> bl as u8;
+        let start = self.snap(x, y, n4, n4);
+        let plan_len = self.plan.len();
+        let base = self.counter.bits;
+        let ctx = self.partition_ctx(bl, x, y);
+        use BlockPartition::*;
+        let cands: &[BlockPartition] = match halves {
+            Halves::Both => &[None, Split, H, V],
+            Halves::Top => &[Split, H],
+            Halves::Left => &[Split, V],
+        };
+        let mut best: Option<(f64, u32, Snap, Vec<Node>)> = Option::None;
+        for &bp in cands {
+            self.restore(&start);
+            self.plan.truncate(plan_len);
+            self.counter.bits = base;
+            self.plan.push(Node::Part(bp));
+            Self::write_partition(&mut self.counter, &mut self.cost_cdf, bl, ctx, halves, bp);
+            self.code_partition(ti, bl, bp, x, y, edge_index, halves, &mut |e, ti, bs, x, y, f| {
+                e.pick_block(ti, bs, x, y, f);
+            });
+            let bits = self.counter.bits - base;
+            let cost = self.rd_cost(self.sse(x, y, n4, n4, 0..self.planes), bits);
+            if best.as_ref().is_none_or(|b| cost < b.0) {
+                best = Some((cost, bits, self.snap(x, y, n4, n4), self.plan[plan_len..].to_vec()));
+            }
+        }
+        let (_, bits, snap, nodes) = best.unwrap();
+        self.restore(&snap);
+        self.counter.bits = base + bits;
+        self.plan.truncate(plan_len);
+        self.plan.extend(nodes);
+    }
+
+    /// Finds the best modes of a block and leaves them applied; its node goes on the plan and its
+    /// bits on the counter.
+    fn pick_block(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
+        let b_dim = bs.dimensions();
+        let (w4, h4) = (b_dim[0] as usize, b_dim[1] as usize);
+        let start = self.snap(x, y, w4, h4);
+        let (limits, max_tx) = self.limits(bs);
+        let (ax, ly) = (x as usize, (y & 15) as usize);
+        let lossless = self.frame.quant.lossless();
+        let tx_select = self.frame.tx_select && !lossless;
+        let screen = self.frame.screen_content;
+
+        let luma = |e: &mut Self, intra: &Intra, depth: u8| -> f64 {
+            e.restore(&start);
+            let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 0..1);
+            let mut c = Counter::default();
+            write_luma_modes(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, intra, &limits);
+            write_luma_rest(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, bs, intra, depth, &limits, max_tx, screen, tx_select);
+            let bits = c.bits + coef_bits(e, &txs, bs, intra);
+            let dist = e.sse(x, y, w4, h4, 0..1);
+            e.rd_cost(dist, bits)
+        };
+
+        self.dct_only = true;
+        let mut scored: Vec<(f64, Intra)> = (0..N_INTRA_PRED_MODES as u8)
+            .map(|m| {
+                let c = Intra { y_mode: m, ..Default::default() };
+                (luma(self, &c, 0), c)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if limits.angles {
+            let dirs: Vec<Intra> = scored
+                .iter()
+                .filter(|s| (VERT_PRED..=VERT_LEFT_PRED).contains(&s.1.y_mode))
+                .take(2)
+                .map(|s| s.1)
+                .collect();
+            for d in dirs {
+                for a in [-3, -2, -1, 1, 2, 3] {
+                    let c = Intra { y_angle: a, ..d };
+                    scored.push((luma(self, &c, 0), c));
+                }
+            }
+        }
+        if limits.filter {
+            for f in 0..5 {
+                let c = Intra { y_mode: FILTER_PRED, y_angle: f, ..Default::default() };
+                scored.push((luma(self, &c, 0), c));
+            }
+        }
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        self.dct_only = false;
+        let mut best_luma = (f64::MAX, scored[0].1, 0u8);
+        for &(_, c) in scored.iter().take(2) {
+            for depth in 0..=limits.max_depth {
+                let cost = luma(self, &c, depth);
+                if cost < best_luma.0 {
+                    best_luma = (cost, c, depth);
+                }
+            }
+        }
+        let (_, mut intra, depth) = best_luma;
+
+        if limits.chroma {
+            self.restore(&start);
+            self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
+            let luma_done = self.snap(x, y, w4, h4);
+            let chroma = |e: &mut Self, intra: &Intra| -> f64 {
+                e.restore(&luma_done);
+                let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 1..3);
+                let mut c = Counter::default();
+                write_chroma_modes(&mut c, &mut e.cost_cdf, intra, &limits);
+                let bits = c.bits + coef_bits(e, &txs, bs, intra);
+                let dist = e.sse(x, y, w4, h4, 1..3);
+                e.rd_cost(dist, bits)
+            };
+            let mut best = (f64::MAX, intra);
+            for m in 0..N_UV_INTRA_PRED_MODES as u8 - 1 {
+                let c = Intra { uv_mode: m, uv_angle: 0, cfl: [0; 2], ..intra };
+                let cost = chroma(self, &c);
+                if cost < best.0 {
+                    best = (cost, c);
+                }
+            }
+            if limits.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&best.1.uv_mode) {
+                let d = best.1;
+                for a in [-3, -2, -1, 1, 2, 3] {
+                    let c = Intra { uv_angle: a, ..d };
+                    let cost = chroma(self, &c);
+                    if cost < best.0 {
+                        best = (cost, c);
+                    }
+                }
+            }
+            if limits.cfl {
+                let alphas = self.cfl_alphas(ti, bs, x, y, &intra, depth, &luma_done);
+                if alphas != [0, 0] {
+                    let c = Intra { uv_mode: CFL_PRED, uv_angle: 0, cfl: alphas, ..intra };
+                    let cost = chroma(self, &c);
+                    if cost < best.0 {
+                        best = (cost, c);
+                    }
+                }
+            }
+            intra = best.1;
+        }
+
+        self.restore(&start);
+        self.trial = Some((intra, depth));
+        self.code_b(ti, bs, x, y, edge_flags);
+        self.plan.push(Node::Block(intra, depth));
+    }
+
+    /// CfL alphas that best predict each chroma plane from the reconstructed luma.
+    #[allow(clippy::too_many_arguments)]
+    fn cfl_alphas(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, intra: &Intra, depth: u8, luma_done: &Snap) -> [i8; 2] {
+        let b_dim = bs.dimensions();
+        let (w4, h4) = (b_dim[0] as usize, b_dim[1] as usize);
+        let (bw4, bh4) = (b_dim[0] as i32, b_dim[1] as i32);
+        let cw4 = cmp::min(bw4, self.bw - x);
+        let ch4 = cmp::min(bh4, self.bh - y);
+        let (tx, uvtx) = self.tx_sizes(bs, depth);
+        let mut best = [(u64::MAX, 0i8); 2];
+        for a in -16i8..=16 {
+            if a == 0 {
+                continue;
+            }
+            self.restore(luma_done);
+            let c = Intra { uv_mode: CFL_PRED, cfl: [a, a], ..*intra };
+            self.predict_cfl(ti, x, y, cw4, ch4, bw4, bh4, tx, uvtx, &c);
+            for p in 0..2 {
+                let d = self.sse(x, y, w4, h4, 1 + p..2 + p);
+                if d < best[p].0 {
+                    best[p] = (d, a);
+                }
+            }
+        }
+        self.restore(luma_done);
+        [best[0].1, best[1].1]
+    }
+}
+
+/// The bits of a block's coefficients in the order the decoder reads them; the contexts are
+/// left as they were.
+fn coef_bits<D: Decide>(e: &mut Encoder<D>, txs: &[TxDone], bs: BlockSize, intra: &Intra) -> u32 {
+    let Some(first) = txs.first() else { return 0 };
+    let b_dim = bs.dimensions();
+    let (ax, ly) = (first.x4 as usize, (first.y4 & 15) as usize);
+    let saved_a = e.above.save(ax..ax + b_dim[0] as usize);
+    let saved_l = e.left.save(ly..ly + b_dim[1] as usize);
+    let mut c = Counter::default();
+    let lossless = e.frame.quant.lossless();
+    for t in txs {
+        let (a, l) = coef_ctx(&mut e.above, &mut e.left, t.plane);
+        write_coefs(
+            &mut c,
+            &mut e.cost_cdf,
+            a,
+            l,
+            t.plane,
+            t.x4 as usize,
+            t.y4 as usize,
+            t.tx,
+            bs,
+            &t.coefs,
+            t.eob,
+            intra,
+            lossless,
+            e.frame.quant.base,
+            e.frame.reduced_tx_set,
+            e.bw,
+            e.bh,
+        );
+    }
+    e.above.restore_coef(ax, &saved_a);
+    e.left.restore_coef(ly, &saved_l);
+    c.bits
 }
 
 fn smooth(m: u8) -> i32 {
@@ -938,6 +1463,212 @@ fn smooth(m: u8) -> i32 {
         512
     } else {
         0
+    }
+}
+
+/// The quantized level of each coefficient: `rounding` in 1/128 of a step.
+fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32) {
+    for (rc, (&c, l)) in coefs.iter().zip(levels.iter_mut()).enumerate() {
+        let mut q = dq[(rc != 0) as usize];
+        if let Some(qm) = qm {
+            q = q * qm[rc] as u32 + 16 >> 5;
+        }
+        let a = (c.unsigned_abs() as u64) << shift;
+        let v = ((a * 128 + q as u64 * rounding as u64) / (q as u64 * 128)) as i32;
+        *l = if c < 0 { -v } else { v };
+    }
+}
+
+/// The context a transform block leaves for its neighbours: the sum of its levels, capped, and
+/// the sign of its DC.
+fn res_ctx(levels: &[i32], eob: i32) -> u8 {
+    if eob < 0 {
+        return 0x40;
+    }
+    let cul = levels.iter().fold(0u32, |a, l| a.saturating_add(l.unsigned_abs() & 0xfffff));
+    let sign = match levels[0] {
+        0 => 0x40,
+        d if d < 0 => 0,
+        _ => 0x80,
+    };
+    (cmp::min(cul, 63) | sign) as u8
+}
+
+/// Everything a block writes, in the order `decode_b` reads it.
+struct BlockWrite {
+    bs: BlockSize,
+    x: i32,
+    y: i32,
+    skip: bool,
+    intra: Intra,
+    depth: u8,
+    max_tx: TxfmSize,
+    limits: Limits,
+    delta: Option<i32>,
+    screen_content: bool,
+    tx_select: bool,
+    lossless: bool,
+    qidx: u8,
+    reduced_tx_set: bool,
+    bw: i32,
+    bh: i32,
+}
+
+impl BlockWrite {
+    fn write<S: Sink>(&self, s: &mut S, cdf: &mut CdfContext, above: &mut Ctx, left: &mut Ctx, txs: &[TxDone]) {
+        let (ax, ly) = (self.x as usize, (self.y & 15) as usize);
+        let b_dim = self.bs.dimensions();
+        let (bw4, bh4) = (b_dim[0] as usize, b_dim[1] as usize);
+        let sctx = (above.skip[ax] + left.skip[ly]) as usize;
+        s.bool_adapt(self.skip, &mut cdf.m.skip[sctx]);
+        if let Some(delta) = self.delta {
+            let abs = delta.unsigned_abs();
+            s.symbol(cmp::min(abs, 3) as u8, &mut cdf.m.delta_q.0, 3);
+            if abs >= 3 {
+                let n_bits = 31 - (abs - 1).leading_zeros();
+                s.bools(n_bits - 1, 3);
+                s.bools(abs - 1 - (1 << n_bits), n_bits as u8);
+            }
+            if abs != 0 {
+                s.bool_equi(delta < 0);
+            }
+        }
+        write_luma_modes(s, cdf, above, left, ax, ly, &self.intra, &self.limits);
+        if self.limits.chroma {
+            write_chroma_modes(s, cdf, &self.intra, &self.limits);
+        }
+        let y_mode = if self.intra.y_mode == FILTER_PRED { DC_PRED } else { self.intra.y_mode };
+        if self.screen_content && cmp::max(bw4, bh4) <= 16 && bw4 + bh4 >= 4 {
+            let sz_ctx = (b_dim[2] + b_dim[3] - 2) as usize;
+            if y_mode == DC_PRED {
+                let pal_ctx = (above.pal_sz[ax] > 0) as usize + (left.pal_sz[ly] > 0) as usize;
+                s.bool_adapt(false, &mut cdf.m.pal_y[sz_ctx][pal_ctx]);
+            }
+            if self.limits.chroma && self.intra.uv_mode == DC_PRED {
+                s.bool_adapt(false, &mut cdf.m.pal_uv[0]);
+            }
+        }
+        write_luma_rest(s, cdf, above, left, ax, ly, self.bs, &self.intra, self.depth, &self.limits, self.max_tx, false, self.tx_select && !self.lossless);
+        if !self.skip {
+            for t in txs {
+                let (a, l) = coef_ctx(above, left, t.plane);
+                write_coefs(
+                    s,
+                    cdf,
+                    a,
+                    l,
+                    t.plane,
+                    t.x4 as usize,
+                    t.y4 as usize,
+                    t.tx,
+                    self.bs,
+                    &t.coefs,
+                    t.eob,
+                    &self.intra,
+                    self.lossless,
+                    self.qidx,
+                    self.reduced_tx_set,
+                    self.bw,
+                    self.bh,
+                );
+            }
+        } else {
+            for t in txs {
+                let t_dim = &DAV1D_TXFM_DIMENSIONS[t.tx as usize];
+                let (a, l) = coef_ctx(above, left, t.plane);
+                a[t.x4 as usize..][..t_dim.w as usize].fill(0x40);
+                l[(t.y4 & 15) as usize..][..t_dim.h as usize].fill(0x40);
+            }
+        }
+        let mut tx = self.max_tx;
+        for _ in 0..self.depth {
+            tx = DAV1D_TXFM_DIMENSIONS[tx as usize].sub;
+        }
+        let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
+        above.tx_intra[ax..ax + bw4].fill(t_dim.lw as i8);
+        left.tx_intra[ly..ly + bh4].fill(t_dim.lh as i8);
+        above.mode[ax..ax + bw4].fill(y_mode);
+        left.mode[ly..ly + bh4].fill(y_mode);
+        above.pal_sz[ax..ax + bw4].fill(0);
+        left.pal_sz[ly..ly + bh4].fill(0);
+        above.skip[ax..ax + bw4].fill(self.skip as u8);
+        left.skip[ly..ly + bh4].fill(self.skip as u8);
+        if self.limits.chroma {
+            above.uvmode[ax..ax + bw4].fill(self.intra.uv_mode);
+            left.uvmode[ly..ly + bh4].fill(self.intra.uv_mode);
+        }
+    }
+}
+
+/// The luma mode and its angle delta.
+#[allow(clippy::too_many_arguments)]
+fn write_luma_modes<S: Sink>(s: &mut S, cdf: &mut CdfContext, above: &Ctx, left: &Ctx, ax: usize, ly: usize, intra: &Intra, limits: &Limits) {
+    let y_mode = if intra.y_mode == FILTER_PRED { DC_PRED } else { intra.y_mode };
+    let ymode_cdf = &mut cdf.kfym[DAV1D_INTRA_MODE_CONTEXT[above.mode[ax] as usize] as usize]
+        [DAV1D_INTRA_MODE_CONTEXT[left.mode[ly] as usize] as usize];
+    s.symbol(y_mode, ymode_cdf, N_INTRA_PRED_MODES as u8 - 1);
+    if limits.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&y_mode) {
+        let acdf = &mut cdf.m.angle_delta[(y_mode - VERT_PRED) as usize];
+        s.symbol((intra.y_angle + 3) as u8, acdf, 6);
+    }
+}
+
+/// What follows the modes for luma: the palette flag when `palette_flag`, filter-intra and,
+/// when `tx_select`, the transform depth.
+#[allow(clippy::too_many_arguments)]
+fn write_luma_rest<S: Sink>(
+    s: &mut S,
+    cdf: &mut CdfContext,
+    above: &Ctx,
+    left: &Ctx,
+    ax: usize,
+    ly: usize,
+    bs: BlockSize,
+    intra: &Intra,
+    depth: u8,
+    limits: &Limits,
+    max_tx: TxfmSize,
+    palette_flag: bool,
+    tx_select: bool,
+) {
+    let b_dim = bs.dimensions();
+    let y_mode = if intra.y_mode == FILTER_PRED { DC_PRED } else { intra.y_mode };
+    if palette_flag && cmp::max(b_dim[0], b_dim[1]) <= 16 && b_dim[0] + b_dim[1] >= 4 && y_mode == DC_PRED {
+        let sz_ctx = (b_dim[2] + b_dim[3] - 2) as usize;
+        let pal_ctx = (above.pal_sz[ax] > 0) as usize + (left.pal_sz[ly] > 0) as usize;
+        s.bool_adapt(false, &mut cdf.m.pal_y[sz_ctx][pal_ctx]);
+    }
+    if y_mode == DC_PRED && limits.filter {
+        let filter = (intra.y_mode == FILTER_PRED).then_some(intra.y_angle as u8);
+        s.bool_adapt(filter.is_some(), &mut cdf.m.use_filter_intra[bs as usize]);
+        if let Some(f) = filter {
+            s.symbol(f, &mut cdf.m.filter_intra.0, 4);
+        }
+    }
+    let max_dim = &DAV1D_TXFM_DIMENSIONS[max_tx as usize];
+    if tx_select && max_dim.max > 0 {
+        let tctx = (left.tx_intra[ly] as i32 >= max_dim.lh as i32) as usize + (above.tx_intra[ax] as i32 >= max_dim.lw as i32) as usize;
+        let c = &mut cdf.m.txsz[(max_dim.max - 1) as usize][tctx];
+        s.symbol(depth, c, cmp::min(max_dim.max, 2));
+    }
+}
+
+fn write_chroma_modes<S: Sink>(s: &mut S, cdf: &mut CdfContext, intra: &Intra, limits: &Limits) {
+    let y_mode = if intra.y_mode == FILTER_PRED { DC_PRED } else { intra.y_mode };
+    let c = &mut cdf.m.uv_mode[limits.cfl as usize][y_mode as usize];
+    s.symbol(intra.uv_mode, c, N_UV_INTRA_PRED_MODES as u8 - 1 - !limits.cfl as u8);
+    if intra.uv_mode == CFL_PRED {
+        let sign = intra.cfl.map(|a| if a == 0 { 0u8 } else if a < 0 { 1 } else { 2 });
+        s.symbol(sign[0] * 3 + sign[1] - 1, &mut cdf.m.cfl_sign.0, 7);
+        for i in 0..2 {
+            if sign[i] != 0 {
+                let ctx = (sign[i] == 2) as usize * 3 + sign[1 - i] as usize;
+                s.symbol(intra.cfl[i].unsigned_abs() - 1, &mut cdf.m.cfl_alpha[ctx], 15);
+            }
+        }
+    } else if limits.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&intra.uv_mode) {
+        let acdf = &mut cdf.m.angle_delta[(intra.uv_mode - VERT_PRED) as usize];
+        s.symbol((intra.uv_angle + 3) as u8, acdf, 6);
     }
 }
 
@@ -991,24 +1722,12 @@ fn eob_of(tx: TxfmSize, txtp: TxfmType, levels: &[i32]) -> i32 {
         .map_or(-1, |i| i as i32)
 }
 
-fn golomb(w: &mut Writer, v: u32) {
-    let x = v + 1;
-    let len = 31 - x.leading_zeros();
-    for _ in 0..len {
-        w.bool_equi(false);
-    }
-    w.bool_equi(true);
-    for i in (0..len).rev() {
-        w.bool_equi(x >> i & 1 != 0);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn write_coefs(
-    w: &mut Writer,
+fn write_coefs<S: Sink>(
+    w: &mut S,
     cdf: &mut CdfContext,
-    above: &mut Ctx,
-    left: &mut Ctx,
+    a: &mut [u8],
+    l: &mut [u8],
     plane: usize,
     x4: usize,
     y4: usize,
@@ -1026,20 +1745,19 @@ fn write_coefs(
     let t_dim: &TxfmInfo = &DAV1D_TXFM_DIMENSIONS[tx as usize];
     let chroma = (plane != 0) as usize;
     let ly = y4 & 15;
-    let (a, l) = coef_ctx(above, left, plane);
     let sctx = get_skip_ctx(
         t_dim,
         bs,
         &a[x4..x4 + t_dim.w as usize],
         &l[ly..ly + t_dim.h as usize],
         plane != 0,
-        crate::include::dav1d::headers::Rav1dPixelLayout::I444,
+        Rav1dPixelLayout::I444,
     );
     let all_skip = eob < 0;
     w.bool_adapt(all_skip, &mut cdf.coef.skip[t_dim.ctx as usize][sctx.get() as usize]);
     let set_ctx = |a: &mut [u8], l: &mut [u8], v: u8| {
-        let n = cmp::min(t_dim.w as i32, bw - x4 as i32) as usize;
-        let m = cmp::min(t_dim.h as i32, bh - y4 as i32) as usize;
+        let n = cmp::min(t_dim.w as i64, bw as i64 - x4 as i64) as usize;
+        let m = cmp::min(t_dim.h as i64, bh as i64 - y4 as i64) as usize;
         a[x4..x4 + n].fill(v);
         l[ly..ly + m].fill(v);
     };
@@ -1106,32 +1824,32 @@ fn write_coefs(
     let dc_level;
     if eob > 0 {
         let (rc, x, y) = scan_rc(tx, class, eob as usize);
-        let l = level_at(eob as usize);
+        let lv = level_at(eob as usize);
         let ctx = 1 + (eob > (2 << tx2dszctx)) as usize + (eob > (4 << tx2dszctx)) as usize;
-        w.symbol((cmp::min(l, 3) - 1) as u8, &mut cdf.coef.eob_base_tok[t_dim.ctx as usize][chroma][ctx], 2);
-        if l >= 3 {
+        w.symbol((cmp::min(lv, 3) - 1) as u8, &mut cdf.coef.eob_base_tok[t_dim.ctx as usize][chroma][ctx], 2);
+        if lv >= 3 {
             let far = if class == TxClass::TwoD { (x | y) > 1 } else { y != 0 };
             let ctx = if far { 14 } else { 7 };
-            w.hi_tok(cmp::min(l, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
+            w.hi_tok(cmp::min(lv, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
         }
-        levels[level_off(rc, x, y)] = pack(l);
+        levels[level_off(rc, x, y)] = pack(lv);
         for i in (1..eob as usize).rev() {
             let (rc, x, mut y) = scan_rc(tx, class, i);
             let off = level_off(rc, x, y);
             let mut mag = 0;
             let lo = get_lo_ctx(&levels[off..], class, &mut mag, offsets, x, y, stride as u8);
-            let l = level_at(i);
-            w.symbol(cmp::min(l, 3) as u8, &mut cdf.coef.base_tok[t_dim.ctx as usize][chroma][lo.get()], 3);
+            let lv = level_at(i);
+            w.symbol(cmp::min(lv, 3) as u8, &mut cdf.coef.base_tok[t_dim.ctx as usize][chroma][lo.get()], 3);
             if class == TxClass::TwoD {
                 y |= x;
             }
-            if l >= 3 {
+            if lv >= 3 {
                 let mag = mag as u8 & 63;
                 let ctx = if y > (class == TxClass::TwoD) as u8 { 14 } else { 7 }
                     + if mag > 12 { 6 } else { (mag + 1) >> 1 } as usize;
-                w.hi_tok(cmp::min(l, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
+                w.hi_tok(cmp::min(lv, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
             }
-            levels[off] = pack(l);
+            levels[off] = pack(lv);
         }
         let mut mag = 0;
         let lo = if class == TxClass::TwoD {
@@ -1139,24 +1857,24 @@ fn write_coefs(
         } else {
             get_lo_ctx(&levels, class, &mut mag, offsets, 0, 0, stride as u8).get()
         };
-        let l = level_at(0);
-        w.symbol(cmp::min(l, 3) as u8, &mut cdf.coef.base_tok[t_dim.ctx as usize][chroma][lo], 3);
-        if l >= 3 {
+        let lv = level_at(0);
+        w.symbol(cmp::min(lv, 3) as u8, &mut cdf.coef.base_tok[t_dim.ctx as usize][chroma][lo], 3);
+        if lv >= 3 {
             if class == TxClass::TwoD {
                 mag = levels[1] as u32 + levels[stride] as u32 + levels[stride + 1] as u32;
             }
             let mag = mag as u8 & 63;
             let ctx = if mag > 12 { 6 } else { (mag + 1) >> 1 } as usize;
-            w.hi_tok(cmp::min(l, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
+            w.hi_tok(cmp::min(lv, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
         }
-        dc_level = l;
+        dc_level = lv;
     } else {
-        let l = level_at(0);
-        w.symbol((cmp::min(l, 3) - 1) as u8, &mut cdf.coef.eob_base_tok[t_dim.ctx as usize][chroma][0], 2);
-        if l >= 3 {
-            w.hi_tok(cmp::min(l, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][0]);
+        let lv = level_at(0);
+        w.symbol((cmp::min(lv, 3) - 1) as u8, &mut cdf.coef.eob_base_tok[t_dim.ctx as usize][chroma][0], 2);
+        if lv >= 3 {
+            w.hi_tok(cmp::min(lv, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][0]);
         }
-        dc_level = l;
+        dc_level = lv;
     }
     let mut cul_level = 0u32;
     let dc_sign_level;
@@ -1167,7 +1885,7 @@ fn write_coefs(
         let ctx = get_dc_sign_ctx(tx, &a[x4..], &l[ly..]) as usize;
         w.bool_adapt(dc < 0, &mut cdf.coef.dc_sign[chroma][ctx]);
         if dc_level >= 15 {
-            golomb(w, dc_level - 15);
+            w.golomb(dc_level - 15);
         }
         dc_sign_level = if dc < 0 { 0 } else { 0x80 };
         cul_level = dc_level;
@@ -1178,15 +1896,14 @@ fn write_coefs(
             continue;
         }
         w.bool_equi(v < 0);
-        let l = v.unsigned_abs();
-        if l >= 15 {
-            golomb(w, l - 15);
+        let lv = v.unsigned_abs();
+        if lv >= 15 {
+            w.golomb(lv - 15);
         }
-        cul_level = cul_level.wrapping_add(l);
+        cul_level = cul_level.wrapping_add(lv);
     }
     set_ctx(a, l, (cmp::min(cul_level, 63) | dc_sign_level) as u8);
 }
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1259,11 +1976,8 @@ pub(crate) mod tests {
             (m, r.below(l.max_depth as u32 + 1) as u8)
         }
 
-        fn txtp(&mut self, _: TxfmSize, set: &[TxfmType]) -> TxfmType {
-            set[self.rng.below(set.len() as u32) as usize]
-        }
-
-        fn levels(&mut self, _: usize, _: TxfmSize, _: TxfmType, _: &[u8], _: &[u8], _: [u32; 2], levels: &mut [i32]) {
+        fn residual(&mut self, _: usize, _: TxfmSize, set: &[TxfmType], levels: &mut [i32]) -> Option<TxfmType> {
+            let txtp = if set.is_empty() { DCT_DCT } else { set[self.rng.below(set.len() as u32) as usize] };
             let density = [0, 1, 4, self.density][self.rng.below(4) as usize];
             for l in levels.iter_mut() {
                 *l = if self.rng.below(100) < density {
@@ -1274,6 +1988,7 @@ pub(crate) mod tests {
                     0
                 };
             }
+            Some(txtp)
         }
     }
 
@@ -1431,5 +2146,95 @@ pub(crate) mod tests {
     #[test]
     fn random_two_tile_columns() {
         random(4200, 72, false, 3, |f| f.tx_select = true);
+    }
+
+    fn psnr(a: &[Vec<u8>], b: &[Vec<u8>]) -> f64 {
+        let (mut se, mut n) = (0u64, 0usize);
+        for (p, q) in a.iter().zip(b) {
+            se += p.iter().zip(q).map(|(&x, &y)| ((x as i32 - y as i32).pow(2)) as u64).sum::<u64>();
+            n += p.len();
+        }
+        10.0 * (255.0f64 * 255.0 * n as f64 / se.max(1) as f64).log10()
+    }
+
+    /// A smooth gradient with edges and a little noise, closer to a photo than `image`.
+    fn photo(w: usize, h: usize, planes: usize, seed: u64) -> Vec<Vec<u8>> {
+        let mut rng = Rng(seed);
+        (0..planes)
+            .map(|p| {
+                (0..w * h)
+                    .map(|i| {
+                        let (x, y) = ((i % w) as f64, (i / w) as f64);
+                        let v = 128.0 + 60.0 * ((x * 0.05 + p as f64).sin() * (y * 0.03).cos())
+                            + if (x - 40.0).abs() < 10.0 || (y - 70.0).abs() < 3.0 { 50.0 } else { 0.0 };
+                        (v as i32 + (rng.next() % 5) as i32 - 2).clamp(0, 255) as u8
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rd_search() {
+        let cases = [
+            (64, 64, false, 100, true, 232, 43.45),
+            (130, 70, false, 60, true, 589, 44.24),
+            (100, 37, true, 160, false, 56, 40.33),
+            (70, 45, false, 0, false, usize::MAX, 0.0),
+        ];
+        for (w, h, mono, base, tx_select, max_bytes, min_db) in cases {
+            let planes = if mono { 1 } else { 3 };
+            let seq = sequence(w as u32, h as u32, mono);
+            let mut fr = frame(&seq, base);
+            fr.tx_select = tx_select;
+            let img = photo(w, h, planes, 5);
+            let coded = round_trip(&img, w, h, fr, Rd);
+            let db = psnr(&img, coded.recon.as_ref().unwrap());
+            let bpp = coded.data.len() as f64 * 8.0 / (w * h) as f64;
+            eprintln!("rd {w}x{h} mono {mono} q {base}: {db:.4} dB {} bytes {bpp:.3} bpp", coded.data.len());
+            if base == 0 {
+                assert!(coded.recon.as_ref().unwrap() == &img, "lossless changed pixels");
+            }
+            assert!(coded.data.len() <= max_bytes && db >= min_db, "{} bytes {db} dB", coded.data.len());
+        }
+    }
+
+    /// Lossless keeps residuals whose distortion costs less than their bits.
+    #[test]
+    fn lossless_keeps_small_residuals() {
+        let (w, h) = (40, 24);
+        let mut img = vec![vec![128u8; w * h]; 3];
+        for (i, p) in img.iter_mut().enumerate() {
+            p[17 + i * 3] = 129;
+            p[w * 9 + 30] = 127;
+        }
+        let seq = sequence(w as u32, h as u32, false);
+        let coded = round_trip(&img, w, h, frame(&seq, 0), Rd);
+        assert!(coded.recon.as_ref().unwrap() == &img);
+    }
+
+    /// The search beats fixed DC prediction with chosen residuals at the same quantizer.
+    #[test]
+    fn rd_beats_dc() {
+        struct Dc;
+        impl Decide for Dc {
+            fn partition(&mut self, bl: BlockLevel, x: i32, y: i32, h: Halves) -> BlockPartition {
+                Skip(BlockLevel::Bl16x16).partition(bl, x, y, h)
+            }
+            fn mode(&mut self, _: BlockSize, _: i32, _: i32, _: &Limits) -> (Intra, u8) {
+                (Intra::default(), 0)
+            }
+        }
+        let (w, h) = (128, 96);
+        let img = photo(w, h, 3, 9);
+        let seq = sequence(w as u32, h as u32, false);
+        let cost = |c: &Coded| {
+            let db = psnr(&img, c.recon.as_ref().unwrap());
+            (db, c.data.len())
+        };
+        let dc = cost(&round_trip(&img, w, h, frame(&seq, 120), Dc));
+        let rd = cost(&round_trip(&img, w, h, frame(&seq, 120), Rd));
+        eprintln!("dc {dc:?} rd {rd:?}");
+        assert!(rd.0 >= dc.0 - 0.3 && rd.1 < dc.1, "dc {dc:?} rd {rd:?}");
     }
 }

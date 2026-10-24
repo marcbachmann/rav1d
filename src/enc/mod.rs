@@ -4,3 +4,4 @@ pub mod ec;
 pub mod fdct;
 pub mod frame;
 pub mod header;
+pub mod rd;
