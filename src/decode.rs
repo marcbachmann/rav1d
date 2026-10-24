@@ -29,14 +29,14 @@ use crate::include::common::bitdepth::BPC;
 use crate::include::common::intops::{apply_sign64, clip, clip_u8, iclip};
 use crate::include::dav1d::common::Rav1dDataProps;
 use crate::include::dav1d::headers::{
-    Rav1dFilterMode, Rav1dFrameHeader, Rav1dFrameHeaderTiling, Rav1dPixelLayout,
+    Rav1dFilterMode, Rav1dFrameHeader, Rav1dPixelLayout,
     Rav1dRestorationType, Rav1dSequenceHeader, Rav1dTxfmMode, Rav1dWarpedMotionParams,
     Rav1dWarpedMotionType, SgrIdx, RAV1D_PRIMARY_REF_NONE,
 };
 use crate::include::dav1d::picture::Rav1dPicture;
 use crate::internal::{
     Bxy, Rav1dBitDepthDSPContext, Rav1dContext, Rav1dContextTaskType, Rav1dFrameContext,
-    Rav1dFrameContextFrameThread, Rav1dFrameContextLf, Rav1dFrameData, Rav1dState,
+    FrameRows, Rav1dFrameContextFrameThread, Rav1dFrameContextLf, Rav1dFrameData, Rav1dState,
     Rav1dTaskContext, Rav1dTileState, Rav1dTileStateContext, ScalableMotionParams, ScratchPal,
     TileStateRef,
 };
@@ -4671,58 +4671,146 @@ fn rav1d_decode_frame_main(c: &Rav1dContext, f: &mut Rav1dFrameData) -> Rav1dRes
     };
     let mut t = t.lock();
 
-    let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
-
-    for ctx in &mut f.a[..f.sb128w as usize * frame_hdr.tiling.rows as usize] {
-        reset_context(ctx, frame_hdr.frame_type.is_key_or_intra(), 0);
-    }
+    reset_above_contexts(f);
 
     // no threading - we explicitly interleave tile/sbrow decoding
     // and post-filtering, so that the full process runs in-line
-    let Rav1dFrameHeaderTiling { rows, cols, .. } = frame_hdr.tiling;
-    let [rows, cols] = [rows, cols].map(|it| it.try_into().unwrap());
-    // Need to clone this because `(f.bd_fn().filter_sbrow)(f, sby);` takes a `&mut` to `f` within the loop.
-    let row_start_sb = frame_hdr.tiling.row_start_sb.clone();
-    for (tile_row, sbh_start_end) in row_start_sb[..rows + 1].windows(2).take(rows).enumerate() {
-        // Needed until #[feature(array_windows)] stabilizes; it should hopefully optimize out.
-        let [sbh_start, sbh_end] = <[u16; 2]>::try_from(sbh_start_end).unwrap();
-
-        let sbh_end = cmp::min(sbh_end.into(), f.sbh);
-
-        for sby in sbh_start.into()..sbh_end {
-            let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
-            let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
-            t.b.y = sby << 4 + seq_hdr.sb128;
-            let by_end = t.b.y + f.sb_step >> 1;
-            if frame_hdr.use_ref_frame_mvs != 0 {
-                c.dsp.refmvs.load_tmvs.call(
-                    &f.rf,
-                    &f.mvs,
-                    &f.ref_mvs,
-                    tile_row as c_int,
-                    0,
-                    f.bw >> 1,
-                    t.b.y >> 1,
-                    by_end,
-                );
-            }
-            for col in 0..cols {
-                t.ts = tile_row * cols + col;
-                rav1d_decode_tile_sbrow(c, &mut t, f).map_err(|()| Rav1dError::InvalidArgument)?;
-            }
-            if f.frame_hdr().frame_type.is_inter_or_switch() {
-                c.dsp
-                    .refmvs
-                    .save_tmvs
-                    .call(&t.rt, &f.rf, &f.mvs, 0, f.bw >> 1, t.b.y >> 1, by_end);
-            }
-
-            // loopfilter + cdef + restoration
-            (f.bd_fn().filter_sbrow)(c, f, &mut t, sby);
-        }
+    let mut sby = 0;
+    while let Some(tile_row) = sbrow_tile_row(f, sby) {
+        decode_sbrow(c, &mut t, f, tile_row, sby)?;
+        sby += 1;
     }
 
     Ok(())
+}
+
+fn reset_above_contexts(f: &mut Rav1dFrameData) {
+    let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
+    for ctx in &mut f.a[..f.sb128w as usize * frame_hdr.tiling.rows as usize] {
+        reset_context(ctx, frame_hdr.frame_type.is_key_or_intra(), 0);
+    }
+}
+
+/// The tile row superblock row `sby` is decoded in, `None` past the last one.
+fn sbrow_tile_row(f: &Rav1dFrameData, sby: c_int) -> Option<usize> {
+    let tiling = &f.frame_hdr().tiling;
+    let rows = tiling.rows as usize;
+    (0..rows).find(|&tile_row| {
+        sby >= tiling.row_start_sb[tile_row].into()
+            && sby < cmp::min(tiling.row_start_sb[tile_row + 1].into(), f.sbh)
+    })
+}
+
+/// Decodes superblock row `sby` of every tile column, then loopfilter + cdef + restoration.
+fn decode_sbrow(
+    c: &Rav1dContext,
+    t: &mut Rav1dTaskContext,
+    f: &mut Rav1dFrameData,
+    tile_row: usize,
+    sby: c_int,
+) -> Rav1dResult {
+    let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
+    let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
+    let cols = frame_hdr.tiling.cols as usize;
+    t.b.y = sby << 4 + seq_hdr.sb128;
+    let by_end = t.b.y + f.sb_step >> 1;
+    if frame_hdr.use_ref_frame_mvs != 0 {
+        c.dsp.refmvs.load_tmvs.call(
+            &f.rf,
+            &f.mvs,
+            &f.ref_mvs,
+            tile_row as c_int,
+            0,
+            f.bw >> 1,
+            t.b.y >> 1,
+            by_end,
+        );
+    }
+    for col in 0..cols {
+        t.ts = tile_row * cols + col;
+        rav1d_decode_tile_sbrow(c, t, f).map_err(|()| Rav1dError::InvalidArgument)?;
+    }
+    if f.frame_hdr().frame_type.is_inter_or_switch() {
+        c.dsp
+            .refmvs
+            .save_tmvs
+            .call(&t.rt, &f.rf, &f.mvs, 0, f.bw >> 1, t.b.y >> 1, by_end);
+    }
+
+    (f.bd_fn().filter_sbrow)(c, f, t, sby);
+    Ok(())
+}
+
+/// The rows of the output picture no filter changes after superblock row `sby`: the filters of
+/// the next one reach up to 8 luma rows into it.
+fn final_rows(f: &Rav1dFrameData, sby: c_int) -> c_int {
+    let h = f.sr_cur.p.p.h;
+    if sby + 1 >= f.sbh {
+        return h;
+    }
+    cmp::min(h, (sby + 1) * f.sb_step * 4 - 8)
+}
+
+/// Sets up a frame to be decoded a superblock row at a time by [`rav1d_decode_frame_rows`],
+/// on this thread alone.
+pub(crate) fn rav1d_decode_frame_begin(c: &Rav1dContext, fc: &Rav1dFrameContext) -> Rav1dResult {
+    assert!(c.fc.len() == 1 && c.tc.len() == 1);
+    let mut res = rav1d_decode_frame_init(c, fc);
+    if res.is_ok() {
+        let mut f = fc.data.try_write().unwrap();
+        res = rav1d_decode_frame_init_cdf(c, fc, &mut f, &fc.in_cdf());
+        if res.is_ok() {
+            reset_above_contexts(&mut f);
+        }
+    }
+    if res.is_err() {
+        return rav1d_decode_frame_exit(c, fc, res);
+    }
+    Ok(())
+}
+
+/// Decodes superblock row `sby` of the frame [`rav1d_decode_frame_begin`] set up, and after its last
+/// one finishes the frame. Returns how many rows from the top are final, and whether it finished.
+pub(crate) fn rav1d_decode_frame_rows(
+    c: &Rav1dContext,
+    fc: &Rav1dFrameContext,
+    sby: c_int,
+) -> Result<(c_int, bool), Rav1dError> {
+    let Rav1dContextTaskType::Single(t) = &c.tc[0].task else {
+        panic!("Expected a single-threaded context");
+    };
+    let res = {
+        let mut f = fc.data.try_write().unwrap();
+        let mut t = t.lock();
+        match sbrow_tile_row(&f, sby) {
+            Some(tile_row) => decode_sbrow(c, &mut t, &mut f, tile_row, sby)
+                .map(|()| (final_rows(&f, sby), sbrow_tile_row(&f, sby + 1).is_none())),
+            None => Ok((f.sr_cur.p.p.h, true)),
+        }
+    };
+    match res {
+        Ok((rows, false)) => Ok((rows, false)),
+        Ok((rows, true)) => {
+            {
+                let mut f = fc.data.try_write().unwrap();
+                let f = &mut *f;
+                let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
+                if frame_hdr.refresh_context != 0 && fc.task_thread.update_set.get() {
+                    rav1d_cdf_thread_update(
+                        frame_hdr,
+                        &mut f.out_cdf.cdf_write(),
+                        &f.ts[frame_hdr.tiling.update as usize]
+                            .context
+                            .try_lock()
+                            .unwrap()
+                            .cdf,
+                    );
+                }
+            }
+            rav1d_decode_frame_exit(c, fc, Ok(())).map(|()| (rows, true))
+        }
+        Err(e) => rav1d_decode_frame_exit(c, fc, Err(e)).map(|()| (0, true)),
+    }
 }
 
 pub(crate) fn rav1d_decode_frame_exit(
@@ -4840,6 +4928,96 @@ fn get_upscale_x0(in_w: c_int, out_w: c_int, step: c_int) -> c_int {
     x0 & 0x3fff
 }
 
+fn on_error(
+    fc: &Rav1dFrameContext,
+    f: &mut Rav1dFrameData,
+    out: &mut Rav1dThreadPicture,
+    cached_error_props: &mut Rav1dDataProps,
+    m: &Rav1dDataProps,
+) {
+    fc.task_thread.error.store(1, Ordering::Relaxed);
+    let _ = mem::take(&mut *fc.in_cdf.try_write().unwrap());
+    if f.frame_hdr.as_ref().is_some_and(|h| h.refresh_context != 0) {
+        let _ = mem::take(&mut f.out_cdf);
+    }
+    for i in 0..7 {
+        if f.refp[i].p.frame_hdr.is_some() {
+            let _ = mem::take(&mut f.refp[i]);
+        }
+        let _ = mem::take(&mut f.ref_mvs[i]);
+    }
+    let _ = mem::take(out);
+    let _ = mem::take(&mut f.cur);
+    let _ = mem::take(&mut f.sr_cur);
+    let _ = mem::take(&mut f.mvs);
+    let _ = mem::take(&mut f.seq_hdr);
+    let _ = mem::take(&mut f.frame_hdr);
+    *cached_error_props = m.clone();
+
+    f.tiles.clear();
+    fc.task_thread.finished.store(true, Ordering::SeqCst);
+}
+
+/// Lets go of what a frame that failed to decode left in the output and the references.
+fn drop_failed_frame(state: &mut Rav1dState, fc: &Rav1dFrameContext, refresh_frame_flags: c_uint) {
+    let _ = mem::take(&mut state.out);
+    for i in 0..8 {
+        if refresh_frame_flags & (1 << i) != 0 {
+            if state.refs[i].p.p.frame_hdr.is_some() {
+                let _ = mem::take(&mut state.refs[i].p);
+            }
+            let _ = mem::take(&mut state.cdf[i]);
+            let _ = mem::take(&mut state.refs[i].segmap);
+            let _ = mem::take(&mut state.refs[i].refmvs);
+        }
+    }
+    let mut f = fc.data.try_write().unwrap();
+    on_error(
+        fc,
+        &mut f,
+        &mut state.out,
+        &mut state.cached_error_props,
+        &state.in_0.m,
+    );
+}
+
+/// Decodes the next superblock row of the frame `state.rows` holds: how many rows from the top of
+/// the picture are final, all of them once the frame is done.
+pub(crate) fn rav1d_decode_rows(c: &Rav1dContext, state: &mut Rav1dState) -> Result<c_int, Rav1dError> {
+    let Some(rows) = state.rows.as_mut() else {
+        return Err(Rav1dError::TryAgain);
+    };
+    let FrameRows {
+        sby,
+        refresh_frame_flags,
+    } = *rows;
+    rows.sby += 1;
+    let fc = &c.fc[0];
+    match rav1d_decode_frame_rows(c, fc, sby) {
+        Ok((n, done)) => {
+            if done {
+                state.rows = None;
+            }
+            Ok(n)
+        }
+        Err(e) => {
+            state.rows = None;
+            let _ = mem::take(&mut state.in_0);
+            drop_failed_frame(state, fc, refresh_frame_flags);
+            Err(e)
+        }
+    }
+}
+
+/// Lets go of a frame left part decoded by rows.
+pub(crate) fn rav1d_abandon_rows(c: &Rav1dContext, state: &mut Rav1dState) {
+    if let Some(rows) = state.rows.take() {
+        let fc = &c.fc[0];
+        let _ = rav1d_decode_frame_exit(c, fc, Err(Rav1dError::Other));
+        drop_failed_frame(state, fc, rows.refresh_frame_flags);
+    }
+}
+
 pub fn rav1d_submit_frame(c: &Rav1dContext, state: &mut Rav1dState) -> Rav1dResult {
     // wait for c->out_delayed[next] and move into c->out if visible
     let (fc, out, _task_thread_lock) = if c.fc.len() > 1 {
@@ -4893,36 +5071,6 @@ pub fn rav1d_submit_frame(c: &Rav1dContext, state: &mut Rav1dState) -> Rav1dResu
     f.seq_hdr = state.seq_hdr.clone();
     f.frame_hdr = mem::take(&mut state.frame_hdr);
     let seq_hdr = f.seq_hdr.clone().unwrap();
-
-    fn on_error(
-        fc: &Rav1dFrameContext,
-        f: &mut Rav1dFrameData,
-        out: &mut Rav1dThreadPicture,
-        cached_error_props: &mut Rav1dDataProps,
-        m: &Rav1dDataProps,
-    ) {
-        fc.task_thread.error.store(1, Ordering::Relaxed);
-        let _ = mem::take(&mut *fc.in_cdf.try_write().unwrap());
-        if f.frame_hdr.as_ref().is_some_and(|h| h.refresh_context != 0) {
-            let _ = mem::take(&mut f.out_cdf);
-        }
-        for i in 0..7 {
-            if f.refp[i].p.frame_hdr.is_some() {
-                let _ = mem::take(&mut f.refp[i]);
-            }
-            let _ = mem::take(&mut f.ref_mvs[i]);
-        }
-        let _ = mem::take(out);
-        let _ = mem::take(&mut f.cur);
-        let _ = mem::take(&mut f.sr_cur);
-        let _ = mem::take(&mut f.mvs);
-        let _ = mem::take(&mut f.seq_hdr);
-        let _ = mem::take(&mut f.frame_hdr);
-        *cached_error_props = m.clone();
-
-        f.tiles.clear();
-        fc.task_thread.finished.store(true, Ordering::SeqCst);
-    }
 
     let bpc = 8 + 2 * seq_hdr.hbd;
     match Rav1dBitDepthDSPContext::get(bpc) {
@@ -5235,28 +5383,25 @@ pub fn rav1d_submit_frame(c: &Rav1dContext, state: &mut Rav1dState) -> Rav1dResu
     drop(f);
 
     if c.fc.len() == 1 {
-        let res = rav1d_decode_frame(c, &fc);
+        let by_rows = state.by_rows
+            && c.tc.len() == 1
+            && state.out.p.data.is_some()
+            && (c.all_layers || state.max_spatial_id == 0)
+            && !(c.apply_grain && frame_hdr.film_grain.data.has_grain())
+            && !frame_hdr.allow_intrabc;
+        let res = match by_rows {
+            true => rav1d_decode_frame_begin(c, &fc),
+            false => rav1d_decode_frame(c, &fc),
+        };
         if res.is_err() {
-            let _ = mem::take(&mut state.out);
-            for i in 0..8 {
-                if refresh_frame_flags & (1 << i) != 0 {
-                    if state.refs[i].p.p.frame_hdr.is_some() {
-                        let _ = mem::take(&mut state.refs[i].p);
-                    }
-                    let _ = mem::take(&mut state.cdf[i]);
-                    let _ = mem::take(&mut state.refs[i].segmap);
-                    let _ = mem::take(&mut state.refs[i].refmvs);
-                }
-            }
-            let mut f = fc.data.try_write().unwrap();
-            on_error(
-                fc,
-                &mut f,
-                &mut state.out,
-                &mut state.cached_error_props,
-                &state.in_0.m,
-            );
+            drop_failed_frame(state, fc, refresh_frame_flags);
             return res;
+        }
+        if by_rows {
+            state.rows = Some(FrameRows {
+                sby: 0,
+                refresh_frame_flags,
+            });
         }
     } else {
         rav1d_task_frame_init(c, fc);

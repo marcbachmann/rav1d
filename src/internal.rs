@@ -379,6 +379,19 @@ pub struct Rav1dState {
     pub(crate) event_flags: Rav1dEventFlags,
     pub(crate) cached_error_props: Rav1dDataProps,
     pub(crate) cached_error: Option<Rav1dError>,
+
+    /// Whether a frame decoded on the calling thread alone is decoded by rows, see
+    /// [`dav1d_decode_rows`](crate::dav1d_decode_rows).
+    pub(crate) by_rows: bool,
+    /// The frame being decoded by rows.
+    pub(crate) rows: Option<FrameRows>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FrameRows {
+    /// The next superblock row.
+    pub sby: c_int,
+    pub refresh_frame_flags: c_uint,
 }
 
 #[derive(Default)]

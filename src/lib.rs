@@ -147,7 +147,7 @@ mod thread_task;
 mod warpmv;
 mod wedge;
 
-use std::ffi::{c_char, c_uint, c_void, CStr};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Once};
@@ -160,7 +160,7 @@ use to_method::To as _;
 use crate::c_arc::RawArc;
 use crate::c_box::{CBox, CRef, FnFree};
 use crate::cpu::{rav1d_init_cpu, rav1d_num_logical_processors};
-use crate::decode::rav1d_decode_frame_exit;
+use crate::decode::{rav1d_abandon_rows, rav1d_decode_frame_exit, rav1d_decode_rows};
 pub use crate::error::{Dav1dResult, Rav1dError, Rav1dResult};
 use crate::extensions::OptionError as _;
 use crate::in_range::InRange;
@@ -591,7 +591,7 @@ pub unsafe extern "C" fn dav1d_parse_sequence_header(
 }
 
 impl Rav1dFilmGrainData {
-    fn has_grain(&self) -> bool {
+    pub(crate) fn has_grain(&self) -> bool {
         self.num_y_points != 0
             || self.num_uv_points[0] != 0
             || self.num_uv_points[1] != 0
@@ -628,6 +628,9 @@ fn output_image(c: &Rav1dContext, state: &mut Rav1dState, out: &mut Rav1dPicture
 }
 
 fn output_picture_ready(c: &Rav1dContext, state: &mut Rav1dState, drain: bool) -> bool {
+    if state.rows.is_some() {
+        return false;
+    }
     if state.cached_error.is_some() {
         return true;
     }
@@ -712,7 +715,7 @@ fn drain_picture(c: &Rav1dContext, state: &mut Rav1dState, out: &mut Rav1dPictur
 }
 
 fn gen_picture(c: &Rav1dContext, state: &mut Rav1dState) -> Rav1dResult {
-    if output_picture_ready(c, state, false) {
+    if state.rows.is_some() || output_picture_ready(c, state, false) {
         return Ok(());
     }
     // Take so we don't have 2 `&mut`s.
@@ -727,7 +730,7 @@ fn gen_picture(c: &Rav1dContext, state: &mut Rav1dState) -> Rav1dResult {
             r#in.slice_in_place(len..);
         }
         // Note that [`output_picture_ready`] doesn't read [`Rav1dContext::in_0`].
-        if output_picture_ready(c, state, false) {
+        if state.rows.is_some() || output_picture_ready(c, state, false) {
             // Restore into `c` when there's still data left.
             if !r#in.is_empty() {
                 state.in_0 = Rav1dData {
@@ -826,6 +829,57 @@ pub unsafe extern "C" fn dav1d_get_picture(
     .into()
 }
 
+/// Decodes frames that are decoded on the calling thread alone (one frame at a time, no worker
+/// taken) a superblock row at a time: [`dav1d_send_data`] or [`dav1d_get_picture`], whichever
+/// parses such a frame, only sets it up, each [`dav1d_decode_rows`] decodes one more row of
+/// superblocks, and [`dav1d_get_picture`] gives the picture once all are, `EAGAIN` before. A frame
+/// with film grain to apply, one copying blocks from rows above (intra block copy), or one not
+/// output, is decoded whole.
+///
+/// # Safety
+///
+/// * `c` must be from [`dav1d_open`] and not be passed to [`dav1d_close`] yet.
+pub unsafe fn dav1d_set_decode_by_rows(c: Dav1dContext, by_rows: bool) {
+    // SAFETY: `c` is from `dav1d_open` and thus from `RawArc::from_arc`.
+    let c = unsafe { c.as_ref() };
+    c.state.try_lock().unwrap().by_rows = by_rows;
+}
+
+/// Decodes the next superblock row of the frame [`dav1d_send_data`] set up to be decoded by rows,
+/// and writes how many rows from the top of its picture no later row changes or reads, its height
+/// once the frame is done. `EAGAIN` where no frame is being decoded by rows; on an error the frame is
+/// gone, as where [`dav1d_send_data`] fails to decode it.
+///
+/// # Safety
+///
+/// * `c` must be from [`dav1d_open`] and not be passed to [`dav1d_close`] yet.
+pub unsafe fn dav1d_decode_rows(c: Dav1dContext, rows: &mut c_int) -> Dav1dResult {
+    // SAFETY: `c` is from `dav1d_open` and thus from `RawArc::from_arc`.
+    let c = unsafe { c.as_ref() };
+    let state = &mut *c.state.try_lock().unwrap();
+    rav1d_decode_rows(c, state).map(|n| *rows = n).into()
+}
+
+/// A reference to the picture of the frame being decoded by rows, to read its final rows from
+/// while it is; released with [`dav1d_picture_unref`]. `EAGAIN` where no frame is.
+///
+/// # Safety
+///
+/// * `c` must be from [`dav1d_open`] and not be passed to [`dav1d_close`] yet.
+/// * `out` must be valid to [`ptr::write`] to.
+pub unsafe fn dav1d_rows_picture(c: Dav1dContext, out: NonNull<Dav1dPicture>) -> Dav1dResult {
+    // SAFETY: `c` is from `dav1d_open` and thus from `RawArc::from_arc`.
+    let c = unsafe { c.as_ref() };
+    let state = &mut *c.state.try_lock().unwrap();
+    if state.rows.is_none() {
+        return Err::<(), _>(Rav1dError::TryAgain).into();
+    }
+    let picture: Dav1dPicture = state.out.p.clone().into();
+    // SAFETY: `out` is safe to write to.
+    unsafe { out.as_ptr().write(picture) };
+    Ok(()).into()
+}
+
 pub(crate) fn rav1d_apply_grain(
     c: &Rav1dContext,
     out: &mut Rav1dPicture,
@@ -896,7 +950,9 @@ pub unsafe extern "C" fn dav1d_apply_grain(
 pub(crate) fn rav1d_flush(c: &Rav1dContext) {
     let state = &mut *c.state.try_lock().unwrap();
 
+    rav1d_abandon_rows(c, state);
     let old_state = mem::take(state);
+    state.by_rows = old_state.by_rows;
     state.tiles = old_state.tiles;
     state.n_tiles = old_state.n_tiles;
     state.frame_thread = old_state.frame_thread;
