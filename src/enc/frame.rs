@@ -395,6 +395,13 @@ pub struct Encoder<D: Decide> {
     chosen: Vec<Vec<TxDone>>,
     /// The bits of the levels `rd_residual` chose.
     residual_bits: Option<u32>,
+    /// Their distortion.
+    residual_dist: u64,
+    /// A cost the luma being predicted must stay under, its decided transform blocks' distortion
+    /// and bits so far, and whether it stopped there.
+    limit: Option<f64>,
+    spent: (u64, u32),
+    stopped: bool,
     edge: DisjointMut<AlignedVec64<u8>>,
     edge_stride: usize,
     above: Ctx,
@@ -548,6 +555,10 @@ impl<D: Decide> Encoder<D> {
             replay: None,
             chosen: Vec::new(),
             residual_bits: None,
+            residual_dist: 0,
+            limit: None,
+            spent: (0, 0),
+            stopped: false,
             edge: DisjointMut::new(edge),
             edge_stride: stride,
             above: Ctx::new(bw as usize),
@@ -1381,6 +1392,7 @@ impl<D: Decide> Encoder<D> {
                 levels.fill(0);
                 self.recon_ready = false;
                 self.residual_bits = None;
+                self.residual_dist = 0;
                 let decided = if self.predict_only {
                     Some(fixed_txtp)
                 } else if let Some(replay) = self.replay.as_mut() {
@@ -1450,6 +1462,14 @@ impl<D: Decide> Encoder<D> {
                 a[px as usize..][..cw].fill(v);
                 l[(py & 15) as usize..][..ch].fill(v);
                 out.push(TxDone { plane, x4: px, y4: py, tx, coefs: Coefs { txtp, levels }, eob, bits: self.residual_bits });
+                if let Some(limit) = self.limit {
+                    self.spent.0 += self.residual_dist;
+                    self.spent.1 += self.residual_bits.unwrap_or(0);
+                    if self.spent.0 as f64 + self.lambda * self.spent.1 as f64 / 512.0 >= limit {
+                        self.stopped = true;
+                        return;
+                    }
+                }
                 x += tw;
             }
             y += th;
@@ -1571,7 +1591,9 @@ impl<D: Decide> Encoder<D> {
         };
         let zero_rate = rate(self, cands[0], &[], -1);
         self.residual_bits = Some(zero_rate);
-        let zero = if lossless { f64::MAX } else { sse(&src[..], &pred[..], pw) as f64 + self.lambda * zero_rate as f64 / 512.0 };
+        let zero_dist = if lossless { 0 } else { sse(&src[..], &pred[..], pw) };
+        self.residual_dist = zero_dist;
+        let zero = if lossless { f64::MAX } else { zero_dist as f64 + self.lambda * zero_rate as f64 / 512.0 };
         let mut best = (zero, cands[0]);
         levels.fill(0);
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
@@ -1610,6 +1632,7 @@ impl<D: Decide> Encoder<D> {
                 if dist as f64 + self.lambda * bits as f64 / 512.0 < zero {
                     self.recon_ready = true;
                     self.residual_bits = Some(bits);
+                    self.residual_dist = dist;
                     self.bufs = Some(b);
                     return txtp;
                 }
@@ -1687,6 +1710,7 @@ impl<D: Decide> Encoder<D> {
                 best = (cost, txtp);
                 levels.copy_from_slice(&trial[..n]);
                 self.residual_bits = Some(bits);
+                self.residual_dist = dist;
             }
         }
         self.recon_ready = best.0 < zero && last == Some(best.1);
@@ -1936,9 +1960,14 @@ impl<D: Decide> Encoder<D> {
             c.bits
         };
 
-        let luma = |e: &mut Self, intra: &Intra, depth: u8| -> (f64, Vec<TxDone>) {
+        let luma = |e: &mut Self, intra: &Intra, depth: u8, limit: Option<f64>| -> (f64, Vec<TxDone>) {
             e.restore(&start);
+            (e.limit, e.spent) = (limit, (0, 0));
             let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 0..1);
+            e.limit = None;
+            if std::mem::take(&mut e.stopped) {
+                return (f64::INFINITY, txs);
+            }
             let bits = mode_bits(e, intra, depth) + coef_bits(e, &txs, bs, intra);
             let dist = e.sse(x, y, w4, h4, 0..1);
             (e.rd_cost(dist, bits), txs)
@@ -1948,7 +1977,7 @@ impl<D: Decide> Encoder<D> {
         let sad_lambda = self.lambda.sqrt();
         let score = |e: &mut Self, intra: &Intra| -> f64 {
             if keep == 0 {
-                return luma(e, intra, 0).0;
+                return luma(e, intra, 0, None).0;
             }
             e.restore(&start);
             e.predict_only = true;
@@ -2008,7 +2037,7 @@ impl<D: Decide> Encoder<D> {
         if keep > 0 {
             scored.truncate(keep);
             for s in scored.iter_mut() {
-                s.0 = luma(self, &s.1, 0).0;
+                s.0 = luma(self, &s.1, 0, None).0;
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
@@ -2018,7 +2047,7 @@ impl<D: Decide> Encoder<D> {
         let mut luma_txs = Vec::new();
         for &(_, c) in scored.iter().take(2) {
             for depth in 0..=limits.max_depth {
-                let (cost, txs) = luma(self, &c, depth);
+                let (cost, txs) = luma(self, &c, depth, Some(best_luma.0));
                 if cost < best_luma.0 {
                     best_luma = (cost, c, depth);
                     luma_txs = txs;
