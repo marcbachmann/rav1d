@@ -448,6 +448,8 @@ pub struct Encoder<D: Decide> {
     pub prune_intra: bool,
     /// See `Options::rank_rd`.
     pub rank_rd: bool,
+    /// See `Options::tx_depths`.
+    pub tx_depths: u8,
     /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
     pub levels: Range<u8>,
     /// A block whose unsplit cost, distortion and rate, is under `prune` bits' worth per 4×4 unit
@@ -593,6 +595,7 @@ impl<D: Decide> Encoder<D> {
             uv_from_luma: false,
             prune_intra: false,
             rank_rd: false,
+            tx_depths: 2,
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
@@ -2078,10 +2081,12 @@ impl<D: Decide> Encoder<D> {
         }
         self.dct_only = self.late_txtp;
         self.stage = 1;
+        let inside = (x as u32 + w4 as u32) * 4 <= self.seq.width && (y as u32 + h4 as u32) * 4 <= self.seq.height;
+        let depths = if inside { self.tx_depths } else { 2 };
         let mut best_luma = (f64::MAX, scored[0].1, 0u8);
         let mut luma_txs = Vec::new();
         for &(_, c) in scored.iter().take(2) {
-            for depth in 0..=limits.max_depth {
+            for depth in 0..=cmp::min(limits.max_depth, depths) {
                 let (cost, txs) = luma(self, &c, depth, Some(best_luma.0));
                 if cost < best_luma.0 {
                     best_luma = (cost, c, depth);
@@ -3516,6 +3521,7 @@ pub(crate) mod tests {
             uv_from_luma: std::env::var("ENC_UV_FROM_LUMA").is_ok_and(|v| v == "1"),
             prune_intra: std::env::var("ENC_PRUNE_INTRA").is_ok_and(|v| v == "1"),
             rank_rd: std::env::var("ENC_RANK_RD").is_ok_and(|v| v == "1"),
+            tx_depths: std::env::var("ENC_TX_DEPTHS").map_or(2, |v| v.parse().unwrap()),
             levels: std::env::var("ENC_LEVELS").map_or(0..5, |v| {
                 let (a, b) = v.split_once("..").unwrap();
                 a.parse().unwrap()..b.parse().unwrap()
