@@ -377,8 +377,10 @@ pub struct Encoder<D: Decide> {
     predict_only: bool,
     /// Luma modes kept from the SATD ranking for rate and distortion, all when 0.
     pub keep_modes: usize,
-    /// Whether the search tries H and V partitions.
-    pub rect: bool,
+    /// Whether the search tries H and V partitions: 0 never, 1 always, 2 where Split beat None.
+    pub rect: u8,
+    /// Transform depths are compared with `DCT_DCT` only; the chosen one searches every type.
+    pub late_txtp: bool,
     /// A block whose unsplit distortion is under `prune` bits' worth per 4×4 unit is not split.
     pub prune: f64,
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
@@ -442,7 +444,8 @@ impl<D: Decide> Encoder<D> {
             dct_only: false,
             predict_only: false,
             keep_modes: 0,
-            rect: true,
+            rect: 1,
+            late_txtp: false,
             prune: 0.0,
             pal_map: [Vec::new(), Vec::new()],
             bufs: Some(Box::new(Bufs {
@@ -1388,13 +1391,16 @@ impl<D: Decide> Encoder<D> {
         let ctx = self.partition_ctx(bl, x, y);
         use BlockPartition::*;
         let cands: &[BlockPartition] = match (halves, self.rect) {
-            (Halves::Both, true) => &[None, Split, H, V],
-            (Halves::Both, false) => &[None, Split],
+            (Halves::Both, 0) => &[None, Split],
+            (Halves::Both, _) => &[None, Split, H, V],
             (Halves::Top, _) => &[Split, H],
             (Halves::Left, _) => &[Split, V],
         };
         let mut best: Option<(f64, u32, Snap, Vec<Node>)> = Option::None;
         for &bp in cands {
+            if matches!(bp, H | V) && halves == Halves::Both && self.rect == 2 && best.as_ref().is_some_and(|b| b.3.first().is_some_and(|n| matches!(n, Node::Part(None)))) {
+                break;
+            }
             if bp != None && self.prune > 0.0 && best.as_ref().is_some_and(|b| b.0 - self.lambda * b.1 as f64 / 512.0 < self.prune * self.lambda * (n4 * n4) as f64) {
                 break;
             }
@@ -1511,7 +1517,7 @@ impl<D: Decide> Encoder<D> {
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
-        self.dct_only = false;
+        self.dct_only = self.late_txtp;
         let mut best_luma = (f64::MAX, scored[0].1, 0u8);
         for &(_, c) in scored.iter().take(2) {
             for depth in 0..=limits.max_depth {
@@ -1521,6 +1527,7 @@ impl<D: Decide> Encoder<D> {
                 }
             }
         }
+        self.dct_only = false;
         let (_, mut intra, depth) = best_luma;
 
         if limits.chroma {
@@ -2693,7 +2700,8 @@ pub(crate) mod tests {
             qidx,
             keep_modes: std::env::var("ENC_KEEP").map_or(0, |v| v.parse().unwrap()),
             screen: std::env::var("ENC_SCREEN").map_or(true, |v| v != "0"),
-            rect: std::env::var("ENC_RECT").map_or(true, |v| v != "0"),
+            rect: std::env::var("ENC_RECT").map_or(1, |v| v.parse().unwrap()),
+            late_txtp: std::env::var("ENC_LATE").is_ok_and(|v| v == "1"),
             prune: std::env::var("ENC_PRUNE").map_or(0.0, |v| v.parse().unwrap()),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();

@@ -62,8 +62,10 @@ pub struct Options {
     pub keep_modes: usize,
     /// Screen content tools: palettes.
     pub screen: bool,
-    /// H and V partitions are tried.
-    pub rect: bool,
+    /// H and V partitions: 0 never, 1 always, 2 where Split beat None.
+    pub rect: u8,
+    /// Transform types are searched for the chosen depth only.
+    pub late_txtp: bool,
     /// See `Encoder::prune`; 0 tries every partition.
     pub prune: f64,
 }
@@ -76,6 +78,7 @@ pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Co
     let mut e = Encoder::new(seq, frame, Rd);
     e.keep_modes = options.keep_modes;
     e.rect = options.rect;
+    e.late_txtp = options.late_txtp;
     e.prune = options.prune;
     let w = width as usize;
     for y in 0..height as usize {
