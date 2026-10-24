@@ -405,8 +405,8 @@ pub struct Encoder<D: Decide> {
     residual_bits: Option<u32>,
     /// Their distortion.
     residual_dist: u64,
-    /// A cost the luma being predicted must stay under, its decided transform blocks' distortion
-    /// and bits so far, and whether it stopped there.
+    /// A cost the planes being predicted must stay under, their decided transform blocks'
+    /// distortion and bits so far, and whether they stopped there.
     limit: Option<f64>,
     spent: (u64, u32),
     stopped: bool,
@@ -1191,6 +1191,9 @@ impl<D: Decide> Encoder<D> {
             for p in 1..3 {
                 let predict = !(intra.uv_mode == CFL_PRED && intra.cfl[p - 1] != 0) && intra.pal_sz[1] == 0;
                 self.predict_plane(ti, bs, p, x, y, w4, h4, uvtx, intra, edge_flags, flags, predict, &mut txs);
+                if self.stopped {
+                    break;
+                }
             }
         }
         self.above.restore_coef(ax, &saved_a);
@@ -2148,9 +2151,14 @@ impl<D: Decide> Encoder<D> {
         if limits.chroma {
             let luma_done = self.snap(x, y, w4, h4);
             self.stage = 2;
-            let chroma = |e: &mut Self, intra: &Intra| -> (f64, Vec<TxDone>) {
+            let chroma = |e: &mut Self, intra: &Intra, limit: f64| -> (f64, Vec<TxDone>) {
                 e.restore(&luma_done);
+                (e.limit, e.spent) = (Some(limit), (0, 0));
                 let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 1..3);
+                e.limit = None;
+                if std::mem::take(&mut e.stopped) {
+                    return (f64::INFINITY, txs);
+                }
                 let mut c = Counter::default();
                 write_chroma_modes(&mut c, &mut e.cost_cdf, intra, &limits);
                 if limits.palette {
@@ -2190,7 +2198,7 @@ impl<D: Decide> Encoder<D> {
                 modes.truncate(keep_chroma);
             }
             for &(_, c) in &modes {
-                let (cost, txs) = chroma(self, &c);
+                let (cost, txs) = chroma(self, &c, best.0);
                 if cost < best.0 {
                     best = (cost, c);
                     chroma_txs = txs;
@@ -2200,7 +2208,7 @@ impl<D: Decide> Encoder<D> {
                 let d = best.1;
                 for a in [-3, -2, -1, 1, 2, 3] {
                     let c = Intra { uv_angle: a, ..d };
-                    let (cost, txs) = chroma(self, &c);
+                    let (cost, txs) = chroma(self, &c, best.0);
                     if cost < best.0 {
                         best = (cost, c);
                         chroma_txs = txs;
@@ -2214,7 +2222,7 @@ impl<D: Decide> Encoder<D> {
                     c.pal_sz[1] = pu.len() as u8;
                     c.pal[1][..pu.len()].copy_from_slice(&pu);
                     c.pal[2][..pv.len()].copy_from_slice(&pv);
-                    let (cost, txs) = chroma(self, &c);
+                    let (cost, txs) = chroma(self, &c, best.0);
                     if cost < best.0 {
                         best = (cost, c);
                         chroma_txs = txs;
@@ -2225,7 +2233,7 @@ impl<D: Decide> Encoder<D> {
                 let alphas = self.cfl_alphas(ti, bs, x, y, &intra, depth, &luma_done);
                 if alphas != [0, 0] {
                     let c = Intra { uv_mode: CFL_PRED, uv_angle: 0, cfl: alphas, ..intra };
-                    let (cost, txs) = chroma(self, &c);
+                    let (cost, txs) = chroma(self, &c, best.0);
                     if cost < best.0 {
                         best = (cost, c);
                         chroma_txs = txs;
