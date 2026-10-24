@@ -46,6 +46,11 @@ costs from tables filled per superblock as `av1_fill_coeff_costs` (same bytes, �
 yet three replacements lost: a 32-bit division +6.5%, reciprocal tables rebuilt per superblock
 +4.5%, reciprocal tables cached per qindex +7.5% (16 KB per transform size crowd L1). At qindex
 32 a final code takes about 190 residual searches per 8×8: ranking 60, depths 46, chroma 68.
+Then: split pruning on the unsplit block's whole cost (distortion alone kept dense palette
+blocks whole and a chart grew 2226 → 3752 B), prune 1 at effort 4-5 (−8% at qindex 140, same
+dB); the residual search's reconstruction copied instead of computed again (same bytes, −3.4%
+and −6.3%). Now 4954 ms and 15740 ms, AVIF gates 190/195. A 16-wide AVX2 SATD gained 0.6%:
+most SATD calls are 4 and 8 wide and stay scalar.
 
 **2026-10-24, the gate misses on synthetic patterns.** The strip pattern of the AVIF gates
 (sawtooth R, diagonal G, XOR B) loses 1.9 dB at libaom's bytes at effort 4 and gains 0.1 at
