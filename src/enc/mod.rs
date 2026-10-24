@@ -86,6 +86,10 @@ pub struct Options {
     pub prune_intra: bool,
     /// Luma modes are ranked by their DCT's quantization error and rate instead of SATD.
     pub rank_rd: bool,
+    /// With `rank_rd`, only this many of the SATD ranking get the DCT estimate; all when 0. Six
+    /// to effort 5 above qindex 64 (on 384 px crops at qindex 140: -16.8% time for -0.065 dB at
+    /// equal bytes; at qindex 32 it cost -0.18 dB). Blocks over the picture edge rank all.
+    pub rank_pre: usize,
     /// Transform depths the search tries below the largest transform of a block wholly inside
     /// the picture, at most 2; libaom's `intra_tx_size_search_init_depth` 1 tries one. Blocks
     /// over the edge try 2, which a 1×9000 line needs.
@@ -133,7 +137,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
     }
 }
 
@@ -226,6 +230,7 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
     e.uv_from_luma = options.uv_from_luma;
     e.prune_intra = options.prune_intra;
     e.rank_rd = options.rank_rd;
+    e.rank_pre = options.rank_pre;
     e.tx_depths = options.tx_depths;
     e.levels = options.levels.clone();
     e.variance_boost = boost;

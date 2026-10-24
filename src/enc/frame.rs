@@ -450,6 +450,8 @@ pub struct Encoder<D: Decide> {
     pub rank_rd: bool,
     /// See `Options::tx_depths`.
     pub tx_depths: u8,
+    /// See `Options::rank_pre`.
+    pub rank_pre: usize,
     /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
     pub levels: Range<u8>,
     /// A block whose unsplit cost, distortion and rate, is under `prune` bits' worth per 4×4 unit
@@ -596,6 +598,7 @@ impl<D: Decide> Encoder<D> {
             prune_intra: false,
             rank_rd: false,
             tx_depths: 2,
+            rank_pre: 0,
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
@@ -2013,7 +2016,10 @@ impl<D: Decide> Encoder<D> {
 
         let keep = self.keep_modes;
         let sad_lambda = self.lambda.sqrt();
-        let score = |e: &mut Self, intra: &Intra| -> f64 {
+        let inside = (x as u32 + w4 as u32) * 4 <= self.seq.width && (y as u32 + h4 as u32) * 4 <= self.seq.height;
+        let rank_rd = self.rank_rd && !self.frame.quant.lossless();
+        let pre = if rank_rd && inside { self.rank_pre } else { 0 };
+        let score = |e: &mut Self, intra: &Intra, estimate: bool| -> f64 {
             if keep == 0 {
                 return luma(e, intra, 0, None).0;
             }
@@ -2022,7 +2028,7 @@ impl<D: Decide> Encoder<D> {
             e.predict_block(ti, bs, x, y, edge_flags, intra, 0, 0..1);
             e.predict_only = false;
             let bits = mode_bits(e, intra, 0);
-            if e.rank_rd && !e.frame.quant.lossless() {
+            if estimate {
                 return e.luma_estimate(bs, x, y, intra) + e.lambda * bits as f64 / 512.0;
             }
             e.satd(x, y, w4, h4) as f64 + sad_lambda * bits as f64 / 512.0
@@ -2035,7 +2041,7 @@ impl<D: Decide> Encoder<D> {
             .filter(|&m| !(prune_intra && matches!(m, SMOOTH_V_PRED | SMOOTH_H_PRED)))
             .map(|m| {
                 let c = Intra { y_mode: m, ..Default::default() };
-                (score(self, &c), c)
+                (score(self, &c, rank_rd && pre == 0), c)
             })
             .collect();
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -2049,7 +2055,7 @@ impl<D: Decide> Encoder<D> {
             for d in dirs {
                 for a in [-3, -2, -1, 1, 2, 3] {
                     let c = Intra { y_angle: a, ..d };
-                    scored.push((score(self, &c), c));
+                    scored.push((score(self, &c, rank_rd && pre == 0), c));
                 }
             }
         }
@@ -2060,7 +2066,7 @@ impl<D: Decide> Encoder<D> {
                     continue;
                 }
                 let c = Intra { y_mode: FILTER_PRED, y_angle: f, ..Default::default() };
-                scored.push((score(self, &c), c));
+                scored.push((score(self, &c, rank_rd && pre == 0), c));
             }
         }
         if limits.palette {
@@ -2068,10 +2074,17 @@ impl<D: Decide> Encoder<D> {
                 let mut c = Intra { y_mode: DC_PRED, ..Default::default() };
                 c.pal_sz[0] = pal.len() as u8;
                 c.pal[0][..pal.len()].copy_from_slice(&pal);
-                scored.push((score(self, &c), c));
+                scored.push((score(self, &c, rank_rd && pre == 0), c));
             }
         }
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if pre > 0 {
+            scored.truncate(pre);
+            for s in scored.iter_mut() {
+                s.0 = score(self, &s.1, true);
+            }
+            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
         if keep > 0 {
             scored.truncate(keep);
             for s in scored.iter_mut() {
@@ -2081,7 +2094,6 @@ impl<D: Decide> Encoder<D> {
         }
         self.dct_only = self.late_txtp;
         self.stage = 1;
-        let inside = (x as u32 + w4 as u32) * 4 <= self.seq.width && (y as u32 + h4 as u32) * 4 <= self.seq.height;
         let depths = if inside { self.tx_depths } else { 2 };
         let mut best_luma = (f64::MAX, scored[0].1, 0u8);
         let mut luma_txs = Vec::new();
@@ -3522,6 +3534,7 @@ pub(crate) mod tests {
             prune_intra: std::env::var("ENC_PRUNE_INTRA").is_ok_and(|v| v == "1"),
             rank_rd: std::env::var("ENC_RANK_RD").is_ok_and(|v| v == "1"),
             tx_depths: std::env::var("ENC_TX_DEPTHS").map_or(2, |v| v.parse().unwrap()),
+            rank_pre: std::env::var("ENC_RANK_PRE").map_or(0, |v| v.parse().unwrap()),
             levels: std::env::var("ENC_LEVELS").map_or(0..5, |v| {
                 let (a, b) = v.split_once("..").unwrap();
                 a.parse().unwrap()..b.parse().unwrap()
