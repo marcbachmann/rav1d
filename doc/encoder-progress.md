@@ -36,6 +36,12 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-24, rate counted once.** Coefficients are written through a cached scan table with the
+lo context inline (ee598570), and the chosen transform blocks' bits come from the residual
+search instead of a second count in `coef_bits` (same bytes; an assert held them equal over the
+unit tests and the corpus at qindex 140, 32 and 200 with RDOQ). Pinned on 13 crops: qindex 140
+3940 ms, qindex 32 9907 ms (from 5978 and 21231 at the start of the speed work).
+
 **2026-10-24, search speed.** Pinned on 13 crops of 384 px: qindex 140 5978 → 5577 ms and
 qindex 32 21231 → 17521 ms with the same or near bytes and dB: symbol costs from a table built at
 compile time (same bytes), libaom's reduced intra transform-type set where the search is not
