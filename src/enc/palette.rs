@@ -197,23 +197,32 @@ fn kmeans1(hist: &[u32; 256], colors: &[u8], k: usize) -> Vec<u8> {
     out
 }
 
-/// Chroma palettes (U colours sorted, V alongside) worth trying for these pixel pairs.
+/// Chroma palettes (U colours sorted, V alongside) worth trying for these pixel pairs. A block
+/// with more than 64 pairs has none, which is known after the 65th distinct pair.
 pub fn candidates_uv(u: &[u8], v: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut pairs: Vec<(u8, u8)> = u.iter().copied().zip(v.iter().copied()).collect();
-    pairs.sort_unstable();
-    let mut counts: Vec<((u8, u8), u32)> = Vec::new();
-    for p in pairs {
-        match counts.last_mut() {
-            Some((q, n)) if *q == p => *n += 1,
-            _ => counts.push((p, 1)),
+    let mut seen = [0u64; 1024];
+    let mut keys = Vec::with_capacity(65);
+    for (&a, &b) in u.iter().zip(v) {
+        let k = (a as usize) << 8 | b as usize;
+        if seen[k >> 6] & 1 << (k & 63) == 0 {
+            seen[k >> 6] |= 1 << (k & 63);
+            keys.push(k as u16);
+            if keys.len() > 64 {
+                return vec![];
+            }
         }
+    }
+    keys.sort_unstable();
+    let mut counts: Vec<((u8, u8), u32)> = keys.iter().map(|&k| (((k >> 8) as u8, k as u8), 0)).collect();
+    for (&a, &b) in u.iter().zip(v) {
+        let k = (a as u16) << 8 | b as u16;
+        counts[keys.binary_search(&k).unwrap()].1 += 1;
     }
     let split = |c: &[(u8, u8)]| (c.iter().map(|p| p.0).collect(), c.iter().map(|p| p.1).collect());
     match counts.len() {
         0 | 1 => vec![],
         2..=8 => vec![split(&counts.iter().map(|c| c.0).collect::<Vec<_>>())],
-        9..=64 => [8, 4].iter().map(|&k| split(&kmeans2(&counts, k))).collect(),
-        _ => vec![],
+        _ => [8, 4].iter().map(|&k| split(&kmeans2(&counts, k))).collect(),
     }
 }
 
