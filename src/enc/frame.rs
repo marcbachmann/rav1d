@@ -912,9 +912,19 @@ impl<D: Decide> Encoder<D> {
         };
         let tile = &mut self.tiles[ti];
         Self::write_partition(&mut tile.w, &mut tile.cdf, bl, ctx, halves, bp);
-        self.code_partition(ti, bl, bp, x, y, edge_index, halves, &mut |e, ti, bs, x, y, f| {
-            e.code_b(ti, bs, x, y, f);
-        });
+        self.code_partition(
+            ti,
+            bl,
+            bp,
+            x,
+            y,
+            edge_index,
+            halves,
+            &mut |e, ti, bs, x, y, f| {
+                e.code_b(ti, bs, x, y, f);
+            },
+            &mut |e, ti, bl, x, y, edge_index| e.code_sb(ti, bl, x, y, edge_index),
+        );
     }
 
     /// Runs `block` on every block of `bp`, recursing through splits (searching them when dry),
@@ -930,6 +940,7 @@ impl<D: Decide> Encoder<D> {
         edge_index: EdgeIndex,
         halves: Halves,
         block: &mut dyn FnMut(&mut Self, usize, BlockSize, i32, i32, EdgeFlags),
+        split: &mut dyn FnMut(&mut Self, usize, BlockLevel, i32, i32, EdgeIndex),
     ) {
         let hsz = 16 >> bl as u8;
         let (have_h_split, have_v_split) = (halves != Halves::Left, halves != Halves::Top);
@@ -961,14 +972,8 @@ impl<D: Decide> Encoder<D> {
             }
             Split => {
                 let next = bl.decrease().unwrap();
-                let split = edges.branch(false, edge_index).split;
-                let sub = |e: &mut Self, x: i32, y: i32, i: usize| {
-                    if e.dry {
-                        e.pick_partition(ti, next, x, y, split[i]);
-                    } else {
-                        e.code_sb(ti, next, x, y, split[i]);
-                    }
-                };
+                let edge = edges.branch(false, edge_index).split;
+                let mut sub = |e: &mut Self, x: i32, y: i32, i: usize| split(e, ti, next, x, y, edge[i]);
                 sub(self, x, y, 0);
                 if have_h_split {
                     sub(self, x + hsz, y, 1);
@@ -1819,6 +1824,7 @@ impl<D: Decide> Encoder<D> {
         };
         let n4 = 32 >> bl as u8;
         self.block_lambda(x, y, n4, n4);
+        let lambda = self.lambda;
         let start = self.snap(x, y, n4, n4);
         let plan_len = self.plan.len();
         let base = self.counter.bits;
@@ -1853,9 +1859,42 @@ impl<D: Decide> Encoder<D> {
             self.counter.bits = base;
             self.plan.push(Node::Part(bp));
             Self::write_partition(&mut self.counter, &mut self.cost_cdf, bl, ctx, halves, bp);
-            self.code_partition(ti, bl, bp, x, y, edge_index, halves, &mut |e, ti, bs, x, y, f| {
-                e.pick_block(ti, bs, x, y, f);
-            });
+            // A candidate's cost only grows block by block, so one that reaches the best so far
+            // stops: its decided blocks' distortion and bits at this block's λ.
+            let limit = best.as_ref().map_or(f64::INFINITY, |b| b.0);
+            let done = std::cell::Cell::new((0u64, false));
+            let over = |e: &Self, x: i32, y: i32, w4: usize, h4: usize| {
+                let dist = done.get().0 + e.sse(x, y, w4, h4, 0..e.planes);
+                let over = dist as f64 + lambda * (e.counter.bits - base) as f64 / 512.0 >= limit;
+                done.set((dist, over));
+            };
+            self.code_partition(
+                ti,
+                bl,
+                bp,
+                x,
+                y,
+                edge_index,
+                halves,
+                &mut |e, ti, bs, x, y, f| {
+                    if !done.get().1 {
+                        e.pick_block(ti, bs, x, y, f);
+                        let d = bs.dimensions();
+                        over(e, x, y, d[0] as usize, d[1] as usize);
+                    }
+                },
+                &mut |e, ti, bl, x, y, edge_index| {
+                    if !done.get().1 {
+                        e.pick_partition(ti, bl, x, y, edge_index);
+                        let n = 32 >> bl as u8;
+                        over(e, x, y, n, n);
+                    }
+                },
+            );
+            if done.get().1 {
+                self.lambda = lambda;
+                continue;
+            }
             let bits = self.counter.bits - base;
             self.block_lambda(x, y, n4, n4);
             let cost = self.rd_cost(self.sse(x, y, n4, n4, 0..self.planes), bits);
