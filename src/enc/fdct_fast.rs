@@ -13,6 +13,8 @@ use crate::levels::{TxfmSize, TxfmType, WHT_WHT};
 
 #[macro_use]
 mod kernels;
+#[cfg(all(test, unix))]
+mod bounds;
 #[cfg(target_arch = "aarch64")]
 mod arm;
 mod scalar;
