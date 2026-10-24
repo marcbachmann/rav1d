@@ -484,6 +484,9 @@ pub struct Encoder<D: Decide> {
     /// Residual searches and the coefficients they transformed, per stage: luma ranking, luma
     /// depths, chroma, CfL, the block's final dry code, coding.
     pub stats: [[u64; 2]; 6],
+    /// Nanoseconds per stage of `stats` when `timing`.
+    pub stage_ns: [u64; 10],
+    pub timing: bool,
     /// The search's rate estimate of the coded superblocks, in 1/512 bits.
     pub estimated: u64,
     /// The search's squared error of the coded superblocks, before the in-loop filters.
@@ -622,6 +625,8 @@ impl<D: Decide> Encoder<D> {
             lv: Some(Box::new([0; 32 * 32])),
             stage: 5,
             stats: [[0; 2]; 6],
+            stage_ns: [0; 10],
+            timing: false,
             estimated: 0,
             estimated_sse: 0,
             counter: Counter::default(),
@@ -1861,6 +1866,14 @@ impl<D: Decide> Encoder<D> {
         self.left.restore((s.y & 15) as usize, &s.left);
     }
 
+    fn lap(&mut self, clock: &mut Option<std::time::Instant>, stage: usize) {
+        if let Some(t) = clock {
+            let now = std::time::Instant::now();
+            self.stage_ns[stage] += (now - *t).as_nanos() as u64;
+            *t = now;
+        }
+    }
+
     fn rd_cost(&self, dist: u64, bits: u32) -> f64 {
         dist as f64 + self.lambda * bits as f64 / 512.0
     }
@@ -2023,18 +2036,25 @@ impl<D: Decide> Encoder<D> {
             if keep == 0 {
                 return luma(e, intra, 0, None).0;
             }
+            let mut clock = e.timing.then(std::time::Instant::now);
             e.restore(&start);
+            e.lap(&mut clock, 6);
             e.predict_only = true;
             e.predict_block(ti, bs, x, y, edge_flags, intra, 0, 0..1);
             e.predict_only = false;
+            e.lap(&mut clock, 7);
             let bits = mode_bits(e, intra, 0);
+            e.lap(&mut clock, 8);
             if estimate {
-                return e.luma_estimate(bs, x, y, intra) + e.lambda * bits as f64 / 512.0;
+                let v = e.luma_estimate(bs, x, y, intra) + e.lambda * bits as f64 / 512.0;
+                e.lap(&mut clock, 9);
+                return v;
             }
             e.satd(x, y, w4, h4) as f64 + sad_lambda * bits as f64 / 512.0
         };
 
         self.stage = 0;
+        let mut clock = self.timing.then(std::time::Instant::now);
         self.dct_only = true;
         let prune_intra = self.prune_intra;
         let mut scored: Vec<(f64, Intra)> = (0..N_INTRA_PRED_MODES as u8)
@@ -2085,6 +2105,7 @@ impl<D: Decide> Encoder<D> {
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
+        self.lap(&mut clock, 0);
         if keep > 0 {
             scored.truncate(keep);
             for s in scored.iter_mut() {
@@ -2092,6 +2113,7 @@ impl<D: Decide> Encoder<D> {
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
+        self.lap(&mut clock, 3);
         self.dct_only = self.late_txtp;
         self.stage = 1;
         let depths = if inside { self.tx_depths } else { 2 };
@@ -2121,6 +2143,7 @@ impl<D: Decide> Encoder<D> {
             self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
             self.replay = None;
         }
+        self.lap(&mut clock, 1);
 
         if limits.chroma {
             let luma_done = self.snap(x, y, w4, h4);
@@ -2212,12 +2235,14 @@ impl<D: Decide> Encoder<D> {
             intra = best.1;
         }
 
+        self.lap(&mut clock, 2);
         self.restore(&start);
         self.trial = Some((intra, depth));
         self.stage = 4;
         luma_txs.extend(chroma_txs);
         self.replay = Some(luma_txs.into_iter().rev().collect());
         let txs = self.code_b(ti, bs, x, y, edge_flags);
+        self.lap(&mut clock, 4);
         self.stage = 5;
         self.chosen.push(txs);
         self.plan.push(Node::Block(intra, depth, self.chosen.len() - 1));
@@ -3567,8 +3592,14 @@ pub(crate) mod tests {
             }
             let rows: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
             let t = std::time::Instant::now();
-            let mut e = crate::enc::still_with(w as u32, h as u32, &rows, &options);
+            let mut e = if std::env::var("ENC_STATS").is_ok() {
+                crate::enc::still_timed(w as u32, h as u32, &rows, &options)
+            } else {
+                crate::enc::still_with(w as u32, h as u32, &rows, &options)
+            };
+            let searched = t.elapsed().as_millis();
             let stats = e.stats;
+            let ns = e.stage_ns.map(|n| n / 1_000_000);
             let estimated = e.estimated as f64 / 4096.0;
             let estimated_db = 10.0 * (65025.0 * (w * h * 3) as f64 / e.estimated_sse.max(1) as f64).log10();
             if options.filter_search {
@@ -3582,6 +3613,7 @@ pub(crate) mod tests {
                 let per = stats.map(|[n, c]| format!("{:.2}/{:.1}", n as f64 * 64.0 / px, c as f64 / px));
                 println!("  estimated {estimated:.0} B {estimated_db:.2} dB unfiltered");
                 println!("  searches per 8x8 / coefficients per pixel: rank {} depth {} chroma {} final {} code {}", per[0], per[1], per[2], per[4], per[5]);
+                println!("  ms: rank {} depth {} chroma {} final {}, coded {searched}, with filters {t}; kept modes {}; scoring restore {} predict {} mode bits {} estimate {}", ns[0], ns[1], ns[2], ns[4], ns[3], ns[6], ns[7], ns[8], ns[9]);
             }
             let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));
             println!("{:20} {t:6} ms {:7} B {d:6.2} dB", path.file_stem().unwrap().to_string_lossy(), c.data.len());

@@ -189,6 +189,15 @@ pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Co
 
 /// `still` up to the last row pushed, the encoder kept for its statistics.
 pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Encoder<Rd> {
+    still_rows(width, height, planes, options, false)
+}
+
+/// `still_with`, timing each stage of the search into `Encoder::stage_ns`.
+pub fn still_timed(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Encoder<Rd> {
+    still_rows(width, height, planes, options, true)
+}
+
+fn still_rows(width: u32, height: u32, planes: &[&[u8]], options: &Options, timing: bool) -> Encoder<Rd> {
     let (seq, mut frame) = headers(width, height, planes.len() == 1, options.qidx);
     frame.screen_content = options.screen;
     let lossy = options.qidx != 0;
@@ -219,6 +228,7 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
         });
     }
     let mut e = Encoder::new(seq, frame, Rd);
+    e.timing = timing;
     e.iq = options.iq_rdmult;
     e.skip_prediction = options.skip_prediction;
     e.keep_modes = options.keep_modes;
