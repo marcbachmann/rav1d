@@ -41,6 +41,9 @@ lo context inline (ee598570), and the chosen transform blocks' bits come from th
 search instead of a second count in `coef_bits` (same bytes; an assert held them equal over the
 unit tests and the corpus at qindex 140, 32 and 200 with RDOQ). Pinned on 13 crops: qindex 140
 3940 ms, qindex 32 9907 ms (from 5978 and 21231 at the start of the speed work).
+Two dead ends: a reused level buffer zeroed only where the transform reads (−0.5% and +0.1%,
+the memset was not the cost), and stopping the depth search when a depth costs more than the
+one above it (−3.7% and −3.3%, but −0.022 dB with 0.2% more bytes at 140 and −0.037 dB at 32).
 
 **2026-10-24, search speed.** Pinned on 13 crops of 384 px: qindex 140 5978 → 5577 ms and
 qindex 32 21231 → 17521 ms with the same or near bytes and dB: symbol costs from a table built at
