@@ -35,6 +35,17 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-24, tune IQ complete for the quantizer.** `Options::tune_iq` turns on what libaom's
+tune IQ changes and the encoder has: Variance Boost, the SSIM rate weighting
+(`av1_set_mb_ssim_rdmult_scaling`: λ per block by the geometric mean of its 16×16 activity
+factors over the picture's), quantizer matrices (all-intra luma levels, 4:4:4 chroma levels),
+chroma AC delta q of min(base/2, 24) and the IQ rdmult weight. Against libaom at equal bytes
+(PSNR, 10 pictures, Q30-Q90): photos −0.08 to +0.65 dB (were −1.08 to +0.95 with Variance Boost
+alone; flat-area photos and dense photos needed 10-20% more bytes), graphics +1 to +8 dB except
+a logo at Q80 (−0.63); mean +1.03 dB over 40 codes. The qindex meeting libaom's bytes is now
+uniform over photos: about libaom's below 60, 6% finer at 148, 6% finer at 196. Still to port:
+sharpness 7 with adaptive sharpness, CDEF_ADAPTIVE and the deblock and CDEF searches.
+
 **2026-10-24, comparison with palettes.** At libaom's bytes (PSNR, 4:4:4, decoded with
 filters): photos +0.11 to +1.85 dB, a gradient +3.0 to +6.0, a UI mock +4.2 to +5.5, a hard-edged
 logo +4.2 to +4.4 (was −5 to −11 without palettes); mean +2.41 dB over 14 codes. Several graphics

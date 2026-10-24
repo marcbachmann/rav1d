@@ -8,6 +8,8 @@ pub mod header;
 pub mod palette;
 pub mod rd;
 
+use std::cmp;
+
 use crate::dequant_tables::DAV1D_DQ_TBL;
 use frame::{Coded, Encoder, Rd};
 use header::{Cdef, Colour, Frame, Quant, Sequence, Tiling};
@@ -77,6 +79,14 @@ pub struct Options {
     pub variance_boost: bool,
     /// See `Encoder::rdoq`.
     pub rdoq: usize,
+    /// libaom's tune-IQ rate weighting: λ per 16×16 block by its activity over the picture's.
+    pub ssim: bool,
+    /// libaom's tune-IQ quantizer matrices: luma levels for all-intra, chroma levels for 4:4:4.
+    pub quant_matrices: bool,
+    /// libaom's tune-IQ chroma AC qindex for 4:4:4, half the base qindex higher, at most 24.
+    pub chroma_delta_q: bool,
+    /// libaom's tune-IQ weight on λ, up to 72/128 more at low qindexes.
+    pub iq_rdmult: bool,
 }
 
 impl Options {
@@ -91,7 +101,42 @@ impl Options {
             _ => (2, 2, 0, 0..4, 1.0),
         };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false }
+    }
+}
+
+impl Options {
+    /// Everything libaom's tune IQ changes that the encoder has.
+    pub fn tune_iq(self) -> Self {
+        Self { variance_boost: true, ssim: true, quant_matrices: true, chroma_delta_q: true, iq_rdmult: true, ..self }
+    }
+}
+
+/// libaom's `aom_get_qmlevel_allintra`, tune IQ's range 2 to 10.
+fn luma_qm_level(qidx: u8) -> u8 {
+    match qidx {
+        ..=40 => 10,
+        ..=100 => 9,
+        ..=160 => 8,
+        ..=200 => 7,
+        ..=220 => 6,
+        ..=240 => 5,
+        _ => 4,
+    }
+}
+
+/// libaom's `aom_get_qmlevel_444_chroma`, tune IQ's range 2 to 10.
+fn chroma_qm_level(qidx: u8) -> u8 {
+    match qidx {
+        ..=12 => 10,
+        ..=24 => 9,
+        ..=32 => 8,
+        ..=36 => 7,
+        ..=44 => 6,
+        ..=48 => 5,
+        ..=56 => 4,
+        ..=88 => 3,
+        _ => 2,
     }
 }
 
@@ -105,6 +150,14 @@ pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Co
 pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Encoder<Rd> {
     let (seq, mut frame) = headers(width, height, planes.len() == 1, options.qidx);
     frame.screen_content = options.screen;
+    let lossy = options.qidx != 0;
+    if lossy && options.chroma_delta_q && planes.len() == 3 {
+        frame.quant.u_ac = cmp::min(options.qidx / 2, 24) as i8;
+    }
+    if lossy && options.quant_matrices {
+        let u = (options.qidx as i32 + frame.quant.u_ac as i32).clamp(0, 255) as u8;
+        frame.quant.qm = Some([luma_qm_level(options.qidx), chroma_qm_level(u), chroma_qm_level(u)]);
+    }
     let boost = options.variance_boost && options.qidx != 0;
     if boost {
         frame.delta_q_log2 = Some(match options.qidx {
@@ -115,6 +168,7 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
         });
     }
     let mut e = Encoder::new(seq, frame, Rd);
+    e.iq = options.iq_rdmult;
     e.keep_modes = options.keep_modes;
     e.keep_chroma = options.keep_chroma;
     e.rect = options.rect;
@@ -123,6 +177,9 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
     e.variance_boost = boost;
     e.rdoq = options.rdoq;
     e.prune = options.prune;
+    if options.ssim && options.qidx != 0 {
+        e.ssim_reference = Some(frame::ssim_reference(width as usize, height as usize, planes[0]));
+    }
     let w = width as usize;
     for y in 0..height as usize {
         let rows: Vec<&[u8]> = planes.iter().map(|p| &p[y * w..][..w]).collect();

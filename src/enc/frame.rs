@@ -392,6 +392,12 @@ pub struct Encoder<D: Decide> {
     /// Levels the residual search tries one step nearer zero, from the last coefficient back,
     /// keeping each that lowers the cost.
     pub rdoq: usize,
+    /// The geometric mean of `ssim_factor` over the frame: λ is scaled per 16×16 block by its
+    /// factor over this, libaom's tune-IQ rate weighting.
+    pub ssim_reference: Option<f64>,
+    /// The superblock's 16×16 blocks' factors over `ssim_reference`, and its λ before them.
+    ssim: [f64; 16],
+    sb_lambda: f64,
 
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
     /// the block's width at a time.
@@ -410,6 +416,41 @@ pub struct Encoder<D: Decide> {
     next: usize,
     /// The whole reconstruction, kept only when asked for (tests).
     pub recon: Option<Vec<Vec<u8>>>,
+}
+
+/// libaom's tune-IQ activity of a 16×16 luma block of `cols`×`rows` 8×8 blocks
+/// (`av1_set_mb_ssim_rdmult_scaling`): its mean per-pixel 8×8 variance through a fitted curve.
+fn ssim_factor(px: &dyn Fn(usize, usize) -> u32, cols: usize, rows: usize) -> f64 {
+    let mut var = 0.0;
+    for b in 0..cols * rows {
+        let (bx, by) = ((b % cols) * 8, (b / cols) * 8);
+        let (mut sum, mut sse) = (0u32, 0u32);
+        for r in 0..8 {
+            for c in 0..8 {
+                let p = px(bx + c, by + r);
+                sum += p;
+                sse += p * p;
+            }
+        }
+        var += ((sse - ((sum as u64 * sum as u64) >> 6) as u32 + 32) >> 6) as f64;
+    }
+    67.035434 * (1.0 - (-0.0021489 * var / (cols * rows) as f64).exp()) + 17.492222
+}
+
+/// The geometric mean of `ssim_factor` over a picture's luma, the reference its blocks' rate
+/// weights are taken against.
+pub fn ssim_reference(width: usize, height: usize, luma: &[u8]) -> f64 {
+    let (w8, h8) = (width.div_ceil(8), height.div_ceil(8));
+    let (cols, rows) = (w8.div_ceil(2), h8.div_ceil(2));
+    let mut log = 0.0;
+    for r in 0..rows {
+        for c in 0..cols {
+            let (x0, y0) = (c * 16, r * 16);
+            let px = |x: usize, y: usize| luma[cmp::min(y0 + y, height - 1) * width + cmp::min(x0 + x, width - 1)] as u32;
+            log += ssim_factor(&px, cmp::min(2, w8 - 2 * c), cmp::min(2, h8 - 2 * r)).ln();
+        }
+    }
+    (log / (rows * cols) as f64).exp()
 }
 
 impl<D: Decide> Encoder<D> {
@@ -466,6 +507,9 @@ impl<D: Decide> Encoder<D> {
             prune: 0.0,
             variance_boost: false,
             rdoq: 0,
+            ssim_reference: None,
+            ssim: [1.0; 16],
+            sb_lambda: 1.0,
 
             pal_map: [Vec::new(), Vec::new()],
             bufs: Some(Box::new(Bufs {
@@ -522,6 +566,44 @@ impl<D: Decide> Encoder<D> {
         let target = (1..255).find(|&i| q(i) >= target_q).unwrap_or(255);
         let boost = (((base as f64 + 544.0) * (base - target) as f64 / 1279.0).round() as i32).min(80);
         cmp::max(base - boost, 1) as u8
+    }
+
+    fn ssim_scales(&mut self, x: i32, reference: f64) {
+        let src = &self.src[0];
+        let y = self.sby as i32 * 16;
+        for (i, s) in self.ssim.iter_mut().enumerate() {
+            let (bx, by) = (x + (i as i32 % 4) * 4, y + (i as i32 / 4) * 4);
+            if bx >= self.bw || by >= self.bh {
+                continue;
+            }
+            let cols = cmp::min(2, (self.bw - bx) / 2) as usize;
+            let rows = cmp::min(2, (self.bh - by) / 2) as usize;
+            let (x0, y0) = (bx as usize * 4, (by - y) as usize * 4);
+            let mut block = [0u8; 256];
+            for r in 0..rows * 8 {
+                let row = src.comp.slice::<BD, _>(((y0 + r) * src.stride + x0.., ..cols * 8));
+                block[r * 16..][..cols * 8].copy_from_slice(&row);
+            }
+            *s = ssim_factor(&|c, r| block[r * 16 + c] as u32, cols, rows) / reference;
+        }
+    }
+
+    /// λ for a block: the superblock's, scaled by the geometric mean of its 16×16 blocks' factors.
+    fn block_lambda(&mut self, x: i32, y: i32, w4: usize, h4: usize) {
+        if self.ssim_reference.is_none() {
+            return;
+        }
+        let (cols, rows) = ((self.bw + 3) >> 2, (self.bh + 3) >> 2);
+        let (c0, r0) = (x >> 2, y >> 2);
+        let (c1, r1) = (cmp::min(cols, c0 + (w4 as i32 + 3) / 4), cmp::min(rows, r0 + (h4 as i32 + 3) / 4));
+        let (mut log, mut n) = (0.0, 0.0);
+        for r in r0..r1 {
+            for c in c0..c1 {
+                log += self.ssim[((r & 3) * 4 + (c & 3)) as usize].ln();
+                n += 1.0;
+            }
+        }
+        self.lambda = self.sb_lambda * (log / n).exp();
     }
 
     fn set_qidx(&mut self, qidx: u8) {
@@ -648,6 +730,10 @@ impl<D: Decide> Encoder<D> {
                 self.set_qidx(qidx);
                 if let Some(target) = target {
                     self.lambda = lambda(target, self.iq);
+                }
+                self.sb_lambda = self.lambda;
+                if let Some(reference) = self.ssim_reference {
+                    self.ssim_scales(x, reference);
                 }
                 if self.decide.searches() {
                     *self.cost_cdf = self.tiles[ti].cdf.clone();
@@ -886,6 +972,8 @@ impl<D: Decide> Encoder<D> {
 
     /// Codes one block: predicts and reconstructs it, then writes it, or counts it when dry.
     fn code_b(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
+        let b_dim = bs.dimensions();
+        self.block_lambda(x, y, b_dim[0] as usize, b_dim[1] as usize);
         let (limits, max_tx) = self.limits(bs);
         let (intra, depth) = if self.dry {
             self.trial.unwrap()
@@ -1501,6 +1589,7 @@ impl<D: Decide> Encoder<D> {
             return self.pick_partition(ti, bl.decrease().unwrap(), x, y, edges.branch(false, edge_index).split[0]);
         };
         let n4 = 32 >> bl as u8;
+        self.block_lambda(x, y, n4, n4);
         let start = self.snap(x, y, n4, n4);
         let plan_len = self.plan.len();
         let base = self.counter.bits;
@@ -1539,6 +1628,7 @@ impl<D: Decide> Encoder<D> {
                 e.pick_block(ti, bs, x, y, f);
             });
             let bits = self.counter.bits - base;
+            self.block_lambda(x, y, n4, n4);
             let cost = self.rd_cost(self.sse(x, y, n4, n4, 0..self.planes), bits);
             if best.as_ref().is_none_or(|b| cost < b.0) {
                 best = Some((cost, bits, self.snap(x, y, n4, n4), self.plan[plan_len..].to_vec()));
@@ -1556,6 +1646,7 @@ impl<D: Decide> Encoder<D> {
     fn pick_block(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
         let b_dim = bs.dimensions();
         let (w4, h4) = (b_dim[0] as usize, b_dim[1] as usize);
+        self.block_lambda(x, y, w4, h4);
         let start = self.snap(x, y, w4, h4);
         let (limits, max_tx) = self.limits(bs);
         let (ax, ly) = (x as usize, (y & 15) as usize);
@@ -2874,6 +2965,10 @@ pub(crate) mod tests {
             prune: std::env::var("ENC_PRUNE").map_or(0.0, |v| v.parse().unwrap()),
             variance_boost: std::env::var("ENC_BOOST").is_ok_and(|v| v == "1"),
             rdoq: std::env::var("ENC_RDOQ").map_or(0, |v| v.parse().unwrap()),
+            ssim: std::env::var("ENC_SSIM").is_ok_and(|v| v == "1"),
+            quant_matrices: std::env::var("ENC_QM").is_ok_and(|v| v == "1"),
+            chroma_delta_q: std::env::var("ENC_CHROMA_DQ").is_ok_and(|v| v == "1"),
+            iq_rdmult: std::env::var("ENC_IQ_RDMULT").is_ok_and(|v| v == "1"),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
         files.sort();
@@ -2942,5 +3037,53 @@ pub(crate) mod tests {
         };
         eprintln!("variance boost: plain {} B {:.2}/{:.2} dB, boosted {} B {:.2}/{:.2} dB", plain.data.len(), db(&plain, 0), db(&plain, 1), boosted.data.len(), db(&boosted, 0), db(&boosted, 1));
         assert!(db(&boosted, 1) > db(&plain, 1) + 0.5);
+    }
+
+    /// A photo beside a flat half: weighted against the picture's mean activity, the photo's
+    /// blocks get a larger λ and fewer bits, and the stream still decodes to the reconstruction.
+    #[test]
+    fn ssim_weighting() {
+        let (w, h) = (256, 128);
+        let mut img = vec![vec![200u8; w * h]; 3];
+        for (i, p) in img.iter_mut().enumerate() {
+            for y in 0..h {
+                for x in 0..w / 2 {
+                    p[y * w + x] = (100 + (((x * 37 + y * 91) ^ (x * y + i)) & 63)) as u8;
+                }
+            }
+        }
+        assert!((ssim_reference(8, 8, &[7; 64]) - 17.492222).abs() < 1e-9);
+        let (seq, fr) = crate::enc::headers(w as u32, h as u32, false, 120);
+        let plain = round_trip_with(&img, w, h, seq.clone(), fr.clone(), Rd);
+        let mut e = Encoder::new(seq, fr, Rd);
+        e.ssim_reference = Some(ssim_reference(w, h, &img[0]));
+        e.recon = Some(vec![Vec::new(); 3]);
+        for y in 0..h {
+            let rows: Vec<&[u8]> = img.iter().map(|p| &p[y * w..][..w]).collect();
+            e.push(&rows);
+        }
+        let weighted = e.finish();
+        assert!(weighted.recon.as_ref().unwrap() == &decode(weighted.data.clone(), w, h, 3));
+        eprintln!("ssim weighting: plain {} B, weighted {} B", plain.data.len(), weighted.data.len());
+        assert!(weighted.data.len() * 10 < plain.data.len() * 9);
+    }
+
+    /// Quantizer matrices, a coarser chroma AC and the tune-IQ λ decode to a picture
+    /// close to the source, in fewer bytes than without them.
+    #[test]
+    fn tune_iq() {
+        let (w, h) = (200, 136);
+        let img = photo(w, h, 3, 9);
+        let planes: Vec<&[u8]> = img.iter().map(|p| p.as_slice()).collect();
+        let plain = crate::enc::Options::effort(150, 4, false);
+        let code = |o: &crate::enc::Options| {
+            let c = crate::enc::still(w as u32, h as u32, &planes, o);
+            let db = psnr(&img, &decode_with(c.data.clone(), w, h, 3, true));
+            (c.data.len(), db)
+        };
+        let iq = crate::enc::Options { quant_matrices: true, chroma_delta_q: true, iq_rdmult: true, ..plain.clone() };
+        let (a, b) = (code(&plain), code(&iq));
+        eprintln!("tune iq: plain {} B {:.2} dB, tune iq {} B {:.2} dB", a.0, a.1, b.0, b.1);
+        assert!(b.0 < a.0 && b.1 > a.1 - 3.0);
     }
 }
