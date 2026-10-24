@@ -7,7 +7,7 @@ use std::mem::MaybeUninit;
 
 use strum::EnumCount;
 
-use super::fdct::{self, coded_dimensions, dimensions, kinds, Kind};
+use super::fdct::{self, dimensions, kinds, Kind};
 use crate::cpu::{rav1d_get_cpu_flags, CpuFlags};
 use crate::levels::{TxfmSize, TxfmType, WHT_WHT};
 
@@ -144,23 +144,25 @@ pub fn forward_in(
     if ty == WHT_WHT {
         return fdct::forward(residual, stride, coefs, size, ty);
     }
-    let cfg = Config::new(size, ty);
-    let (cw, ch) = coded_dimensions(size);
-    let coefs = &mut coefs[..cw * ch];
+    run(lane, residual, stride, coefs, &Config::new(size, ty))
+}
+
+fn run(lane: Lane, residual: &[i16], stride: usize, coefs: &mut [i32], cfg: &Config) {
+    let coefs = &mut coefs[..cfg.w.min(32) * cfg.h.min(32)];
     assert!(stride >= cfg.w && residual.len() >= (cfg.h - 1) * stride + cfg.w);
     match lane {
-        Lane::Scalar => scalar::forward(residual, stride, coefs, &cfg),
+        Lane::Scalar => scalar::forward(residual, stride, coefs, cfg),
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         Lane::Simd => {
             assert!(is_x86_feature_detected!("avx2"));
             // SAFETY: AVX2 is available.
-            unsafe { x86::forward(residual, stride, coefs, &cfg) }
+            unsafe { x86::forward(residual, stride, coefs, cfg) }
         }
         #[cfg(target_arch = "aarch64")]
         // SAFETY: NEON is part of aarch64.
-        Lane::Simd => unsafe { arm::forward(residual, stride, coefs, &cfg) },
+        Lane::Simd => unsafe { arm::forward(residual, stride, coefs, cfg) },
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-        Lane::Simd => scalar::forward(residual, stride, coefs, &cfg),
+        Lane::Simd => scalar::forward(residual, stride, coefs, cfg),
     }
 }
 
@@ -190,6 +192,7 @@ mod tests {
     use crate::enc::fdct::tests::{
         blocks, cpu_levels, decodable, max_error, sizes, Rng, ROUND_TRIP_BOUND,
     };
+    use crate::enc::fdct::coded_dimensions;
     use crate::include::common::bitdepth::BitDepth8;
     use crate::itx::Rav1dInvTxfmDSPContext;
 
@@ -383,7 +386,7 @@ mod tests {
             };
             let aom = time(&mut |c| fdct::forward(black_box(&block), w, c, size, 0));
             let scalar = time(&mut |c| forward_in(Lane::Scalar, black_box(&block), w, c, size, 0));
-            let simd = time(&mut |c| forward_in(Lane::detect(), black_box(&block), w, c, size, 0));
+            let simd = time(&mut |c| forward_in(*lanes().last().unwrap(), black_box(&block), w, c, size, 0));
             coefs[0] = 0;
             println!("{size:?}: libaom port {aom:8.0} ns, scalar {scalar:8.0} ns, simd {simd:8.0} ns");
         }

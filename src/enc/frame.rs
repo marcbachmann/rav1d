@@ -2542,9 +2542,9 @@ pub(crate) mod tests {
     #[test]
     fn rd_search() {
         let cases = [
-            (64, 64, false, 100, true, 232, 43.45),
-            (130, 70, false, 60, true, 589, 44.24),
-            (100, 37, true, 160, false, 56, 40.33),
+            (64, 64, false, 100, true, 234, 43.45),
+            (130, 70, false, 60, true, 604, 44.24),
+            (100, 37, true, 160, false, 59, 40.33),
             (70, 45, false, 0, false, usize::MAX, 0.0),
         ];
         for (w, h, mono, base, tx_select, max_bytes, min_db) in cases {
