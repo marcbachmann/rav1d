@@ -75,6 +75,8 @@ pub struct Options {
     pub prune: f64,
     /// libaom's Variance Boost: lower qindexes for flat superblocks, as its tune IQ codes them.
     pub variance_boost: bool,
+    /// See `Encoder::rdoq`.
+    pub rdoq: usize,
 }
 
 impl Options {
@@ -88,7 +90,8 @@ impl Options {
             2..=3 => (3, 3, 0, 0..4, 0.0),
             _ => (2, 2, 0, 0..4, 1.0),
         };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false }
+        let rdoq = if effort >= 8 { 8 } else { 0 };
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq }
     }
 }
 
@@ -118,6 +121,7 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
     e.late_txtp = options.late_txtp;
     e.levels = options.levels.clone();
     e.variance_boost = boost;
+    e.rdoq = options.rdoq;
     e.prune = options.prune;
     let w = width as usize;
     for y in 0..height as usize {

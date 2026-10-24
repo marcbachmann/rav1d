@@ -389,6 +389,9 @@ pub struct Encoder<D: Decide> {
     pub prune: f64,
     /// Superblock qindexes from libaom's Variance Boost; needs `Frame::delta_q_log2`.
     pub variance_boost: bool,
+    /// Levels the residual search tries one step nearer zero, from the last coefficient back,
+    /// keeping each that lowers the cost.
+    pub rdoq: usize,
 
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
     /// the block's width at a time.
@@ -462,6 +465,7 @@ impl<D: Decide> Encoder<D> {
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
+            rdoq: 0,
 
             pal_map: [Vec::new(), Vec::new()],
             bufs: Some(Box::new(Bufs {
@@ -1307,12 +1311,60 @@ impl<D: Decide> Encoder<D> {
             if eob < 0 {
                 continue;
             }
-            let bits = rate(self, txtp, &trial[..n], eob);
-            self.dequant(plane, tx, txtp, &trial[..n], &mut cf.0[..n]);
-            self.scratch.write(0, 0, pw, ph, &pred[..pw * ph]);
-            let dst = self.scratch.comp.with_offset::<BD>();
-            self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
-            let dist = sse(&src[..], &self.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB);
+            let mut eob = eob;
+            let mut bits = rate(self, txtp, &trial[..n], eob);
+            let reconstruct = |e: &mut Self, lv: &[i32], eob: i32, cf: &mut Coef| -> u64 {
+                e.dequant(plane, tx, txtp, lv, &mut cf.0[..n]);
+                e.scratch.write(0, 0, pw, ph, &pred[..pw * ph]);
+                let dst = e.scratch.comp.with_offset::<BD>();
+                e.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
+                sse(&src[..], &e.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB)
+            };
+            let mut dist = reconstruct(self, &trial[..n], eob, cf);
+            if self.rdoq > 0 && !self.dct_only && !lossless {
+                let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
+                let dqp = self.dq[plane];
+                let step = |rc: usize| {
+                    let q = dqp[(rc != 0) as usize];
+                    qm.map_or(q, |m| q * m[rc] as u32 + 16 >> 5)
+                };
+                let err = |rc: usize, l: i32| {
+                    let r = ((step(rc).wrapping_mul(l.unsigned_abs()) & 0xffffff) >> shift) as f64;
+                    let d = coefs[rc].abs() as f64 - r;
+                    d * d
+                };
+                let coef_dist: f64 = (0..n).map(|rc| err(rc, trial[rc])).sum();
+                if coef_dist > 0.0 {
+                    let k = dist as f64 / coef_dist;
+                    let class = DAV1D_TX_TYPE_CLASS[txtp as usize];
+                    let mut tried = 0;
+                    let mut i = eob;
+                    let mut changed = false;
+                    while i >= 0 && tried < self.rdoq {
+                        let rc = scan_rc(tx, class, i as usize).0;
+                        let l = trial[rc];
+                        if l != 0 {
+                            tried += 1;
+                            let lower = l - l.signum();
+                            trial[rc] = lower;
+                            let new_eob = if lower == 0 && i == eob { eob_of(tx, txtp, &trial[..n]) } else { eob };
+                            let new_bits = if new_eob < 0 { u32::MAX } else { rate(self, txtp, &trial[..n], new_eob) };
+                            let delta = k * (err(rc, lower) - err(rc, l)) + self.lambda * (new_bits as f64 - bits as f64) / 512.0;
+                            if new_eob >= 0 && delta < 0.0 {
+                                bits = new_bits;
+                                eob = new_eob;
+                                changed = true;
+                            } else {
+                                trial[rc] = l;
+                            }
+                        }
+                        i -= 1;
+                    }
+                    if changed {
+                        dist = reconstruct(self, &trial[..n], eob, cf);
+                    }
+                }
+            }
             let cost = dist as f64 + self.lambda * bits as f64 / 512.0;
             if cost < best.0 {
                 best = (cost, txtp);
@@ -2821,6 +2873,7 @@ pub(crate) mod tests {
             }),
             prune: std::env::var("ENC_PRUNE").map_or(0.0, |v| v.parse().unwrap()),
             variance_boost: std::env::var("ENC_BOOST").is_ok_and(|v| v == "1"),
+            rdoq: std::env::var("ENC_RDOQ").map_or(0, |v| v.parse().unwrap()),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
         files.sort();
