@@ -217,7 +217,7 @@ impl_MergeInt!(u64, u32);
 impl_MergeInt!(u128, u64);
 
 #[inline]
-fn get_skip_ctx(
+pub(crate) fn get_skip_ctx(
     t_dim: &TxfmInfo,
     bs: BlockSize,
     a: &[u8],
@@ -295,7 +295,7 @@ fn get_skip_ctx(
 }
 
 #[inline]
-fn get_dc_sign_ctx(tx: TxfmSize, a: &[u8], l: &[u8]) -> c_uint {
+pub(crate) fn get_dc_sign_ctx(tx: TxfmSize, a: &[u8], l: &[u8]) -> c_uint {
     let mask = 0xc0c0c0c0c0c0c0c0 as u64;
     let mul = 0x101010101010101 as u64;
 
@@ -429,10 +429,10 @@ fn get_dc_sign_ctx(tx: TxfmSize, a: &[u8], l: &[u8]) -> c_uint {
 /// `lo_cdf` corresponds roughly to `Coeff_Base_Cdf` in the spec.
 /// `rav1d`/`dav1d` use a maximum value of 40 (for an array size of 41),
 /// whereas the spec has the array being 42 elements.
-type LoCdfIndex = InRange<usize, 0, 40>;
+pub(crate) type LoCdfIndex = InRange<usize, 0, 40>;
 
 #[inline]
-fn get_lo_ctx(
+pub(crate) fn get_lo_ctx(
     levels: &[u8],
     tx_class: TxClass,
     hi_mag: &mut u32,
