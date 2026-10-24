@@ -52,7 +52,10 @@ speed features listed what its search skips; taken so far:
 - Rejected: modes ranked by SATD without rate (-21.6% for -0.228 dB); intra pruning in the
   full search (a grey ramp's own quality 52.25 -> 48.5 dB, gate failed); the CfL alpha search
   in scalar code (+3%, SSE2 baseline); an f64 quantizer (+11-13%, u64 to f64 has no packed
-  conversion below AVX-512); a sign-bit lower bound on the rate (never prunes).
+  conversion below AVX-512); a sign-bit lower bound on the rate (never prunes); skipping the
+  quantizer's division where the level is 0 by a multiply-compare (+4.6% at qindex 32, +1.1%
+  at 140, -1.3% on graphics: the branch mispredicts on mixed blocks; the fifth miss on that
+  division).
 - Trap: the image-processing calibration in the dev profile compiles `Encoder<Rd>` at
   opt-level 0 and timed the encoder 4-5x too slow.
 
