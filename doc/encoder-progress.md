@@ -56,6 +56,16 @@ speed features listed what its search skips; taken so far:
   quantizer's division where the level is 0 by a multiply-compare (+4.6% at qindex 32, +1.1%
   at 140, -1.3% on graphics: the branch mispredicts on mixed blocks; the fifth miss on that
   division).
+- One more taken: above qindex 64 the full search ranks by SATD and estimates the best 6
+  (-16.8% at qindex 140 for -0.065 dB; blocks over the edge rank all).
+- Stage times at the defaults, 13 crops, qindex 32: ranking 47% (scoring 40%, of it the DCT
+  estimate 70%), depths 19%, chroma 21%, filters 8%. Parked, refuted twice by the same gate
+  item (a posterised sepia photo at Q80, 0.13 dB over its gate): a context-free rate in the
+  ranking estimate (-6.9%, gate -0.66 dB) and SATD pre-ranking of angle deltas (-6.3%, gate
+  -0.03 dB); cheaper ranking at qindex 64 and under needs a ranking that holds on posterised
+  content. Also not worth it: an f32 quantizer in the estimate (no faster than the integer
+  one), exact rate for only the best 1-2 transform types by a crude estimate (-3% for +0.6%
+  bytes).
 - Trap: the image-processing calibration in the dev profile compiles `Encoder<Rd>` at
   opt-level 0 and timed the encoder 4-5x too slow.
 
