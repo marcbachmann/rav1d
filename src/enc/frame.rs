@@ -486,6 +486,8 @@ pub struct Encoder<D: Decide> {
     pub stats: [[u64; 2]; 6],
     /// Nanoseconds per stage of `stats` when `timing`.
     pub stage_ns: [u64; 10],
+    /// Nanoseconds in `pick_block` by the block's larger side: 4, 8, 16, 32, 64.
+    pub size_ns: [u64; 5],
     pub timing: bool,
     /// The search's rate estimate of the coded superblocks, in 1/512 bits.
     pub estimated: u64,
@@ -626,6 +628,7 @@ impl<D: Decide> Encoder<D> {
             stage: 5,
             stats: [[0; 2]; 6],
             stage_ns: [0; 10],
+            size_ns: [0; 5],
             timing: false,
             estimated: 0,
             estimated_sse: 0,
@@ -1991,6 +1994,16 @@ impl<D: Decide> Encoder<D> {
     /// Finds the best modes of a block and leaves them applied; its node goes on the plan and its
     /// bits on the counter.
     fn pick_block(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
+        let started = self.timing.then(std::time::Instant::now);
+        self.pick_block_timed(ti, bs, x, y, edge_flags);
+        if let Some(t) = started {
+            let d = bs.dimensions();
+            let side = cmp::max(d[0], d[1]) as u32;
+            self.size_ns[side.trailing_zeros() as usize] += t.elapsed().as_nanos() as u64;
+        }
+    }
+
+    fn pick_block_timed(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
         self.pal_kept.clear();
         let b_dim = bs.dimensions();
         let (w4, h4) = (b_dim[0] as usize, b_dim[1] as usize);
@@ -3632,6 +3645,7 @@ pub(crate) mod tests {
             let searched = t.elapsed().as_millis();
             let stats = e.stats;
             let ns = e.stage_ns.map(|n| n / 1_000_000);
+            let sizes = e.size_ns.map(|n| n / 1_000_000);
             let estimated = e.estimated as f64 / 4096.0;
             let estimated_db = 10.0 * (65025.0 * (w * h * 3) as f64 / e.estimated_sse.max(1) as f64).log10();
             if options.filter_search {
@@ -3646,6 +3660,7 @@ pub(crate) mod tests {
                 println!("  estimated {estimated:.0} B {estimated_db:.2} dB unfiltered");
                 println!("  searches per 8x8 / coefficients per pixel: rank {} depth {} chroma {} final {} code {}", per[0], per[1], per[2], per[4], per[5]);
                 println!("  ms: rank {} depth {} chroma {} final {}, coded {searched}, with filters {t}; kept modes {}; scoring restore {} predict {} mode bits {} estimate {}", ns[0], ns[1], ns[2], ns[4], ns[3], ns[6], ns[7], ns[8], ns[9]);
+                println!("  ms by block side: 4 {} 8 {} 16 {} 32 {} 64 {}", sizes[0], sizes[1], sizes[2], sizes[3], sizes[4]);
             }
             let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));
             println!("{:20} {t:6} ms {:7} B {d:6.2} dB", path.file_stem().unwrap().to_string_lossy(), c.data.len());
