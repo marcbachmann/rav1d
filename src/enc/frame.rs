@@ -3224,7 +3224,7 @@ pub(crate) mod tests {
         let (w, h) = (200, 136);
         let img = photo(w, h, 3, 9);
         let planes: Vec<&[u8]> = img.iter().map(|p| p.as_slice()).collect();
-        let plain = crate::enc::Options::effort(150, 4, false);
+        let plain = crate::enc::Options::effort(150, 4, false, u64::MAX);
         let code = |o: &crate::enc::Options| {
             let c = crate::enc::still(w as u32, h as u32, &planes, o);
             let db = psnr(&img, &decode_with(c.data.clone(), w, h, 3, true));
@@ -3250,7 +3250,7 @@ pub(crate) mod tests {
             .collect();
         let planes: Vec<&[u8]> = img.iter().map(|p| p.as_slice()).collect();
         let code = |search: bool| {
-            let o = crate::enc::Options { filter_search: search, ..crate::enc::Options::effort(144, 4, false) };
+            let o = crate::enc::Options { filter_search: search, ..crate::enc::Options::effort(144, 4, false, u64::MAX) };
             let c = crate::enc::still(w as u32, h as u32, &planes, &o);
             (c.data.len(), psnr(&img, &decode_with(c.data.clone(), w, h, 3, true)))
         };
