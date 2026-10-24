@@ -36,6 +36,26 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-25, libaom's search shortcuts.** Timed against libaom (cpu-used 5, one thread, every
+crate at opt-level 3, pinned): 1.9-6.5x slower, graphics worst. A read of libaom's all-intra
+speed features listed what its search skips; taken so far:
+- Exact (same bytes): the chosen residuals are replayed instead of searched again before chroma,
+  in the dry code and in the coding pass (-6.4% / -10.4% at qindex 140 / 32); partition
+  candidates and luma depth trials stop once their decided blocks cost the best so far
+  (-1.8% / -0.3%, -1.6% / -2.2%); palette maps and index bits are kept per block (-2.3% on
+  the crops, -6.1% on three graphics).
+- Changing output, judged at equal bytes on the crops (1% bytes is 0.097 dB at qindex 32,
+  0.052 at 140) and by the AVIF gates (191/195, the same misses): one transform depth to
+  effort 5 for blocks inside the picture (-11.7% for -0.044 dB at 32, -6.2% for -0.040 at
+  140; blocks over the edge keep two, a 1x9000 line lost 3.2 dB without); the reduced intra
+  transform set in the full search too (-3.3% for -0.014 dB).
+- Rejected: modes ranked by SATD without rate (-21.6% for -0.228 dB); intra pruning in the
+  full search (a grey ramp's own quality 52.25 -> 48.5 dB, gate failed); the CfL alpha search
+  in scalar code (+3%, SSE2 baseline); an f64 quantizer (+11-13%, u64 to f64 has no packed
+  conversion below AVX-512); a sign-bit lower bound on the rate (never prunes).
+- Trap: the image-processing calibration in the dev profile compiles `Encoder<Rd>` at
+  opt-level 0 and timed the encoder 4-5x too slow.
+
 **2026-10-24, rate counted once.** Coefficients are written through a cached scan table with the
 lo context inline (ee598570), and the chosen transform blocks' bits come from the residual
 search instead of a second count in `coef_bits` (same bytes; an assert held them equal over the
