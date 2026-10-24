@@ -2260,7 +2260,7 @@ pub(crate) fn rav1d_recon_b_intra<BD: BitDepth>(
                         let top_sb_edge_slice = if t.b.y & f.sb_step - 1 == 0 {
                             let sby = t.b.y >> f.sb_shift;
                             let offset = f.ipred_edge_off as isize * 0
-                                + (f.sb128w * 128 * (sby - 1)) as isize;
+                                + f.ipred_edge_row(sby - 1) as isize;
                             Some((&f.ipred_edge, offset))
                         } else {
                             None
@@ -2471,7 +2471,7 @@ pub(crate) fn rav1d_recon_b_intra<BD: BitDepth>(
                     let top_sb_edge_slice = if t.b.y & !ss_ver & f.sb_step - 1 == 0 {
                         let sby = t.b.y >> f.sb_shift;
                         let offset = (f.ipred_edge_off * (pl + 1)) as isize
-                            + (f.sb128w * 128 * (sby - 1)) as isize;
+                            + f.ipred_edge_row(sby - 1) as isize;
                         Some((&f.ipred_edge, offset))
                     } else {
                         None
@@ -2624,7 +2624,7 @@ pub(crate) fn rav1d_recon_b_intra<BD: BitDepth>(
                             let top_sb_edge_slice = if t.b.y & !ss_ver & f.sb_step - 1 == 0 {
                                 let sby = t.b.y >> f.sb_shift;
                                 let offset = (f.ipred_edge_off * (1 + pl)) as isize
-                                    + (f.sb128w * 128 * (sby - 1)) as isize;
+                                    + f.ipred_edge_row(sby - 1) as isize;
                                 Some((&f.ipred_edge, offset))
                             } else {
                                 None
@@ -3140,7 +3140,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
             let top_sb_edge_slice = if t.b.y & f.sb_step - 1 == 0 {
                 let sby = t.b.y >> f.sb_shift;
                 let offset =
-                    (f.ipred_edge_off * 0) as isize + (f.sb128w * 128 * (sby - 1)) as isize;
+                    (f.ipred_edge_off * 0) as isize + f.ipred_edge_row(sby - 1) as isize;
                 Some((&f.ipred_edge, offset))
             } else {
                 None
@@ -3424,7 +3424,7 @@ pub(crate) fn rav1d_recon_b_inter<BD: BitDepth>(
                         let top_sb_edge_slice = if t.b.y & f.sb_step - 1 == 0 {
                             let sby = t.b.y >> f.sb_shift;
                             let offset = (f.ipred_edge_off * (pl + 1)) as isize
-                                + (f.sb128w * 128 * (sby - 1)) as isize;
+                                + f.ipred_edge_row(sby - 1) as isize;
                             Some((&f.ipred_edge, offset))
                         } else {
                             None
@@ -3710,11 +3710,11 @@ pub(crate) fn rav1d_filter_sbrow_deblock_cols<BD: BitDepth>(
     let y = sby * f.sb_step * 4;
     let p = f.cur.lf_offsets::<BD>(y);
     let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
-    let mask_offset = (sby >> (seq_hdr.sb128 == 0) as c_int) * f.sb128w;
+    let mask_offset = f.lf_mask_row(sby >> (seq_hdr.sb128 == 0) as c_int);
     rav1d_loopfilter_sbrow_cols::<BD>(
         f,
         p,
-        mask_offset as usize,
+        mask_offset,
         sby,
         f.lf.start_of_tile_row[sby as usize] as c_int,
     );
@@ -3731,12 +3731,12 @@ pub(crate) fn rav1d_filter_sbrow_deblock_rows<BD: BitDepth>(
     let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
     let sb128 = seq_hdr.sb128;
     let cdef = seq_hdr.cdef;
-    let mask_offset = (sby >> (sb128 == 0) as c_int) * f.sb128w;
+    let mask_offset = f.lf_mask_row(sby >> (sb128 == 0) as c_int);
     let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
     if c.inloop_filters.contains(Rav1dInloopFilterType::DEBLOCK)
         && (frame_hdr.loopfilter.level_y != [0; 2])
     {
-        rav1d_loopfilter_sbrow_rows::<BD>(f, p, mask_offset as usize, sby);
+        rav1d_loopfilter_sbrow_rows::<BD>(f, p, mask_offset, sby);
     }
     if cdef != 0 || !f.lf.restore_planes.is_empty() {
         // Store loop filtered pixels required by CDEF / LR.
@@ -3758,8 +3758,8 @@ pub(crate) fn rav1d_filter_sbrow_cdef<BD: BitDepth>(
     let y = sby * sbsz * 4;
     let p = f.cur.lf_offsets::<BD>(y);
     let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
-    let prev_mask = (sby - 1 >> (seq_hdr.sb128 == 0) as c_int) * f.sb128w;
-    let mask_offset = (sby >> (seq_hdr.sb128 == 0) as c_int) * f.sb128w;
+    let prev_mask = f.lf_mask_row(sby - 1 >> (seq_hdr.sb128 == 0) as c_int) as c_int;
+    let mask_offset = f.lf_mask_row(sby >> (seq_hdr.sb128 == 0) as c_int) as c_int;
     let start = sby * sbsz;
     if sby != 0 {
         let p_up = array::from_fn(|i| {
@@ -3856,14 +3856,14 @@ pub(crate) fn rav1d_backup_ipred_edge<BD: BitDepth>(f: &Rav1dFrameData, t: &mut 
 
     let ts = &f.ts[t.ts];
     let sby = t.b.y >> f.sb_shift;
-    let sby_off = f.sb128w * 128 * sby;
+    let sby_off = f.ipred_edge_row(sby);
     let x_off = ts.tiling.col_start;
 
     let y = &cur_data[0];
     let y = y.with_offset::<BD>()
         + x_off as usize * 4
         + ((t.b.y + f.sb_step) * 4 - 1) as isize * y.pixel_stride::<BD>();
-    let ipred_edge_off = (f.ipred_edge_off * 0) + (sby_off + x_off * 4) as usize;
+    let ipred_edge_off = (f.ipred_edge_off * 0) + sby_off + (x_off * 4) as usize;
     let n = 4 * (ts.tiling.col_end - x_off) as usize;
     BD::pixel_copy(
         &mut f.ipred_edge.mut_slice_as((ipred_edge_off.., ..n)),
@@ -3879,7 +3879,7 @@ pub(crate) fn rav1d_backup_ipred_edge<BD: BitDepth>(f: &Rav1dFrameData, t: &mut 
             + (((t.b.y + f.sb_step) * 4 >> ss_ver) - 1) as isize * BD::pxstride(f.cur.stride[1]);
         for pl in 1..3 {
             let ipred_edge_off =
-                (f.ipred_edge_off * pl) + (sby_off + (x_off * 4 >> ss_hor)) as usize;
+                (f.ipred_edge_off * pl) + sby_off + (x_off * 4 >> ss_hor) as usize;
             let n = 4 * (ts.tiling.col_end - x_off) as usize >> ss_hor;
             let uv = &cur_data[pl];
             let uv = uv.with_offset::<BD>() + uv_off;

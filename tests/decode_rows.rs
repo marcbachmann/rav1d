@@ -42,11 +42,15 @@ fn ivf_frames(data: &[u8]) -> Vec<&[u8]> {
 }
 
 fn open(apply_grain: bool, by_rows: bool) -> Dav1dContext {
+    open_on(apply_grain, by_rows, 1)
+}
+
+fn open_on(apply_grain: bool, by_rows: bool, threads: c_int) -> Dav1dContext {
     unsafe {
         let mut settings = MaybeUninit::<Dav1dSettings>::uninit();
         dav1d_default_settings(NonNull::new(settings.as_mut_ptr()).unwrap());
         let mut settings = settings.assume_init();
-        settings.n_threads = 1;
+        settings.n_threads = threads;
         settings.max_frame_delay = 1;
         settings.apply_grain = apply_grain as c_int;
         let mut ctx: Option<Dav1dContext> = None;
@@ -220,12 +224,16 @@ unsafe fn drain(ctx: Dav1dContext, rows: bool, decoded: &mut Decoded) {
 }
 
 fn decode(file: &Path, apply_grain: bool, rows: bool, poison: bool) -> Decoded {
+    decode_on(file, apply_grain, rows, poison, 1)
+}
+
+fn decode_on(file: &Path, apply_grain: bool, rows: bool, poison: bool, threads: c_int) -> Decoded {
     let data = std::fs::read(file).unwrap();
     let mut decoded = Decoded {
         poison,
         ..Default::default()
     };
-    let ctx = open(apply_grain, rows);
+    let ctx = open_on(apply_grain, rows, threads);
     unsafe {
         for frame in ivf_frames(&data) {
             if poison && !decoded.out.is_empty() {
@@ -391,4 +399,28 @@ fn fails_a_tile_group_after_the_frame_as_whole() {
     let (by_rows, rows) = calls(true);
     assert_eq!(by_rows, whole);
     assert!(rows > 0);
+}
+
+/// One thread keeps a superblock row of the frame's line buffers where tile threads keep them all.
+#[test]
+fn decodes_on_one_thread_as_on_four() {
+    let filter = std::env::var("ROWS_FILTER").unwrap_or_default();
+    let (mut pictures, mut differ) = (0, Vec::new());
+    for file in streams().iter().filter(|f| f.to_string_lossy().contains(&filter)) {
+        let one = decode_on(file, true, false, false, 1);
+        let four = decode_on(file, true, false, false, 4);
+        let upto = |d: &Decoded| d.out.iter().position(|o| o.is_err());
+        let n = match (upto(&one), upto(&four)) {
+            (None, None) if one.out.len() != four.out.len() => usize::MAX,
+            (a, b) => a.unwrap_or(one.out.len()).min(b.unwrap_or(four.out.len())),
+        };
+        if n == usize::MAX || one.out[..n] != four.out[..n] {
+            differ.push(file.display().to_string());
+            continue;
+        }
+        pictures += n;
+    }
+    eprintln!("{pictures} pictures, {} streams differ", differ.len());
+    assert!(differ.is_empty(), "{differ:#?}");
+    assert!(!filter.is_empty() || pictures > 10_000, "{pictures} pictures");
 }

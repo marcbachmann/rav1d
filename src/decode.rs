@@ -1837,12 +1837,15 @@ fn decode_b(
                 TileStateRef::Frame => &f.lf.lvl,
                 TileStateRef::Local => &*ts.lflvlmem.try_read().unwrap(),
             };
+            let ss_ver = (f.cur.p.layout == Rav1dPixelLayout::I420) as c_int;
+            let level_rows = [f.lf_level_row(t.b.y), f.lf_level_row(t.b.y >> ss_ver)];
             let mut a_uv_guard;
             let mut l_uv_guard;
             rav1d_create_lf_mask_intra(
                 &f.lf.mask[t.lf_mask.unwrap()],
                 &f.lf.level,
                 f.b4_stride,
+                level_rows,
                 &lflvl[b.seg_id.get()],
                 t.b,
                 f.w4,
@@ -2979,12 +2982,15 @@ fn decode_b(
                 TileStateRef::Frame => &f.lf.lvl,
                 TileStateRef::Local => &*ts.lflvlmem.try_read().unwrap(),
             };
+            let ss_ver = (f.cur.p.layout == Rav1dPixelLayout::I420) as c_int;
+            let level_rows = [f.lf_level_row(t.b.y), f.lf_level_row(t.b.y >> ss_ver)];
             let mut a_uv_guard;
             let mut l_uv_guard;
             rav1d_create_lf_mask_inter(
                 &f.lf.mask[t.lf_mask.unwrap()],
                 &f.lf.level,
                 f.b4_stride,
+                level_rows,
                 // In C, the inner dimensions (`ref`, `is_gmv`) are offset,
                 // but then cast back to a pointer to the full array,
                 // even though the whole array is not passed.
@@ -4085,7 +4091,7 @@ pub(crate) fn rav1d_decode_tile_sbrow(
     t.pal_sz_uv[1] = Default::default();
     let sb128y = t.b.y >> 5;
     t.a = (col_sb128_start + tile_row * f.sb128w) as usize;
-    t.lf_mask = Some((sb128y * f.sb128w + col_sb128_start) as usize);
+    t.lf_mask = Some(f.lf_mask_row(sb128y) + col_sb128_start as usize);
     for bx in (ts.tiling.col_start..ts.tiling.col_end).step_by(sb_step as usize) {
         t.b.x = bx;
         if c.flush.load(Ordering::Acquire) {
@@ -4343,9 +4349,11 @@ pub(crate) fn rav1d_decode_frame_init(c: &Rav1dContext, fc: &Rav1dFrameContext) 
     let mut uv_stride = f.cur.stride[1];
     let has_resize = (frame_hdr.size.width[0] != frame_hdr.size.width[1]) as c_int;
     let need_cdef_lpf_copy = (c.tc.len() > 1 && has_resize != 0) as c_int;
+    // one thread filters a superblock row at a time and keeps only its lines
+    let cdef_sbh = if c.tc.len() > 1 { f.sbh } else { 1 };
     let mut alloc_sz: usize = 64;
-    alloc_sz += (y_stride.unsigned_abs() * 4 * f.sbh as usize) << need_cdef_lpf_copy;
-    alloc_sz += (uv_stride.unsigned_abs() * 8 * f.sbh as usize) << need_cdef_lpf_copy;
+    alloc_sz += (y_stride.unsigned_abs() * 4 * cdef_sbh as usize) << need_cdef_lpf_copy;
+    alloc_sz += (uv_stride.unsigned_abs() * 8 * cdef_sbh as usize) << need_cdef_lpf_copy;
     // TODO: Fallible allocation.
     f.lf.cdef_line_buf.resize(alloc_sz, 0);
 
@@ -4356,23 +4364,23 @@ pub(crate) fn rav1d_decode_frame_init(c: &Rav1dContext, fc: &Rav1dFrameContext) 
     let mut offset = bpc.pxstride(32usize);
     if y_stride < 0 {
         f.lf.cdef_line[0][0] =
-            offset.wrapping_add_signed(-(y_stride_px * (f.sbh as isize * 4 - 1)));
+            offset.wrapping_add_signed(-(y_stride_px * (cdef_sbh as isize * 4 - 1)));
         f.lf.cdef_line[1][0] =
-            offset.wrapping_add_signed(-(y_stride_px * (f.sbh as isize * 4 - 3)));
+            offset.wrapping_add_signed(-(y_stride_px * (cdef_sbh as isize * 4 - 3)));
     } else {
         f.lf.cdef_line[0][0] = offset.wrapping_add_signed(y_stride_px * 0);
         f.lf.cdef_line[1][0] = offset.wrapping_add_signed(y_stride_px * 2);
     }
-    offset = offset.wrapping_add_signed(y_stride_px.abs() * f.sbh as isize * 4);
+    offset = offset.wrapping_add_signed(y_stride_px.abs() * cdef_sbh as isize * 4);
     if uv_stride < 0 {
         f.lf.cdef_line[0][1] =
-            offset.wrapping_add_signed(-(uv_stride_px * (f.sbh as isize * 8 - 1)));
+            offset.wrapping_add_signed(-(uv_stride_px * (cdef_sbh as isize * 8 - 1)));
         f.lf.cdef_line[0][2] =
-            offset.wrapping_add_signed(-(uv_stride_px * (f.sbh as isize * 8 - 3)));
+            offset.wrapping_add_signed(-(uv_stride_px * (cdef_sbh as isize * 8 - 3)));
         f.lf.cdef_line[1][1] =
-            offset.wrapping_add_signed(-(uv_stride_px * (f.sbh as isize * 8 - 5)));
+            offset.wrapping_add_signed(-(uv_stride_px * (cdef_sbh as isize * 8 - 5)));
         f.lf.cdef_line[1][2] =
-            offset.wrapping_add_signed(-(uv_stride_px * (f.sbh as isize * 8 - 7)));
+            offset.wrapping_add_signed(-(uv_stride_px * (cdef_sbh as isize * 8 - 7)));
     } else {
         f.lf.cdef_line[0][1] = offset.wrapping_add_signed(uv_stride_px * 0);
         f.lf.cdef_line[0][2] = offset.wrapping_add_signed(uv_stride_px * 2);
@@ -4438,12 +4446,18 @@ pub(crate) fn rav1d_decode_frame_init(c: &Rav1dContext, fc: &Rav1dFrameContext) 
 
     // update allocation for loopfilter masks
 
+    f.lf.ring = c.tc.len() == 1;
+    let (mask_rows, level_rows) = if f.lf.ring {
+        (2, 1 + f.sb_step)
+    } else {
+        (f.sb128h, f.sb128h * 32)
+    };
     f.lf.mask.clear();
     // TODO: Fallible allocation.
-    f.lf.mask.resize_with(num_sb128 as usize, Default::default);
+    f.lf.mask.resize_with((mask_rows * f.sb128w) as usize, Default::default);
     // over-allocate by 3 bytes since some of the SIMD implementations
     // index this from the level type and can thus over-read by up to 3 bytes.
-    f.lf.level.resize(4 * num_sb128 as usize * 32 * 32 + 3, 0); // TODO: Fallible allocation
+    f.lf.level.resize(4 * level_rows as usize * f.b4_stride as usize + 3, 0); // TODO: Fallible allocation
     if c.fc.len() > 1 {
         // TODO: Fallible allocation
         f.frame_thread
@@ -4471,7 +4485,8 @@ pub(crate) fn rav1d_decode_frame_init(c: &Rav1dContext, fc: &Rav1dFrameContext) 
     }
     rav1d_calc_lf_values(&mut f.lf.lvl, &frame_hdr, &[0, 0, 0, 0]);
 
-    let ipred_edge_sz = f.sbh * f.sb128w << hbd;
+    f.ipred_edge_rows = if c.tc.len() > 1 { f.sbh } else { 2 };
+    let ipred_edge_sz = f.ipred_edge_rows * f.sb128w << hbd;
     // TODO: Fallible allocation
     f.ipred_edge.resize(ipred_edge_sz as usize * 128 * 3, 0);
     f.ipred_edge_off = bpc.pxstride(ipred_edge_sz as usize * 128);
@@ -4726,6 +4741,9 @@ fn decode_sbrow(
             by_end,
         );
     }
+    if f.lf.ring {
+        reuse_lf_rows(f, sby);
+    }
     for col in 0..cols {
         t.ts = tile_row * cols + col;
         rav1d_decode_tile_sbrow(c, t, f).map_err(|()| Rav1dError::InvalidArgument)?;
@@ -4739,6 +4757,20 @@ fn decode_sbrow(
 
     (f.bd_fn().filter_sbrow)(c, f, t, sby);
     Ok(())
+}
+
+/// Readies the loop filter's rings for superblock row `sby`: the level row above it moves to the
+/// ring's first row, and a new row of 128 pixels starts with empty masks.
+fn reuse_lf_rows(f: &mut Rav1dFrameData, sby: c_int) {
+    let row = 4 * f.b4_stride as usize;
+    let last = f.sb_step as usize * row;
+    f.lf.level.index_mut(..last + row).copy_within(last..last + row, 0);
+    let sb128 = f.seq_hdr().sb128;
+    if sby & (sb128 == 0) as c_int == 0 {
+        let at = f.lf_mask_row(sby >> (sb128 == 0) as c_int);
+        let sb128w = f.sb128w as usize;
+        f.lf.mask[at..at + sb128w].fill_with(Default::default);
+    }
 }
 
 /// The rows of the output picture no filter changes after superblock row `sby`: the filters of

@@ -425,6 +425,7 @@ pub(crate) fn rav1d_create_lf_mask_intra(
     lflvl: &Av1Filter,
     level_cache: &DisjointMut<AlignedVec2<u8>>,
     b4_stride: ptrdiff_t,
+    level_rows: [usize; 2],
     filter_level: &Align16<[[[u8; 2]; 8]; 4]>,
     b: Bxy,
     iw: c_int,
@@ -451,7 +452,7 @@ pub(crate) fn rav1d_create_lf_mask_intra(
     let [filter_level_y, filter_level_uv] = *<[u16; 2]>::ref_from(&filter_level_yuv).unwrap();
 
     if bw4 != 0 && bh4 != 0 {
-        let mut level_cache_off = by * b4_stride + bx;
+        let mut level_cache_off = level_rows[0] * b4_stride + bx;
         for _y in 0..bh4 {
             for x in 0..bw4 {
                 let idx = 4 * (level_cache_off + x);
@@ -488,7 +489,7 @@ pub(crate) fn rav1d_create_lf_mask_intra(
     let cbx4 = bx4 >> ss_hor;
     let cby4 = by4 >> ss_ver;
 
-    let mut level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
+    let mut level_cache_off = level_rows[1] * b4_stride + (bx >> ss_hor);
     for _y in 0..cbh4 {
         for x in 0..cbw4 {
             let idx = 4 * (level_cache_off + x);
@@ -519,6 +520,7 @@ pub(crate) fn rav1d_create_lf_mask_inter(
     lflvl: &Av1Filter,
     level_cache: &DisjointMut<AlignedVec2<u8>>,
     b4_stride: ptrdiff_t,
+    level_rows: [usize; 2],
     filter_level: &Align16<[[[u8; 2]; 8]; 4]>,
     r#ref: usize,
     is_gmv: bool,
@@ -550,7 +552,7 @@ pub(crate) fn rav1d_create_lf_mask_inter(
     let [filter_level_y, filter_level_uv] = *<[u16; 2]>::ref_from(&filter_level_yuv).unwrap();
 
     if bw4 != 0 && bh4 != 0 {
-        let mut level_cache_off = by * b4_stride + bx;
+        let mut level_cache_off = level_rows[0] * b4_stride + bx;
         for _y in 0..bh4 {
             for x in 0..bw4 {
                 let idx = 4 * (level_cache_off + x);
@@ -598,7 +600,7 @@ pub(crate) fn rav1d_create_lf_mask_inter(
     let cbx4 = bx4 >> ss_hor;
     let cby4 = by4 >> ss_ver;
 
-    let mut level_cache_off = (by >> ss_ver) * b4_stride + (bx >> ss_hor);
+    let mut level_cache_off = level_rows[1] * b4_stride + (bx >> ss_hor);
     for _y in 0..cbh4 {
         for x in 0..cbw4 {
             let idx = 4 * (level_cache_off + x);

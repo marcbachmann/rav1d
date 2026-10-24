@@ -706,6 +706,9 @@ pub struct Rav1dFrameContextLf {
     // in-loop filter per-frame state keeping
     pub start_of_tile_row: Vec<u8>,
     pub restore_planes: LrRestorePlanes,
+    /// `level` and `mask` hold the superblock rows one thread decodes and filters in turn: `level`
+    /// one row and the row above it, `mask` two rows of 128 pixels.
+    pub ring: bool,
 }
 
 #[derive(Default)]
@@ -802,6 +805,8 @@ pub(crate) struct Rav1dFrameData {
     // in pixel units when slicing.
     pub ipred_edge: DisjointMut<AlignedVec64<u8>>, // DynPixel
     pub ipred_edge_off: usize,
+    /// Superblock rows `ipred_edge` holds, a ring when one thread decodes the rows in turn.
+    pub ipred_edge_rows: c_int,
 
     pub b4_stride: ptrdiff_t,
     pub w4: c_int,
@@ -838,6 +843,21 @@ impl Rav1dFrameData {
 
     pub fn seq_hdr(&self) -> &Rav1dSequenceHeader {
         self.seq_hdr.as_ref().unwrap()
+    }
+
+    /// The row of `lf.level` holding 4-pixel row `y4` of a plane.
+    pub fn lf_level_row(&self, y4: c_int) -> usize {
+        (if self.lf.ring { 1 + y4.rem_euclid(self.sb_step) } else { y4 }) as usize
+    }
+
+    /// Where the 128-pixel row `sb128y` starts in `lf.mask`.
+    pub fn lf_mask_row(&self, sb128y: c_int) -> usize {
+        (if self.lf.ring { sb128y.rem_euclid(2) } else { sb128y } * self.sb128w) as usize
+    }
+
+    /// Where superblock row `sby`'s bottom edge starts in each of `ipred_edge`'s planes.
+    pub fn ipred_edge_row(&self, sby: c_int) -> usize {
+        (self.sb128w * 128 * sby.rem_euclid(self.ipred_edge_rows)) as usize
     }
 }
 

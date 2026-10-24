@@ -619,7 +619,7 @@ pub(crate) fn rav1d_loopfilter_sbrow_cols<BD: BitDepth>(
     let lflvl = &f.lf.mask[lflvl_offset..];
     let lvl = WithOffset {
         data: &f.lf.level,
-        offset: 4 * f.b4_stride as usize * (sby * sbsz) as usize,
+        offset: 4 * f.b4_stride as usize * f.lf_level_row(sby * sbsz),
     };
     have_left = false;
     for x in 0..f.sb128w as usize {
@@ -640,7 +640,7 @@ pub(crate) fn rav1d_loopfilter_sbrow_cols<BD: BitDepth>(
     }
     let lvl = WithOffset {
         data: &f.lf.level,
-        offset: 4 * f.b4_stride as usize * (sby * sbsz >> ss_ver) as usize,
+        offset: 4 * f.b4_stride as usize * f.lf_level_row(sby * sbsz >> ss_ver),
     };
     have_left = false;
     for x in 0..f.sb128w as usize {
@@ -681,7 +681,7 @@ pub(crate) fn rav1d_loopfilter_sbrow_rows<BD: BitDepth>(
 
     let lvl = WithOffset {
         data: &f.lf.level,
-        offset: 4 * f.b4_stride as usize * (sby * sbsz) as usize,
+        offset: 4 * f.b4_stride as usize * f.lf_level_row(sby * sbsz),
     };
     for x in 0..f.sb128w as usize {
         filter_plane_rows_y::<BD>(
@@ -704,7 +704,7 @@ pub(crate) fn rav1d_loopfilter_sbrow_rows<BD: BitDepth>(
 
     let lvl = WithOffset {
         data: &f.lf.level,
-        offset: 4 * f.b4_stride as usize * (sby * sbsz >> ss_ver) as usize,
+        offset: 4 * f.b4_stride as usize * f.lf_level_row(sby * sbsz >> ss_ver),
     };
     let [_, pu, pv] = p;
     for x in 0..f.sb128w as usize {
