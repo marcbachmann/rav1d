@@ -36,6 +36,22 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-24, the gate misses on synthetic patterns.** The strip pattern of the AVIF gates
+(sawtooth R, diagonal G, XOR B) loses 1.9 dB at libaom's bytes at effort 4 and gains 0.1 at
+effort 9. Settings one at a time on a 1024×256 crop at Q50 (−3.20 dB): all luma or chroma
+modes kept change nothing; filters off −3.76; H and V partitions at every block +2.6 dB, 4×4
+blocks +1.3. The gain is at 16×16 and 8×8 (at 64 and 32 nothing), and comes from 8×4/4×8: at
+effort 4 an 8×8 never splits, so the "Split beat None" rule never tries H and V there. Trying
+them costs 2× time on photos for nothing (+0.03 dB always, −0.03 at 8×8 alone); a gate on
+None's bits per pixel recovers the strip at 0.5 bit but costs antialiased text 3.7 dB. That is
+no costing bug: the search's rate estimate is 2.5% under the coded bytes and its distortion is
+the decoded picture's within 0.2 dB, with H/V or without; the extra blocks move the search
+along λ, and the tune-IQ λ weight (×1.56 at qindex 133) makes that a poor trade on text.
+Without the weight: text +1.5 dB at libaom's bytes, photos at Q90 −0.1 to −0.3, mean +0.24 →
++0.30 over 28 codes, bytes at a qindex up to 18% higher; kept, as libaom's tune IQ has it.
+RDOQ does not bring grey noise near libaom's bytes (53 KB against 32 KB at qindex 144, the
+same at 2, 8 and 64 coefficients); at equal bytes it is +0.2 to +1.4 dB ahead.
+
 **2026-10-24, speed.** On 13 crops of 384 px at qindex 140, effort 4: 8535 → 5690 ms. The
 chroma palette search keeps a bitmap of colour pairs and stops past 64 (857fbe94, same bytes);
 effort ≤5 compares depths with DCT only and searches transform types at the chosen depth
