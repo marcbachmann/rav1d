@@ -377,6 +377,10 @@ pub struct Encoder<D: Decide> {
     predict_only: bool,
     /// Luma modes kept from the SATD ranking for rate and distortion, all when 0.
     pub keep_modes: usize,
+    /// Whether the search tries H and V partitions.
+    pub rect: bool,
+    /// A block whose unsplit distortion is under `prune` bits' worth per 4×4 unit is not split.
+    pub prune: f64,
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
     /// the block's width at a time.
     pal_map: [Vec<u8>; 2],
@@ -436,6 +440,8 @@ impl<D: Decide> Encoder<D> {
             dct_only: false,
             predict_only: false,
             keep_modes: 0,
+            rect: true,
+            prune: 0.0,
             pal_map: [Vec::new(), Vec::new()],
             counter: Counter::default(),
             cost_cdf,
@@ -1368,13 +1374,17 @@ impl<D: Decide> Encoder<D> {
         let base = self.counter.bits;
         let ctx = self.partition_ctx(bl, x, y);
         use BlockPartition::*;
-        let cands: &[BlockPartition] = match halves {
-            Halves::Both => &[None, Split, H, V],
-            Halves::Top => &[Split, H],
-            Halves::Left => &[Split, V],
+        let cands: &[BlockPartition] = match (halves, self.rect) {
+            (Halves::Both, true) => &[None, Split, H, V],
+            (Halves::Both, false) => &[None, Split],
+            (Halves::Top, _) => &[Split, H],
+            (Halves::Left, _) => &[Split, V],
         };
         let mut best: Option<(f64, u32, Snap, Vec<Node>)> = Option::None;
         for &bp in cands {
+            if bp != None && self.prune > 0.0 && best.as_ref().is_some_and(|b| b.0 - self.lambda * b.1 as f64 / 512.0 < self.prune * self.lambda * (n4 * n4) as f64) {
+                break;
+            }
             self.restore(&start);
             self.plan.truncate(plan_len);
             self.counter.bits = base;
@@ -2634,5 +2644,66 @@ pub(crate) mod tests {
         let mut fr = frame(&seq, 90);
         fr.screen_content = true;
         round_trip(&img, w, h, fr, Fixed);
+    }
+
+    fn ppm(path: &std::path::Path) -> (usize, usize, Vec<u8>) {
+        let data = std::fs::read(path).unwrap();
+        let mut fields = Vec::new();
+        let mut at = 0;
+        while fields.len() < 4 {
+            while data[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            let start = at;
+            while !data[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            fields.push(String::from_utf8_lossy(&data[start..at]).to_string());
+        }
+        let (w, h): (usize, usize) = (fields[1].parse().unwrap(), fields[2].parse().unwrap());
+        (w, h, data[at + 1..][..w * h * 3].to_vec())
+    }
+
+    /// `ENC_CORPUS=<dir of P6 PPMs> [ENC_QIDX=..] [ENC_KEEP=..] [ENC_CROP=<side>] cargo test --release --features
+    /// encoder --lib enc::frame::tests::corpus -- --ignored --nocapture`: time, bytes and PSNR
+    /// after the in-loop filters, per picture and in total.
+    #[test]
+    #[ignore]
+    fn corpus() {
+        let dir = std::env::var("ENC_CORPUS").unwrap();
+        let qidx: u8 = std::env::var("ENC_QIDX").map_or(120, |v| v.parse().unwrap());
+        let options = crate::enc::Options {
+            qidx,
+            keep_modes: std::env::var("ENC_KEEP").map_or(0, |v| v.parse().unwrap()),
+            screen: std::env::var("ENC_SCREEN").map_or(true, |v| v != "0"),
+            rect: std::env::var("ENC_RECT").map_or(true, |v| v != "0"),
+            prune: std::env::var("ENC_PRUNE").map_or(0.0, |v| v.parse().unwrap()),
+        };
+        let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        let (mut ms, mut bytes, mut db) = (0, 0, 0.0);
+        for path in &files {
+            let (w0, h0, rgb) = ppm(path);
+            let crop: usize = std::env::var("ENC_CROP").map_or(usize::MAX, |v| v.parse().unwrap());
+            let (w, h) = (w0.min(crop), h0.min(crop));
+            let rgb: Vec<u8> = (0..h).flat_map(|y| rgb[y * w0 * 3..][..w * 3].to_vec()).collect();
+            let mut planes = vec![vec![0u8; w * h]; 3];
+            for (i, px) in rgb.chunks_exact(3).enumerate() {
+                let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+                planes[0][i] = ((19595 * r + 38470 * g + 7471 * b + 32768) >> 16) as u8;
+                planes[1][i] = ((-11059 * r - 21709 * g + 32768 * b + (128 << 16) + 32768) >> 16).clamp(0, 255) as u8;
+                planes[2][i] = ((32768 * r - 27439 * g - 5329 * b + (128 << 16) + 32768) >> 16).clamp(0, 255) as u8;
+            }
+            let rows: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
+            let t = std::time::Instant::now();
+            let c = crate::enc::still(w as u32, h as u32, &rows, &options);
+            let t = t.elapsed().as_millis();
+            let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));
+            println!("{:20} {t:6} ms {:7} B {d:6.2} dB", path.file_stem().unwrap().to_string_lossy(), c.data.len());
+            ms += t;
+            bytes += c.data.len();
+            db += d;
+        }
+        println!("total {ms} ms {bytes} B mean {:.3} dB", db / files.len() as f64);
     }
 }

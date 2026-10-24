@@ -62,6 +62,10 @@ pub struct Options {
     pub keep_modes: usize,
     /// Screen content tools: palettes.
     pub screen: bool,
+    /// H and V partitions are tried.
+    pub rect: bool,
+    /// See `Encoder::prune`; 0 tries every partition.
+    pub prune: f64,
 }
 
 /// A still picture of 8-bit planes: one plane is monochrome, three are 4:4:4 YCbCr, BT.601 full
@@ -71,6 +75,8 @@ pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Co
     frame.screen_content = options.screen;
     let mut e = Encoder::new(seq, frame, Rd);
     e.keep_modes = options.keep_modes;
+    e.rect = options.rect;
+    e.prune = options.prune;
     let w = width as usize;
     for y in 0..height as usize {
         let rows: Vec<&[u8]> = planes.iter().map(|p| &p[y * w..][..w]).collect();

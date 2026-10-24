@@ -35,6 +35,12 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-24, comparison with palettes.** At libaom's bytes (PSNR, 4:4:4, decoded with
+filters): photos +0.11 to +1.85 dB, a gradient +3.0 to +6.0, a UI mock +4.2 to +5.5, a hard-edged
+logo +4.2 to +4.4 (was −5 to −11 without palettes); mean +2.41 dB over 14 codes. Several graphics
+points are extrapolated past the three qindexes measured. libaom is tuned for IQ, not PSNR, so
+the JS gates still decide. Time 18–85 s against libaom's 0.1–1.6 s: speed is next.
+
 **2026-10-24, palettes.** `palette.rs` writes what `read_pal_plane`, `read_pal_uv` and
 `read_pal_indices` read: cache reuse flags, delta-coded sorted colours (raw or signed deltas for
 V), and wavefront index maps with `order_palette`'s contexts. The search tries a block's own
