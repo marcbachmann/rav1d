@@ -21,7 +21,7 @@ use crate::enc::ec::Writer;
 use crate::enc::fdct_fast;
 use crate::enc::palette;
 use crate::enc::header::{obu, BitWriter, Frame, Sequence, OBU_FRAME, OBU_SEQUENCE_HEADER};
-use crate::enc::rd::{lambda, Counter, Sink};
+use crate::enc::rd::{lambda, CoefCosts, Counter, Sink};
 use crate::enum_map::DefaultValue;
 use crate::env::{gather_left_partition_prob, gather_top_partition_prob};
 use crate::include::common::bitdepth::{BitDepth, BitDepth8};
@@ -450,6 +450,7 @@ pub struct Encoder<D: Decide> {
     lv: Option<Box<[i32; 32 * 32]>>,
     counter: Counter,
     cost_cdf: Box<CdfContext>,
+    coef_costs: Box<CoefCosts>,
     trial: Option<(Intra, u8)>,
     plan: Vec<Node>,
     next: usize,
@@ -568,6 +569,7 @@ impl<D: Decide> Encoder<D> {
             estimated: 0,
             estimated_sse: 0,
             counter: Counter::default(),
+            coef_costs: CoefCosts::new(&cost_cdf.coef),
             cost_cdf,
             trial: None,
             plan: Vec::new(),
@@ -792,6 +794,7 @@ impl<D: Decide> Encoder<D> {
                 }
                 if self.decide.searches() {
                     *self.cost_cdf = self.tiles[ti].cdf.clone();
+                    self.coef_costs.fill(&self.cost_cdf.coef);
                     self.search_sb(ti, x, y);
                 }
                 self.code_sb(ti, BlockLevel::Bl64x64, x, y, EdgeIndex::root());
@@ -1463,7 +1466,7 @@ impl<D: Decide> Encoder<D> {
         let rate = |e: &mut Self, txtp: TxfmType, lv: &[i32], eob: i32| -> u32 {
             let (mut a, mut l) = (a0, l0);
             let mut c = Counter::default();
-            write_coefs(&mut c, &mut e.cost_cdf, &mut a, &mut l, plane, 0, 0, tx, bs, txtp, lv, eob, intra, lossless, e.frame.quant.base, e.frame.reduced_tx_set, i32::MAX, i32::MAX);
+            write_coefs(&mut c, &mut e.cost_cdf, Some(&e.coef_costs), &mut a, &mut l, plane, 0, 0, tx, bs, txtp, lv, eob, intra, lossless, e.frame.quant.base, e.frame.reduced_tx_set, i32::MAX, i32::MAX);
             c.bits
         };
         let zero_rate = rate(self, cands[0], &[], -1);
@@ -1972,6 +1975,7 @@ fn coef_bits<D: Decide>(e: &mut Encoder<D>, txs: &[TxDone], bs: BlockSize, intra
         write_coefs(
             &mut c,
             &mut e.cost_cdf,
+            Some(&e.coef_costs),
             a,
             l,
             t.plane,
@@ -2167,6 +2171,7 @@ impl BlockWrite {
                 write_coefs(
                     s,
                     cdf,
+                    None,
                     a,
                     l,
                     t.plane,
@@ -2403,10 +2408,27 @@ fn eob_of(tx: TxfmSize, txtp: TxfmType, levels: &[i32]) -> i32 {
     levels.iter().zip(index).filter(|(&l, _)| l != 0).map(|(_, &i)| i as i32).max().unwrap_or(-1)
 }
 
+fn base_tok<S: Sink>(w: &mut S, costs: Option<&CoefCosts>, cdf: &mut CdfContext, t: usize, chroma: usize, ctx: usize, s: u8) {
+    match costs {
+        Some(c) => w.add(c.base[t][chroma][ctx][s as usize] as u32),
+        None => w.symbol(s, &mut cdf.coef.base_tok[t][chroma][ctx], 3),
+    }
+}
+
+fn br_tok<S: Sink>(w: &mut S, costs: Option<&CoefCosts>, cdf: &mut CdfContext, hi: usize, chroma: usize, ctx: usize, tok: u8) {
+    match costs {
+        Some(c) => w.add(c.br[hi][chroma][ctx][tok as usize]),
+        None => w.hi_tok(tok, &mut cdf.coef.br_tok[hi][chroma][ctx]),
+    }
+}
+
+/// Codes a transform block's coefficients; with `costs` a counter takes the per-coefficient
+/// symbols from them instead of the CDFs.
 #[allow(clippy::too_many_arguments)]
 fn write_coefs<S: Sink>(
     w: &mut S,
     cdf: &mut CdfContext,
+    costs: Option<&CoefCosts>,
     a: &mut [u8],
     l: &mut [u8],
     plane: usize,
@@ -2511,7 +2533,7 @@ fn write_coefs<S: Sink>(
         if lv >= 3 {
             let far = if class == TxClass::TwoD { (x | y) > 1 } else { y != 0 };
             let ctx = if far { 14 } else { 7 };
-            w.hi_tok(cmp::min(lv, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
+            br_tok(w, costs, cdf, hi_ctx, chroma, ctx, cmp::min(lv, 15) as u8);
         }
         levels[level_off(rc, x, y)] = pack(lv);
         for i in (1..eob as usize).rev() {
@@ -2519,8 +2541,8 @@ fn write_coefs<S: Sink>(
             let off = level_off(rc, x, y);
             let mut mag = 0;
             let lo = get_lo_ctx(&levels[off..], class, &mut mag, offsets, x, y, stride as u8);
-            let lv = level_at(i);
-            w.symbol(cmp::min(lv, 3) as u8, &mut cdf.coef.base_tok[t_dim.ctx as usize][chroma][lo.get()], 3);
+            let lv = coefs[rc].unsigned_abs();
+            base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, lo.get(), cmp::min(lv, 3) as u8);
             if class == TxClass::TwoD {
                 y |= x;
             }
@@ -2528,7 +2550,7 @@ fn write_coefs<S: Sink>(
                 let mag = mag as u8 & 63;
                 let ctx = if y > (class == TxClass::TwoD) as u8 { 14 } else { 7 }
                     + if mag > 12 { 6 } else { (mag + 1) >> 1 } as usize;
-                w.hi_tok(cmp::min(lv, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
+                br_tok(w, costs, cdf, hi_ctx, chroma, ctx, cmp::min(lv, 15) as u8);
             }
             levels[off] = pack(lv);
         }
@@ -2539,21 +2561,21 @@ fn write_coefs<S: Sink>(
             get_lo_ctx(&levels, class, &mut mag, offsets, 0, 0, stride as u8).get()
         };
         let lv = level_at(0);
-        w.symbol(cmp::min(lv, 3) as u8, &mut cdf.coef.base_tok[t_dim.ctx as usize][chroma][lo], 3);
+        base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, lo, cmp::min(lv, 3) as u8);
         if lv >= 3 {
             if class == TxClass::TwoD {
                 mag = levels[1] as u32 + levels[stride] as u32 + levels[stride + 1] as u32;
             }
             let mag = mag as u8 & 63;
             let ctx = if mag > 12 { 6 } else { (mag + 1) >> 1 } as usize;
-            w.hi_tok(cmp::min(lv, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][ctx]);
+            br_tok(w, costs, cdf, hi_ctx, chroma, ctx, cmp::min(lv, 15) as u8);
         }
         dc_level = lv;
     } else {
         let lv = level_at(0);
         w.symbol((cmp::min(lv, 3) - 1) as u8, &mut cdf.coef.eob_base_tok[t_dim.ctx as usize][chroma][0], 2);
         if lv >= 3 {
-            w.hi_tok(cmp::min(lv, 15) as u8, &mut cdf.coef.br_tok[hi_ctx][chroma][0]);
+            br_tok(w, costs, cdf, hi_ctx, chroma, 0, cmp::min(lv, 15) as u8);
         }
         dc_level = lv;
     }
@@ -2806,6 +2828,48 @@ pub(crate) mod tests {
         f(&mut fr);
         let img = image(w, h, planes, seed);
         round_trip(&img, w, h, fr, Random { rng: Rng(seed * 7919 + 1), density: 30 });
+    }
+
+    #[test]
+    fn coef_costs_count_as_the_cdfs() {
+        let mut rng = Rng(7);
+        for qidx in [20u8, 100, 200] {
+            let mut cdf = rav1d_cdf_thread_copy(&rav1d_cdf_thread_init_static(qidx));
+            let costs = CoefCosts::new(&cdf.coef);
+            for _ in 0..3000 {
+                let tx = TxfmSize::from_repr(rng.below(TxfmSize::COUNT as u32) as usize).unwrap();
+                let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
+                let types: &[TxfmType] = if t_dim.max >= TxfmSize::S32x32 as u8 {
+                    &[DCT_DCT]
+                } else if t_dim.min == TxfmSize::S16x16 as u8 {
+                    &[DCT_DCT, IDTX]
+                } else {
+                    &[DCT_DCT, IDTX, 10, 11]
+                };
+                let txtp = types[rng.below(types.len() as u32) as usize];
+                let n = cmp::min(t_dim.w as usize * 4, 32) * cmp::min(t_dim.h as usize * 4, 32);
+                let dense = rng.below(4) + 1;
+                let coefs: Vec<i32> = (0..n)
+                    .map(|_| match rng.below(16 / dense) {
+                        0 => {
+                            let v = if rng.below(8) == 0 { rng.below(60) } else { rng.below(5) } as i32;
+                            if rng.below(2) == 0 { -v } else { v }
+                        }
+                        _ => 0,
+                    })
+                    .collect();
+                let eob = eob_of(tx, txtp, &coefs);
+                let plane = if t_dim.max > TxfmSize::S32x32 as u8 { 0 } else { rng.below(3) as usize };
+                let intra = Intra { y_mode: rng.below(13) as u8, ..Default::default() };
+                let count = |costs: Option<&CoefCosts>, cdf: &mut CdfContext| {
+                    let (mut a, mut l) = ([0x40u8; 48], [0x40u8; 48]);
+                    let mut c = Counter::default();
+                    write_coefs(&mut c, cdf, costs, &mut a, &mut l, plane, 0, 0, tx, BlockSize::Bs64x64, txtp, &coefs, eob, &intra, false, qidx, false, i32::MAX, i32::MAX);
+                    c.bits
+                };
+                assert_eq!(count(Some(&costs), &mut cdf), count(None, &mut cdf), "{tx:?} {txtp} eob {eob}");
+            }
+        }
     }
 
     #[test]

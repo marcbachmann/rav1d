@@ -1,6 +1,9 @@
 //! Rate and distortion: a sink that counts what the writer would spend, and libaom's λ.
 
 use crate::dequant_tables::DAV1D_DQ_TBL;
+use std::cmp;
+
+use crate::cdf::CdfCoefContext;
 use crate::enc::ec::{adapt, Writer};
 
 /// Where symbols go: the range writer, or a counter of their cost.
@@ -39,6 +42,11 @@ pub trait Sink {
             }
             rest -= 3;
         }
+    }
+
+    /// Bits from a cost table; only counters take them.
+    fn add(&mut self, _bits: u32) {
+        unreachable!("costs are counted, not written")
     }
 
     fn golomb(&mut self, v: u32) {
@@ -143,6 +151,51 @@ impl Sink for Counter {
 
     fn bools(&mut self, _: u32, n: u8) {
         self.bits += 512 * n as u32;
+    }
+
+    fn add(&mut self, bits: u32) {
+        self.bits += bits;
+    }
+}
+
+/// The costs of the symbols every coefficient codes, for one set of CDFs, as libaom's
+/// `av1_fill_coeff_costs`: base tokens by symbol, and the base-range ladder by level to 15.
+pub struct CoefCosts {
+    pub base: [[[[u16; 4]; 41]; 2]; 5],
+    pub br: [[[[u32; 16]; 21]; 2]; 4],
+}
+
+impl CoefCosts {
+    pub fn new(cdf: &CdfCoefContext) -> Box<Self> {
+        let mut c = Box::new(Self { base: [[[[0; 4]; 41]; 2]; 5], br: [[[[0; 16]; 21]; 2]; 4] });
+        c.fill(cdf);
+        c
+    }
+
+    pub fn fill(&mut self, cdf: &CdfCoefContext) {
+        let sym = |cdf: &[u16; 4], s: usize| {
+            let fl = if s > 0 { cdf[s - 1] as u32 } else { 32768 };
+            let fh = if s < 3 { cdf[s] as u32 } else { 0 };
+            cost(fl - fh)
+        };
+        for (out, cdfs) in self.base.iter_mut().flatten().flatten().zip(cdf.base_tok.0.iter().flatten().flatten()) {
+            *out = std::array::from_fn(|s| sym(cdfs, s) as u16);
+        }
+        for (out, cdfs) in self.br.iter_mut().flatten().flatten().zip(cdf.br_tok.0.iter().flatten().flatten()) {
+            for tok in 3..16usize {
+                let mut rest = tok - 3;
+                let mut bits = 0;
+                for _ in 0..4 {
+                    let br = cmp::min(rest, 3);
+                    bits += sym(cdfs, br);
+                    if br < 3 {
+                        break;
+                    }
+                    rest -= 3;
+                }
+                out[tok] = bits;
+            }
+        }
     }
 }
 
