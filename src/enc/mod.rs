@@ -60,6 +60,8 @@ pub struct Options {
     pub qidx: u8,
     /// Luma modes of the SATD ranking that go on to rate and distortion, all of them when 0.
     pub keep_modes: usize,
+    /// Chroma modes of the SATD ranking that go on to rate and distortion, all of them when 0.
+    pub keep_chroma: usize,
     /// Screen content tools: palettes.
     pub screen: bool,
     /// H and V partitions: 0 never, 1 always, 2 where Split beat None.
@@ -76,24 +78,30 @@ impl Options {
     /// The search for an effort of 0 (fastest) to 9, as libaom's `cpu-used` of 9 − effort.
     /// Measured on 256 px crops at qidx 120 against the full search (`doc/encoder-progress.md`).
     pub fn effort(qidx: u8, effort: u8, screen: bool) -> Self {
-        let (keep_modes, rect, levels, prune) = match effort {
-            8.. => (0, 1, 0..5, 0.0),
-            6..=7 => (4, 1, 0..5, 0.0),
-            4..=5 => (4, 2, 0..4, 0.0),
-            2..=3 => (3, 0, 0..4, 0.0),
-            _ => (2, 0, 0..4, 1.0),
+        let (keep_modes, keep_chroma, rect, levels, prune) = match effort {
+            8.. => (0, 0, 1, 0..5, 0.0),
+            6..=7 => (4, 0, 1, 0..5, 0.0),
+            4..=5 => (4, 4, 2, 0..4, 0.0),
+            2..=3 => (3, 3, 0, 0..4, 0.0),
+            _ => (2, 2, 0, 0..4, 1.0),
         };
-        Self { qidx, keep_modes, screen, rect, late_txtp: false, levels, prune }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune }
     }
 }
 
 /// A still picture of 8-bit planes: one plane is monochrome, three are 4:4:4 YCbCr, BT.601 full
 /// range, sRGB.
 pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Coded {
+    still_with(width, height, planes, options).finish()
+}
+
+/// `still` up to the last row pushed, the encoder kept for its statistics.
+pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Encoder<Rd> {
     let (seq, mut frame) = headers(width, height, planes.len() == 1, options.qidx);
     frame.screen_content = options.screen;
     let mut e = Encoder::new(seq, frame, Rd);
     e.keep_modes = options.keep_modes;
+    e.keep_chroma = options.keep_chroma;
     e.rect = options.rect;
     e.late_txtp = options.late_txtp;
     e.levels = options.levels.clone();
@@ -103,5 +111,5 @@ pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Co
         let rows: Vec<&[u8]> = planes.iter().map(|p| &p[y * w..][..w]).collect();
         e.push(&rows);
     }
-    e.finish()
+    e
 }

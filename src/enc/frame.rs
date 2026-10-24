@@ -377,6 +377,8 @@ pub struct Encoder<D: Decide> {
     predict_only: bool,
     /// Luma modes kept from the SATD ranking for rate and distortion, all when 0.
     pub keep_modes: usize,
+    /// Chroma modes kept from the SATD ranking for rate and distortion, all when 0.
+    pub keep_chroma: usize,
     /// Whether the search tries H and V partitions: 0 never, 1 always, 2 where Split beat None.
     pub rect: u8,
     /// Transform depths are compared with `DCT_DCT` only; the chosen one searches every type.
@@ -385,10 +387,16 @@ pub struct Encoder<D: Decide> {
     pub levels: Range<u8>,
     /// A block whose unsplit distortion is under `prune` bits' worth per 4×4 unit is not split.
     pub prune: f64,
+
     /// The colour indexes of the last block predicted with a palette, luma and chroma, a row of
     /// the block's width at a time.
     pal_map: [Vec<u8>; 2],
     bufs: Option<Box<Bufs>>,
+    /// Which part of the search runs, for `stats`.
+    stage: usize,
+    /// Residual searches and the coefficients they transformed, per stage: luma ranking, luma
+    /// depths, chroma, CfL, the block's final dry code, coding.
+    pub stats: [[u64; 2]; 6],
     lv: Option<Box<[i32; 32 * 32]>>,
     counter: Counter,
     cost_cdf: Box<CdfContext>,
@@ -446,10 +454,12 @@ impl<D: Decide> Encoder<D> {
             dct_only: false,
             predict_only: false,
             keep_modes: 0,
+            keep_chroma: 0,
             rect: 1,
             late_txtp: false,
             levels: 0..5,
             prune: 0.0,
+
             pal_map: [Vec::new(), Vec::new()],
             bufs: Some(Box::new(Bufs {
                 src: [0; 64 * 64],
@@ -460,6 +470,8 @@ impl<D: Decide> Encoder<D> {
                 cf: Coef([0; 32 * 32]),
             })),
             lv: Some(Box::new([0; 32 * 32])),
+            stage: 5,
+            stats: [[0; 2]; 6],
             counter: Counter::default(),
             cost_cdf,
             trial: None,
@@ -1202,6 +1214,8 @@ impl<D: Decide> Encoder<D> {
         let vw = cmp::min(pw, (self.seq.width as usize).saturating_sub(x0));
         let vh = cmp::min(ph, (self.seq.height as usize).saturating_sub(py as usize * 4));
         let n = levels.len();
+        self.stats[self.stage][0] += 1;
+        self.stats[self.stage][1] += (n * cands.len()) as u64;
         let mut b = self.bufs.take().unwrap();
         let Bufs { src, pred, residual, coefs, trial, cf } = &mut *b;
         for r in 0..ph {
@@ -1313,11 +1327,15 @@ impl<D: Decide> Encoder<D> {
     /// The sum of absolute 4×4 Hadamard coefficients of the luma residual in a block's visible
     /// area, rounded out to whole 4×4 blocks.
     fn satd(&self, x: i32, y: i32, w4: usize, h4: usize) -> u64 {
+        self.satd_plane(0, x, y, w4, h4)
+    }
+
+    fn satd_plane(&self, plane: usize, x: i32, y: i32, w4: usize, h4: usize) -> u64 {
         let x0 = x as usize * 4;
         let w = cmp::min(w4 * 4, (self.seq.width as usize).saturating_sub(x0)).next_multiple_of(4);
         let h = cmp::min(h4 * 4, (self.seq.height as usize).saturating_sub(y as usize * 4)).next_multiple_of(4);
         let wy = (y as usize * 4) % SB;
-        let (src, rec) = (&self.src[0], &self.rec[0]);
+        let (src, rec) = (&self.src[plane], &self.rec[plane]);
         let mut total = 0;
         for by in (0..h).step_by(4) {
             for bx in (0..w).step_by(4) {
@@ -1486,6 +1504,7 @@ impl<D: Decide> Encoder<D> {
             e.satd(x, y, w4, h4) as f64 + sad_lambda * bits as f64 / 512.0
         };
 
+        self.stage = 0;
         self.dct_only = true;
         let mut scored: Vec<(f64, Intra)> = (0..N_INTRA_PRED_MODES as u8)
             .map(|m| {
@@ -1531,6 +1550,7 @@ impl<D: Decide> Encoder<D> {
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
         self.dct_only = self.late_txtp;
+        self.stage = 1;
         let mut best_luma = (f64::MAX, scored[0].1, 0u8);
         for &(_, c) in scored.iter().take(2) {
             for depth in 0..=limits.max_depth {
@@ -1547,6 +1567,7 @@ impl<D: Decide> Encoder<D> {
             self.restore(&start);
             self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
             let luma_done = self.snap(x, y, w4, h4);
+            self.stage = 2;
             let chroma = |e: &mut Self, intra: &Intra| -> f64 {
                 e.restore(&luma_done);
                 let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 1..3);
@@ -1564,9 +1585,29 @@ impl<D: Decide> Encoder<D> {
                 e.rd_cost(dist, bits)
             };
             let mut best = (f64::MAX, intra);
-            for m in 0..N_UV_INTRA_PRED_MODES as u8 - 1 {
-                let mut c = Intra { uv_mode: m, uv_angle: 0, cfl: [0; 2], ..intra };
-                c.pal_sz[1] = 0;
+            let mut modes: Vec<(f64, Intra)> = (0..N_UV_INTRA_PRED_MODES as u8 - 1)
+                .map(|m| {
+                    let mut c = Intra { uv_mode: m, uv_angle: 0, cfl: [0; 2], ..intra };
+                    c.pal_sz[1] = 0;
+                    (0.0, c)
+                })
+                .collect();
+            let keep_chroma = self.keep_chroma;
+            if keep_chroma > 0 {
+                for m in modes.iter_mut() {
+                    self.restore(&luma_done);
+                    self.predict_only = true;
+                    self.predict_block(ti, bs, x, y, edge_flags, &m.1, depth, 1..3);
+                    self.predict_only = false;
+                    let mut c = Counter::default();
+                    write_chroma_modes(&mut c, &mut self.cost_cdf, &m.1, &limits);
+                    let satd = self.satd_plane(1, x, y, w4, h4) + self.satd_plane(2, x, y, w4, h4);
+                    m.0 = satd as f64 + sad_lambda * c.bits as f64 / 512.0;
+                }
+                modes.sort_by(|a, b| a.0.total_cmp(&b.0));
+                modes.truncate(keep_chroma);
+            }
+            for &(_, c) in &modes {
                 let cost = chroma(self, &c);
                 if cost < best.0 {
                     best = (cost, c);
@@ -1610,7 +1651,9 @@ impl<D: Decide> Encoder<D> {
 
         self.restore(&start);
         self.trial = Some((intra, depth));
+        self.stage = 4;
         self.code_b(ti, bs, x, y, edge_flags);
+        self.stage = 5;
         self.plan.push(Node::Block(intra, depth));
     }
 
@@ -2712,6 +2755,7 @@ pub(crate) mod tests {
         let options = crate::enc::Options {
             qidx,
             keep_modes: std::env::var("ENC_KEEP").map_or(0, |v| v.parse().unwrap()),
+            keep_chroma: std::env::var("ENC_KEEP_UV").map_or(0, |v| v.parse().unwrap()),
             screen: std::env::var("ENC_SCREEN").map_or(true, |v| v != "0"),
             rect: std::env::var("ENC_RECT").map_or(1, |v| v.parse().unwrap()),
             late_txtp: std::env::var("ENC_LATE").is_ok_and(|v| v == "1"),
@@ -2738,8 +2782,15 @@ pub(crate) mod tests {
             }
             let rows: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
             let t = std::time::Instant::now();
-            let c = crate::enc::still(w as u32, h as u32, &rows, &options);
+            let e = crate::enc::still_with(w as u32, h as u32, &rows, &options);
+            let stats = e.stats;
+            let c = e.finish();
             let t = t.elapsed().as_millis();
+            if std::env::var("ENC_STATS").is_ok() {
+                let px = (w * h) as f64;
+                let per = stats.map(|[n, c]| format!("{:.2}/{:.1}", n as f64 * 64.0 / px, c as f64 / px));
+                println!("  searches per 8x8 / coefficients per pixel: rank {} depth {} chroma {} final {} code {}", per[0], per[1], per[2], per[4], per[5]);
+            }
             let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));
             println!("{:20} {t:6} ms {:7} B {d:6.2} dB", path.file_stem().unwrap().to_string_lossy(), c.data.len());
             ms += t;
