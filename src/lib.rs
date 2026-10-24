@@ -98,6 +98,8 @@ mod cursor;
 mod data;
 mod decode;
 mod dequant_tables;
+#[cfg(feature = "encoder")]
+pub mod enc;
 pub(crate) mod disjoint_mut;
 pub(crate) mod enum_map;
 mod env;
