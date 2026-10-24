@@ -417,6 +417,8 @@ pub struct Encoder<D: Decide> {
     pub reduced_txtp: bool,
     /// See `Options::tx_domain_dist`.
     pub tx_domain_dist: bool,
+    /// See `Options::uv_from_luma`.
+    pub uv_from_luma: bool,
     /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
     pub levels: Range<u8>,
     /// A block whose unsplit cost, distortion and rate, is under `prune` bits' worth per 4×4 unit
@@ -551,6 +553,7 @@ impl<D: Decide> Encoder<D> {
             late_txtp: false,
             reduced_txtp: false,
             tx_domain_dist: false,
+            uv_from_luma: false,
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
@@ -1926,7 +1929,10 @@ impl<D: Decide> Encoder<D> {
                 })
                 .collect();
             let keep_chroma = self.keep_chroma;
-            if keep_chroma > 0 {
+            if self.uv_from_luma {
+                let y_mode = if intra.y_mode == FILTER_PRED { DC_PRED } else { intra.y_mode };
+                modes.retain(|m| UV_FROM_LUMA[y_mode as usize] >> m.1.uv_mode & 1 != 0);
+            } else if keep_chroma > 0 {
                 for m in modes.iter_mut() {
                     self.restore(&luma_done);
                     self.predict_only = true;
@@ -2384,6 +2390,11 @@ fn write_chroma_modes<S: Sink>(s: &mut S, cdf: &mut CdfContext, intra: &Intra, l
 struct Ac([i16; SCRATCH_AC_TXTP_LEN]);
 
 const EDGE_LEN: usize = 257;
+
+/// libaom's `av1_derived_chroma_intra_mode_used_flag` without CfL: DC, SMOOTH and the luma
+/// winner's own mode.
+const UV_FROM_LUMA: [u16; N_INTRA_PRED_MODES] =
+    [0x201, 0x203, 0x205, 0x209, 0x211, 0x221, 0x241, 0x281, 0x301, 0x201, 0x601, 0xa01, 0x1201];
 
 /// libaom's `av1_reduced_intra_tx_used_flag`: transform types by luma mode, bit per type.
 const REDUCED_INTRA_TXTP: [u16; N_INTRA_PRED_MODES] =
@@ -3240,6 +3251,7 @@ pub(crate) mod tests {
             late_txtp: std::env::var("ENC_LATE").is_ok_and(|v| v == "1"),
             reduced_txtp: std::env::var("ENC_REDUCED_TXTP").is_ok_and(|v| v == "1"),
             tx_domain_dist: std::env::var("ENC_TX_DOMAIN").is_ok_and(|v| v == "1"),
+            uv_from_luma: std::env::var("ENC_UV_FROM_LUMA").is_ok_and(|v| v == "1"),
             levels: std::env::var("ENC_LEVELS").map_or(0..5, |v| {
                 let (a, b) = v.split_once("..").unwrap();
                 a.parse().unwrap()..b.parse().unwrap()
