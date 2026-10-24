@@ -3,6 +3,7 @@
 pub mod ec;
 pub mod fdct;
 pub mod fdct_fast;
+pub mod filters;
 pub mod frame;
 pub mod header;
 pub mod palette;
@@ -92,6 +93,9 @@ pub struct Options {
     /// libaom's tune-IQ filters: no CDEF up to qindex 32 (`CDEF_ADAPTIVE`), deblocking sharpness
     /// 7 up to qindex 112 and 1 up to 160 (adaptive sharpness).
     pub iq_filters: bool,
+    /// Deblocking and CDEF strengths searched on the decoded picture (`filters::search`), as
+    /// libaom's full-image picks at cpu-used 5 and below; else they come from the qindex.
+    pub filter_search: bool,
 }
 
 impl Options {
@@ -106,7 +110,7 @@ impl Options {
             _ => (2, 2, 0, 0..4, 1.0),
         };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: false, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
     }
 }
 
@@ -148,7 +152,12 @@ fn chroma_qm_level(qidx: u8) -> u8 {
 /// A still picture of 8-bit planes: one plane is monochrome, three are 4:4:4 YCbCr, BT.601 full
 /// range, sRGB.
 pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Coded {
-    still_with(width, height, planes, options).finish()
+    let mut e = still_with(width, height, planes, options);
+    if options.filter_search && options.qidx != 0 {
+        e.flush();
+        filters::search(&mut e, planes);
+    }
+    e.finish()
 }
 
 /// `still` up to the last row pushed, the encoder kept for its statistics.

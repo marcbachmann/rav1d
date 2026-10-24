@@ -639,20 +639,35 @@ impl<D: Decide> Encoder<D> {
     }
 
     pub fn finish(mut self) -> Coded {
-        assert_eq!(self.rows, self.seq.height as usize);
-        if self.rows % SB != 0 {
-            let y = self.rows % SB;
-            for plane in &self.src {
-                let last = plane.row(y - 1, 0, plane.stride);
-                for r in y..SB {
-                    plane
-                        .comp
-                        .slice_mut::<BD, _>((r * plane.stride.., ..plane.stride))
-                        .copy_from_slice(&last);
-                }
-            }
-            self.code_sb_row();
+        self.flush();
+        Coded {
+            data: self.bytes(),
+            config: self.seq.config(),
+            recon: self.recon,
         }
+    }
+
+    /// Codes the last superblock row, its rows past the picture repeating its last one.
+    pub fn flush(&mut self) {
+        assert_eq!(self.rows, self.seq.height as usize);
+        if self.sby as u32 == self.frame.tiling.sbh {
+            return;
+        }
+        let y = self.rows % SB;
+        for plane in &self.src {
+            let last = plane.row(y - 1, 0, plane.stride);
+            for r in y..SB {
+                plane
+                    .comp
+                    .slice_mut::<BD, _>((r * plane.stride.., ..plane.stride))
+                    .copy_from_slice(&last);
+            }
+        }
+        self.code_sb_row();
+    }
+
+    /// The sequence header and frame OBUs of the tiles coded so far.
+    pub fn bytes(&self) -> Vec<u8> {
         let mut tile_data = Vec::new();
         let n = self.coded.len();
         let size_bytes = self
@@ -682,11 +697,7 @@ impl<D: Decide> Encoder<D> {
         let mut data = Vec::new();
         obu(OBU_SEQUENCE_HEADER, &self.seq.write(), &mut data);
         obu(OBU_FRAME, &payload, &mut data);
-        Coded {
-            data,
-            config: self.seq.config(),
-            recon: self.recon,
-        }
+        data
     }
 
     fn code_sb_row(&mut self) {
@@ -3037,6 +3048,7 @@ pub(crate) mod tests {
             iq_rdmult: std::env::var("ENC_IQ_RDMULT").is_ok_and(|v| v == "1"),
             skip_prediction: std::env::var("ENC_SKIP_PRED").map_or(true, |v| v != "0"),
             iq_filters: std::env::var("ENC_IQ_FILTERS").is_ok_and(|v| v == "1"),
+            filter_search: std::env::var("ENC_FILTER_SEARCH").is_ok_and(|v| v == "1"),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
         files.sort();
@@ -3055,8 +3067,12 @@ pub(crate) mod tests {
             }
             let rows: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
             let t = std::time::Instant::now();
-            let e = crate::enc::still_with(w as u32, h as u32, &rows, &options);
+            let mut e = crate::enc::still_with(w as u32, h as u32, &rows, &options);
             let stats = e.stats;
+            if options.filter_search {
+                e.flush();
+                crate::enc::filters::search(&mut e, &rows);
+            }
             let c = e.finish();
             let t = t.elapsed().as_millis();
             if std::env::var("ENC_STATS").is_ok() {
@@ -3156,6 +3172,29 @@ pub(crate) mod tests {
         let (a, b) = (code(&plain), code(&iq));
         eprintln!("tune iq: plain {} B {:.2} dB, tune iq {} B {:.2} dB", a.0, a.1, b.0, b.1);
         assert!(b.0 < a.0 && b.1 > a.1 - 3.0);
+    }
+
+    /// Gradient squares 20 px wide, their edges off the 8×8 grid: deblocking and CDEF from the
+    /// qindex blur the edges, the searched strengths keep them.
+    #[test]
+    fn filter_search() {
+        let (w, h) = (160, 120);
+        let img: Vec<Vec<u8>> = (0..3)
+            .map(|p| (0..w * h).map(|i| {
+                let (x, y) = (i % w, i / w);
+                let base = (x + 2 * y + 60 * p) as u8;
+                if (x / 20 + y / 20) % 2 == 0 { base } else { base.wrapping_add(90) }
+            }).collect())
+            .collect();
+        let planes: Vec<&[u8]> = img.iter().map(|p| p.as_slice()).collect();
+        let code = |search: bool| {
+            let o = crate::enc::Options { filter_search: search, ..crate::enc::Options::effort(144, 4, false) };
+            let c = crate::enc::still(w as u32, h as u32, &planes, &o);
+            (c.data.len(), psnr(&img, &decode_with(c.data.clone(), w, h, 3, true)))
+        };
+        let (from_q, searched) = (code(false), code(true));
+        eprintln!("filter search: from q {from_q:?}, searched {searched:?}");
+        assert!(searched.0.abs_diff(from_q.0) <= 2 && searched.1 > from_q.1 + 0.5);
     }
 
     /// libaom's limits: a 16×16 DC of 128 per level against 68/128 of the DC step, and a mean
