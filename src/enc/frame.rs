@@ -38,10 +38,10 @@ use crate::levels::{
     SMOOTH_PRED, SMOOTH_V_PRED, VERT_LEFT_PRED, VERT_PRED, WHT_WHT,
 };
 use crate::qm::DAV1D_QM_TBL;
-use crate::recon::{get_dc_sign_ctx, get_lo_ctx, get_skip_ctx};
+use crate::recon::{get_dc_sign_ctx, get_skip_ctx};
 use crate::scan::DAV1D_SCANS;
 use crate::tables::{
-    TxfmInfo, CFL_ALLOWED_MASK, DAV1D_AL_PART_CTX, DAV1D_BLOCK_SIZES, DAV1D_FILTER_MODE_TO_Y_MODE,
+    LoCtxOffset, TxfmInfo, CFL_ALLOWED_MASK, DAV1D_AL_PART_CTX, DAV1D_BLOCK_SIZES, DAV1D_FILTER_MODE_TO_Y_MODE,
     DAV1D_INTRA_MODE_CONTEXT, DAV1D_LO_CTX_OFFSETS, DAV1D_MAX_TXFM_SIZE_FOR_BS,
     DAV1D_PARTITION_TYPE_COUNT, DAV1D_TXFM_DIMENSIONS, DAV1D_TXTP_FROM_UVMODE,
     DAV1D_TX_TYPES_PER_SET, DAV1D_TX_TYPE_CLASS,
@@ -2536,6 +2536,58 @@ fn scan_index(tx: TxfmSize, class: TxClass) -> &'static [u16] {
     &tables[tx as usize * 3 + c]
 }
 
+/// Coding order per transform size and class: coefficient index, x, y, and the offset in
+/// `write_coefs`' level buffer.
+fn scan_table(tx: TxfmSize, class: TxClass) -> &'static [(u16, u8, u8, u16)] {
+    static TABLES: std::sync::OnceLock<Vec<Vec<(u16, u8, u8, u16)>>> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        (0..TxfmSize::COUNT * 3)
+            .map(|k| {
+                let tx = TxfmSize::from_repr(k / 3).unwrap();
+                let class = [TxClass::TwoD, TxClass::H, TxClass::V][k % 3];
+                let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
+                let n = cmp::min(t_dim.w as usize * 4, 32) * cmp::min(t_dim.h as usize * 4, 32);
+                (0..n)
+                    .map(|i| {
+                        let (rc, x, y) = scan_rc(tx, class, i);
+                        let off = if class == TxClass::TwoD { rc } else { x as usize * 16 + y as usize };
+                        (rc as u16, x, y, off as u16)
+                    })
+                    .collect()
+            })
+            .collect()
+    });
+    let c = match class {
+        TxClass::TwoD => 0,
+        TxClass::H => 1,
+        TxClass::V => 2,
+    };
+    &tables[tx as usize * 3 + c]
+}
+
+/// rav1d's `get_lo_ctx` at `off` in the level buffer: the base token context and the
+/// neighbourhood magnitude the base-range context takes.
+#[inline(always)]
+fn lo_ctx(levels: &[u8], off: usize, offsets: Option<&[[LoCtxOffset; 32]; 32]>, x: u8, y: u8, stride: usize) -> (usize, u32) {
+    let l = |d: usize| levels[off + d] as u32;
+    let mut mag = l(1) + l(stride);
+    let (hi, offset) = match offsets {
+        Some(o) => {
+            mag += l(stride + 1);
+            let hi = mag;
+            mag += l(2) + l(2 * stride);
+            (hi, o[y as usize][x as usize].get() as usize)
+        }
+        None => {
+            mag += l(2);
+            let hi = mag;
+            mag += l(3) + l(4);
+            (hi, 26 + if y > 1 { 10 } else { y as usize * 5 })
+        }
+    };
+    (offset + if mag > 512 { 4 } else { ((mag + 64) >> 7) as usize }, hi)
+}
+
 fn eob_of(tx: TxfmSize, txtp: TxfmType, levels: &[i32]) -> i32 {
     let index = scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]);
     levels.iter().zip(index).filter(|(&l, _)| l != 0).map(|(_, &i)| i as i32).max().unwrap_or(-1)
@@ -2639,7 +2691,8 @@ fn write_coefs<S: Sink>(
         w.bools(eob & ((1 << (bin - 2)) - 1), bin - 2);
     }
 
-    let level_at = |i: usize| coefs[scan_rc(tx, class, i).0].unsigned_abs();
+    let scan = scan_table(tx, class);
+    let level_at = |i: usize| coefs[scan[i].0 as usize].unsigned_abs();
     let pack = |l: u32| ((cmp::min(l, 3) << 6) | cmp::min(l, 15)) as u8;
     let hi_ctx = cmp::min(t_dim.ctx, 3) as usize;
     let mut levels = [0u8; 1088];
@@ -2650,16 +2703,9 @@ fn write_coefs<S: Sink>(
     } else {
         None
     };
-    let level_off = |rc: usize, x: u8, y: u8| {
-        if class == TxClass::TwoD {
-            rc
-        } else {
-            x as usize * stride + y as usize
-        }
-    };
     let dc_level;
     if eob > 0 {
-        let (rc, x, y) = scan_rc(tx, class, eob as usize);
+        let (_, x, y, off) = scan[eob as usize];
         let lv = level_at(eob as usize);
         let ctx = 1 + (eob > (2 << tx2dszctx)) as usize + (eob > (4 << tx2dszctx)) as usize;
         w.symbol((cmp::min(lv, 3) - 1) as u8, &mut cdf.coef.eob_base_tok[t_dim.ctx as usize][chroma][ctx], 2);
@@ -2668,14 +2714,13 @@ fn write_coefs<S: Sink>(
             let ctx = if far { 14 } else { 7 };
             br_tok(w, costs, cdf, hi_ctx, chroma, ctx, cmp::min(lv, 15) as u8);
         }
-        levels[level_off(rc, x, y)] = pack(lv);
+        levels[off as usize] = pack(lv);
         for i in (1..eob as usize).rev() {
-            let (rc, x, mut y) = scan_rc(tx, class, i);
-            let off = level_off(rc, x, y);
-            let mut mag = 0;
-            let lo = get_lo_ctx(&levels[off..], class, &mut mag, offsets, x, y, stride as u8);
-            let lv = coefs[rc].unsigned_abs();
-            base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, lo.get(), cmp::min(lv, 3) as u8);
+            let (rc, x, mut y, off) = scan[i];
+            let off = off as usize;
+            let (lo, mag) = lo_ctx(&levels, off, offsets, x, y, stride);
+            let lv = coefs[rc as usize].unsigned_abs();
+            base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, lo, cmp::min(lv, 3) as u8);
             if class == TxClass::TwoD {
                 y |= x;
             }
@@ -2687,12 +2732,7 @@ fn write_coefs<S: Sink>(
             }
             levels[off] = pack(lv);
         }
-        let mut mag = 0;
-        let lo = if class == TxClass::TwoD {
-            0
-        } else {
-            get_lo_ctx(&levels, class, &mut mag, offsets, 0, 0, stride as u8).get()
-        };
+        let (lo, mut mag) = if class == TxClass::TwoD { (0, 0) } else { lo_ctx(&levels, 0, offsets, 0, 0, stride) };
         let lv = level_at(0);
         base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, lo, cmp::min(lv, 3) as u8);
         if lv >= 3 {
@@ -2726,8 +2766,8 @@ fn write_coefs<S: Sink>(
         dc_sign_level = if dc < 0 { 0 } else { 0x80 };
         cul_level = dc_level;
     }
-    for i in 1..=eob as usize {
-        let v = coefs[scan_rc(tx, class, i).0];
+    for &(rc, ..) in &scan[1..=eob as usize] {
+        let v = coefs[rc as usize];
         if v == 0 {
             continue;
         }
