@@ -327,7 +327,8 @@ impl Decide for Rd {
 #[derive(Clone, Copy, Debug)]
 enum Node {
     Part(BlockPartition),
-    Block(Intra, u8),
+    /// Modes, transform depth, and the index of the block's residuals in `Encoder::chosen`.
+    Block(Intra, u8, usize),
 }
 
 pub struct Coded {
@@ -360,6 +361,7 @@ struct Snap {
 }
 
 /// A transform block decided while predicting, before its symbols are written.
+#[derive(Clone)]
 struct TxDone {
     plane: usize,
     x4: i32,
@@ -387,6 +389,10 @@ pub struct Encoder<D: Decide> {
     scratch: Plane,
     /// `scratch` holds the reconstruction of the levels `rd_residual` chose.
     recon_ready: bool,
+    /// Residuals to take instead of searching, last first: a block the search already decided.
+    replay: Option<Vec<TxDone>>,
+    /// The residuals of the planned blocks of the superblock.
+    chosen: Vec<Vec<TxDone>>,
     /// The bits of the levels `rd_residual` chose.
     residual_bits: Option<u32>,
     edge: DisjointMut<AlignedVec64<u8>>,
@@ -539,6 +545,8 @@ impl<D: Decide> Encoder<D> {
             rec,
             scratch: Plane::new(SB, SB),
             recon_ready: false,
+            replay: None,
+            chosen: Vec::new(),
             residual_bits: None,
             edge: DisjointMut::new(edge),
             edge_stride: stride,
@@ -905,7 +913,7 @@ impl<D: Decide> Encoder<D> {
         let tile = &mut self.tiles[ti];
         Self::write_partition(&mut tile.w, &mut tile.cdf, bl, ctx, halves, bp);
         self.code_partition(ti, bl, bp, x, y, edge_index, halves, &mut |e, ti, bs, x, y, f| {
-            e.code_b(ti, bs, x, y, f)
+            e.code_b(ti, bs, x, y, f);
         });
     }
 
@@ -1050,7 +1058,7 @@ impl<D: Decide> Encoder<D> {
     }
 
     /// Codes one block: predicts and reconstructs it, then writes it, or counts it when dry.
-    fn code_b(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) {
+    fn code_b(&mut self, ti: usize, bs: BlockSize, x: i32, y: i32, edge_flags: EdgeFlags) -> Vec<TxDone> {
         let b_dim = bs.dimensions();
         self.block_lambda(x, y, b_dim[0] as usize, b_dim[1] as usize);
         let (limits, max_tx) = self.limits(bs);
@@ -1058,7 +1066,10 @@ impl<D: Decide> Encoder<D> {
             self.trial.unwrap()
         } else if self.decide.searches() {
             match self.next_node() {
-                Node::Block(intra, depth) => (intra, depth),
+                Node::Block(intra, depth, k) => {
+                    self.replay = Some(std::mem::take(&mut self.chosen[k]).into_iter().rev().collect());
+                    (intra, depth)
+                }
                 n => panic!("plan has {n:?} where a block is due"),
             }
         } else {
@@ -1066,6 +1077,8 @@ impl<D: Decide> Encoder<D> {
         };
         assert!(depth <= limits.max_depth);
         let txs = self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..self.planes);
+        debug_assert!(self.replay.as_ref().is_none_or(|r| r.is_empty()));
+        self.replay = None;
         let skip = txs.iter().all(|t| t.eob < 0);
         let b = BlockWrite {
             bs,
@@ -1095,6 +1108,7 @@ impl<D: Decide> Encoder<D> {
                 tile.last_qidx = self.sb_qidx;
             }
         }
+        txs
     }
 
     /// Predicts and reconstructs the given planes of a block, choosing every transform block's
@@ -1364,6 +1378,14 @@ impl<D: Decide> Encoder<D> {
                 self.residual_bits = None;
                 let decided = if self.predict_only {
                     Some(fixed_txtp)
+                } else if let Some(replay) = self.replay.as_mut() {
+                    let t = replay.pop().expect("a replayed residual per transform block");
+                    debug_assert!(t.plane == plane && t.tx == tx && (t.x4, t.y4) == (px, py));
+                    if t.eob >= 0 {
+                        levels.copy_from_slice(&t.coefs.levels);
+                    }
+                    self.residual_bits = t.bits;
+                    Some(t.coefs.txtp)
                 } else if self.dry || self.decide.searches() {
                     None
                 } else {
@@ -1776,6 +1798,7 @@ impl<D: Decide> Encoder<D> {
     /// Searches the superblock and leaves its plan to be coded.
     fn search_sb(&mut self, ti: usize, x: i32, y: i32) {
         self.plan.clear();
+        self.chosen.clear();
         self.next = 0;
         let s = self.snap(x, y, 16, 16);
         self.dry = true;
@@ -1874,19 +1897,19 @@ impl<D: Decide> Encoder<D> {
             c.bits
         };
 
-        let luma = |e: &mut Self, intra: &Intra, depth: u8| -> f64 {
+        let luma = |e: &mut Self, intra: &Intra, depth: u8| -> (f64, Vec<TxDone>) {
             e.restore(&start);
             let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 0..1);
             let bits = mode_bits(e, intra, depth) + coef_bits(e, &txs, bs, intra);
             let dist = e.sse(x, y, w4, h4, 0..1);
-            e.rd_cost(dist, bits)
+            (e.rd_cost(dist, bits), txs)
         };
 
         let keep = self.keep_modes;
         let sad_lambda = self.lambda.sqrt();
         let score = |e: &mut Self, intra: &Intra| -> f64 {
             if keep == 0 {
-                return luma(e, intra, 0);
+                return luma(e, intra, 0).0;
             }
             e.restore(&start);
             e.predict_only = true;
@@ -1946,18 +1969,20 @@ impl<D: Decide> Encoder<D> {
         if keep > 0 {
             scored.truncate(keep);
             for s in scored.iter_mut() {
-                s.0 = luma(self, &s.1, 0);
+                s.0 = luma(self, &s.1, 0).0;
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
         self.dct_only = self.late_txtp;
         self.stage = 1;
         let mut best_luma = (f64::MAX, scored[0].1, 0u8);
+        let mut luma_txs = Vec::new();
         for &(_, c) in scored.iter().take(2) {
             for depth in 0..=limits.max_depth {
-                let cost = luma(self, &c, depth);
+                let (cost, txs) = luma(self, &c, depth);
                 if cost < best_luma.0 {
                     best_luma = (cost, c, depth);
+                    luma_txs = txs;
                 }
                 if self.skip_predicted {
                     break;
@@ -1966,13 +1991,21 @@ impl<D: Decide> Encoder<D> {
         }
         self.dct_only = false;
         let (_, mut intra, depth) = best_luma;
+        let mut chroma_txs = Vec::new();
+        if self.late_txtp {
+            self.restore(&start);
+            luma_txs = self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
+        } else if limits.chroma {
+            self.restore(&start);
+            self.replay = Some(luma_txs.iter().rev().cloned().collect());
+            self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
+            self.replay = None;
+        }
 
         if limits.chroma {
-            self.restore(&start);
-            self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
             let luma_done = self.snap(x, y, w4, h4);
             self.stage = 2;
-            let chroma = |e: &mut Self, intra: &Intra| -> f64 {
+            let chroma = |e: &mut Self, intra: &Intra| -> (f64, Vec<TxDone>) {
                 e.restore(&luma_done);
                 let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 1..3);
                 let mut c = Counter::default();
@@ -1986,7 +2019,7 @@ impl<D: Decide> Encoder<D> {
                 }
                 let bits = c.bits + coef_bits(e, &txs, bs, intra);
                 let dist = e.sse(x, y, w4, h4, 1..3);
-                e.rd_cost(dist, bits)
+                (e.rd_cost(dist, bits), txs)
             };
             let mut best = (f64::MAX, intra);
             let mut modes: Vec<(f64, Intra)> = (0..N_UV_INTRA_PRED_MODES as u8 - 1)
@@ -2015,18 +2048,20 @@ impl<D: Decide> Encoder<D> {
                 modes.truncate(keep_chroma);
             }
             for &(_, c) in &modes {
-                let cost = chroma(self, &c);
+                let (cost, txs) = chroma(self, &c);
                 if cost < best.0 {
                     best = (cost, c);
+                    chroma_txs = txs;
                 }
             }
             if limits.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&best.1.uv_mode) {
                 let d = best.1;
                 for a in [-3, -2, -1, 1, 2, 3] {
                     let c = Intra { uv_angle: a, ..d };
-                    let cost = chroma(self, &c);
+                    let (cost, txs) = chroma(self, &c);
                     if cost < best.0 {
                         best = (cost, c);
+                        chroma_txs = txs;
                     }
                 }
             }
@@ -2037,9 +2072,10 @@ impl<D: Decide> Encoder<D> {
                     c.pal_sz[1] = pu.len() as u8;
                     c.pal[1][..pu.len()].copy_from_slice(&pu);
                     c.pal[2][..pv.len()].copy_from_slice(&pv);
-                    let cost = chroma(self, &c);
+                    let (cost, txs) = chroma(self, &c);
                     if cost < best.0 {
                         best = (cost, c);
+                        chroma_txs = txs;
                     }
                 }
             }
@@ -2047,9 +2083,10 @@ impl<D: Decide> Encoder<D> {
                 let alphas = self.cfl_alphas(ti, bs, x, y, &intra, depth, &luma_done);
                 if alphas != [0, 0] {
                     let c = Intra { uv_mode: CFL_PRED, uv_angle: 0, cfl: alphas, ..intra };
-                    let cost = chroma(self, &c);
+                    let (cost, txs) = chroma(self, &c);
                     if cost < best.0 {
                         best = (cost, c);
+                        chroma_txs = txs;
                     }
                 }
             }
@@ -2059,9 +2096,12 @@ impl<D: Decide> Encoder<D> {
         self.restore(&start);
         self.trial = Some((intra, depth));
         self.stage = 4;
-        self.code_b(ti, bs, x, y, edge_flags);
+        luma_txs.extend(chroma_txs);
+        self.replay = Some(luma_txs.into_iter().rev().collect());
+        let txs = self.code_b(ti, bs, x, y, edge_flags);
         self.stage = 5;
-        self.plan.push(Node::Block(intra, depth));
+        self.chosen.push(txs);
+        self.plan.push(Node::Block(intra, depth, self.chosen.len() - 1));
     }
 
     /// CfL alphas that best predict each chroma plane from the reconstructed luma.
