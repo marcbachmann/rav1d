@@ -419,6 +419,8 @@ pub struct Encoder<D: Decide> {
     pub tx_domain_dist: bool,
     /// See `Options::uv_from_luma`.
     pub uv_from_luma: bool,
+    /// See `Options::prune_intra`.
+    pub prune_intra: bool,
     /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
     pub levels: Range<u8>,
     /// A block whose unsplit cost, distortion and rate, is under `prune` bits' worth per 4×4 unit
@@ -554,6 +556,7 @@ impl<D: Decide> Encoder<D> {
             reduced_txtp: false,
             tx_domain_dist: false,
             uv_from_luma: false,
+            prune_intra: false,
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
@@ -1839,7 +1842,9 @@ impl<D: Decide> Encoder<D> {
 
         self.stage = 0;
         self.dct_only = true;
+        let prune_intra = self.prune_intra;
         let mut scored: Vec<(f64, Intra)> = (0..N_INTRA_PRED_MODES as u8)
+            .filter(|&m| !(prune_intra && matches!(m, SMOOTH_V_PRED | SMOOTH_H_PRED)))
             .map(|m| {
                 let c = Intra { y_mode: m, ..Default::default() };
                 (score(self, &c), c)
@@ -1861,7 +1866,11 @@ impl<D: Decide> Encoder<D> {
             }
         }
         if limits.filter {
+            let best_so_far = scored[0].1.y_mode as usize;
             for f in 0..5 {
+                if prune_intra && FILTER_FROM_BEST[best_so_far] >> f & 1 == 0 {
+                    continue;
+                }
                 let c = Intra { y_mode: FILTER_PRED, y_angle: f, ..Default::default() };
                 scored.push((score(self, &c), c));
             }
@@ -2390,6 +2399,10 @@ fn write_chroma_modes<S: Sink>(s: &mut S, cdf: &mut CdfContext, intra: &Intra, l
 struct Ac([i16; SCRATCH_AC_TXTP_LEN]);
 
 const EDGE_LEN: usize = 257;
+
+/// libaom's `av1_derived_filter_intra_mode_used_flag`: FILTER_DC and the filter mode of the best
+/// mode so far.
+const FILTER_FROM_BEST: [u8; N_INTRA_PRED_MODES] = [0x01, 0x03, 0x05, 0x01, 0x01, 0x01, 0x09, 0x01, 0x01, 0x01, 0x01, 0x01, 0x11];
 
 /// libaom's `av1_derived_chroma_intra_mode_used_flag` without CfL: DC, SMOOTH and the luma
 /// winner's own mode.
@@ -3252,6 +3265,7 @@ pub(crate) mod tests {
             reduced_txtp: std::env::var("ENC_REDUCED_TXTP").is_ok_and(|v| v == "1"),
             tx_domain_dist: std::env::var("ENC_TX_DOMAIN").is_ok_and(|v| v == "1"),
             uv_from_luma: std::env::var("ENC_UV_FROM_LUMA").is_ok_and(|v| v == "1"),
+            prune_intra: std::env::var("ENC_PRUNE_INTRA").is_ok_and(|v| v == "1"),
             levels: std::env::var("ENC_LEVELS").map_or(0..5, |v| {
                 let (a, b) = v.split_once("..").unwrap();
                 a.parse().unwrap()..b.parse().unwrap()

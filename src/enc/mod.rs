@@ -81,6 +81,9 @@ pub struct Options {
     /// libaom's `prune_chroma_modes_using_luma_winner`: chroma tries DC, SMOOTH, CfL and the luma
     /// winner's mode.
     pub uv_from_luma: bool,
+    /// libaom's `disable_smooth_intra` and `prune_filter_intra_level` 1: no SMOOTH_V or SMOOTH_H,
+    /// and filter intra only as DC or the filter mode of the best mode so far.
+    pub prune_intra: bool,
     /// See `Encoder::levels`: 0 is 64×64, 4 the 4×4 blocks of a split 8×8.
     pub levels: std::ops::Range<u8>,
     /// See `Encoder::prune`; 0 tries every partition.
@@ -123,7 +126,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (0, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
     }
 }
 
@@ -214,6 +217,7 @@ pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) 
     e.reduced_txtp = options.reduced_txtp;
     e.tx_domain_dist = options.tx_domain_dist;
     e.uv_from_luma = options.uv_from_luma;
+    e.prune_intra = options.prune_intra;
     e.levels = options.levels.clone();
     e.variance_boost = boost;
     e.rdoq = options.rdoq;
