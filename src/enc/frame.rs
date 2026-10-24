@@ -357,6 +357,10 @@ pub struct Encoder<D: Decide> {
     dry: bool,
     /// While searching modes, only `DCT_DCT` is tried where the type is coded.
     dct_only: bool,
+    /// Prediction alone, no residual: ranks luma modes by SATD before rate and distortion.
+    predict_only: bool,
+    /// Luma modes kept from the SATD ranking for rate and distortion, all when 0.
+    pub keep_modes: usize,
     counter: Counter,
     cost_cdf: Box<CdfContext>,
     trial: Option<(Intra, u8)>,
@@ -411,6 +415,8 @@ impl<D: Decide> Encoder<D> {
             lambda: 1.0,
             dry: false,
             dct_only: false,
+            predict_only: false,
+            keep_modes: 0,
             counter: Counter::default(),
             cost_cdf,
             trial: None,
@@ -1032,12 +1038,15 @@ impl<D: Decide> Encoder<D> {
                 let (pw, ph) = (tw as usize * 4, th as usize * 4);
                 let n = cmp::min(pw, 32) * cmp::min(ph, 32);
                 let mut levels = vec![0i32; n];
-                let decided = if self.dry || self.decide.searches() {
+                let decided = if self.predict_only {
+                    Some(fixed_txtp)
+                } else if self.dry || self.decide.searches() {
                     None
                 } else {
                     self.decide.residual(plane, tx, set, &mut levels)
                 };
                 let txtp = match decided {
+                    Some(t) if self.predict_only => t,
                     Some(t) if set.is_empty() => {
                         let _ = t;
                         fixed_txtp
@@ -1093,16 +1102,23 @@ impl<D: Decide> Encoder<D> {
         let x0 = px as usize * 4;
         let vw = cmp::min(pw, (self.seq.width as usize).saturating_sub(x0));
         let vh = cmp::min(ph, (self.seq.height as usize).saturating_sub(py as usize * 4));
-        let mut src = Vec::with_capacity(pw * ph);
-        let mut pred = Vec::with_capacity(pw * ph);
-        self.src[plane].read(x0, wy, pw, ph, &mut src);
-        self.rec[plane].read(x0, wy, pw, ph, &mut pred);
-        let residual: Vec<i16> = src.iter().zip(&pred).map(|(&s, &p)| s as i16 - p as i16).collect();
-        let sse = |a: &[u8], b: &[u8]| -> u64 {
+        let n = levels.len();
+        let mut src = Px([0; 64 * 64]);
+        let mut pred = Px([0; 64 * 64]);
+        let mut residual = Res([0; 64 * 64]);
+        for r in 0..ph {
+            let at = (wy + r) * self.src[plane].stride + x0;
+            src.0[r * pw..][..pw].copy_from_slice(&self.src[plane].comp.slice::<BD, _>((at.., ..pw)));
+            pred.0[r * pw..][..pw].copy_from_slice(&self.rec[plane].comp.slice::<BD, _>((at.., ..pw)));
+        }
+        for i in 0..pw * ph {
+            residual.0[i] = src.0[i] as i16 - pred.0[i] as i16;
+        }
+        let sse = |a: &[u8], b: &[u8], stride: usize| -> u64 {
             let mut s = 0;
             for r in 0..vh {
                 for c in 0..vw {
-                    let d = a[r * pw + c] as i32 - b[r * pw + c] as i32;
+                    let d = a[r * pw + c] as i32 - b[r * stride + c] as i32;
                     s += (d * d) as u64;
                 }
             }
@@ -1116,43 +1132,41 @@ impl<D: Decide> Encoder<D> {
             l0[..16].copy_from_slice(&l[(py & 15) as usize..][..16]);
             (a0, l0)
         };
-        let n = levels.len();
         let lossless = self.frame.quant.lossless();
         let rate = |e: &mut Self, txtp: TxfmType, lv: &[i32], eob: i32| -> u32 {
             let (mut a, mut l) = (a0, l0);
             let mut c = Counter::default();
-            let coefs = Coefs { txtp, levels: lv.to_vec() };
-            write_coefs(&mut c, &mut e.cost_cdf, &mut a, &mut l, plane, 0, 0, tx, bs, &coefs, eob, intra, lossless, e.frame.quant.base, e.frame.reduced_tx_set, i32::MAX, i32::MAX);
+            write_coefs(&mut c, &mut e.cost_cdf, &mut a, &mut l, plane, 0, 0, tx, bs, txtp, lv, eob, intra, lossless, e.frame.quant.base, e.frame.reduced_tx_set, i32::MAX, i32::MAX);
             c.bits
         };
-        let zero_rate = rate(self, cands[0], &vec![0; n], -1);
-        let zero = if lossless { f64::MAX } else { sse(&src, &pred) as f64 + self.lambda * zero_rate as f64 / 512.0 };
-        let mut best = (zero, cands[0], vec![0; n]);
+        let zero_rate = rate(self, cands[0], &[], -1);
+        let zero = if lossless { f64::MAX } else { sse(&src.0, &pred.0, pw) as f64 + self.lambda * zero_rate as f64 / 512.0 };
+        let mut best = (zero, cands[0]);
+        levels.fill(0);
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
-        let mut coefs = vec![0i32; n];
-        let mut trial = vec![0i32; n];
+        let mut coefs = Lv([0; 32 * 32]);
+        let mut trial = Lv([0; 32 * 32]);
         for &txtp in cands {
-            fdct::forward(&residual, pw, &mut coefs, tx, txtp);
+            fdct::forward(&residual.0[..pw * ph], pw, &mut coefs.0[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
-            quantize(&coefs, &mut trial, self.dq[plane], qm, shift, if lossless { 64 } else { 48 });
-            let eob = eob_of(tx, txtp, &trial);
+            quantize(&coefs.0[..n], &mut trial.0[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 });
+            let eob = eob_of(tx, txtp, &trial.0[..n]);
             if eob < 0 {
                 continue;
             }
-            let bits = rate(self, txtp, &trial, eob);
+            let bits = rate(self, txtp, &trial.0[..n], eob);
             let mut cf = Coef([0; 32 * 32]);
-            self.dequant(plane, tx, txtp, &trial, &mut cf.0[..n]);
-            self.scratch.write(0, 0, pw, ph, &pred);
+            self.dequant(plane, tx, txtp, &trial.0[..n], &mut cf.0[..n]);
+            self.scratch.write(0, 0, pw, ph, &pred.0[..pw * ph]);
             let dst = self.scratch.comp.with_offset::<BD>();
             self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
-            let mut rec = Vec::with_capacity(pw * ph);
-            self.scratch.read(0, 0, pw, ph, &mut rec);
-            let cost = sse(&src, &rec) as f64 + self.lambda * bits as f64 / 512.0;
+            let dist = sse(&src.0, &self.scratch.comp.slice::<BD, _>((0.., ..SB * SB)), SB);
+            let cost = dist as f64 + self.lambda * bits as f64 / 512.0;
             if cost < best.0 {
-                best = (cost, txtp, trial.clone());
+                best = (cost, txtp);
+                levels.copy_from_slice(&trial.0[..n]);
             }
         }
-        levels.copy_from_slice(&best.2);
         best.1
     }
 
@@ -1188,6 +1202,32 @@ impl<D: Decide> Encoder<D> {
                 let s = self.src[p].comp.slice::<BD, _>(((wy + r) * self.src[p].stride + x0.., ..w));
                 let d = self.rec[p].comp.slice::<BD, _>(((wy + r) * self.rec[p].stride + x0.., ..w));
                 total += s.iter().zip(d.iter()).map(|(&a, &b)| ((a as i32 - b as i32).pow(2)) as u64).sum::<u64>();
+            }
+        }
+        total
+    }
+
+    /// The sum of absolute 4×4 Hadamard coefficients of the luma residual in a block's visible
+    /// area, rounded out to whole 4×4 blocks.
+    fn satd(&self, x: i32, y: i32, w4: usize, h4: usize) -> u64 {
+        let x0 = x as usize * 4;
+        let w = cmp::min(w4 * 4, (self.seq.width as usize).saturating_sub(x0)).next_multiple_of(4);
+        let h = cmp::min(h4 * 4, (self.seq.height as usize).saturating_sub(y as usize * 4)).next_multiple_of(4);
+        let wy = (y as usize * 4) % SB;
+        let (src, rec) = (&self.src[0], &self.rec[0]);
+        let mut total = 0;
+        for by in (0..h).step_by(4) {
+            for bx in (0..w).step_by(4) {
+                let mut d = [[0i32; 4]; 4];
+                for (r, row) in d.iter_mut().enumerate() {
+                    let at = (wy + by + r) * src.stride + x0 + bx;
+                    let s = src.comp.slice::<BD, _>((at.., ..4));
+                    let p = rec.comp.slice::<BD, _>((at.., ..4));
+                    for c in 0..4 {
+                        row[c] = s[c] as i32 - p[c] as i32;
+                    }
+                }
+                total += hadamard4(&d) as u64;
             }
         }
         total
@@ -1301,11 +1341,27 @@ impl<D: Decide> Encoder<D> {
             e.rd_cost(dist, bits)
         };
 
+        let keep = self.keep_modes;
+        let sad_lambda = self.lambda.sqrt();
+        let score = |e: &mut Self, intra: &Intra| -> f64 {
+            if keep == 0 {
+                return luma(e, intra, 0);
+            }
+            e.restore(&start);
+            e.predict_only = true;
+            e.predict_block(ti, bs, x, y, edge_flags, intra, 0, 0..1);
+            e.predict_only = false;
+            let mut c = Counter::default();
+            write_luma_modes(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, intra, &limits);
+            write_luma_rest(&mut c, &mut e.cost_cdf, &e.above, &e.left, ax, ly, bs, intra, 0, &limits, max_tx, screen, tx_select);
+            e.satd(x, y, w4, h4) as f64 + sad_lambda * c.bits as f64 / 512.0
+        };
+
         self.dct_only = true;
         let mut scored: Vec<(f64, Intra)> = (0..N_INTRA_PRED_MODES as u8)
             .map(|m| {
                 let c = Intra { y_mode: m, ..Default::default() };
-                (luma(self, &c, 0), c)
+                (score(self, &c), c)
             })
             .collect();
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -1319,17 +1375,24 @@ impl<D: Decide> Encoder<D> {
             for d in dirs {
                 for a in [-3, -2, -1, 1, 2, 3] {
                     let c = Intra { y_angle: a, ..d };
-                    scored.push((luma(self, &c, 0), c));
+                    scored.push((score(self, &c), c));
                 }
             }
         }
         if limits.filter {
             for f in 0..5 {
                 let c = Intra { y_mode: FILTER_PRED, y_angle: f, ..Default::default() };
-                scored.push((luma(self, &c, 0), c));
+                scored.push((score(self, &c), c));
             }
         }
         scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if keep > 0 {
+            scored.truncate(keep);
+            for s in scored.iter_mut() {
+                s.0 = luma(self, &s.1, 0);
+            }
+            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
         self.dct_only = false;
         let mut best_luma = (f64::MAX, scored[0].1, 0u8);
         for &(_, c) in scored.iter().take(2) {
@@ -1443,7 +1506,8 @@ fn coef_bits<D: Decide>(e: &mut Encoder<D>, txs: &[TxDone], bs: BlockSize, intra
             t.y4 as usize,
             t.tx,
             bs,
-            &t.coefs,
+            t.coefs.txtp,
+            &t.coefs.levels,
             t.eob,
             intra,
             lossless,
@@ -1456,6 +1520,19 @@ fn coef_bits<D: Decide>(e: &mut Encoder<D>, txs: &[TxDone], bs: BlockSize, intra
     e.above.restore_coef(ax, &saved_a);
     e.left.restore_coef(ly, &saved_l);
     c.bits
+}
+
+fn hadamard4(d: &[[i32; 4]; 4]) -> u32 {
+    let h4 = |v: [i32; 4]| {
+        let (a, b, c, e) = (v[0] + v[1], v[0] - v[1], v[2] + v[3], v[2] - v[3]);
+        [a + c, b + e, a - c, b - e]
+    };
+    let rows = d.map(h4);
+    let mut sum = 0;
+    for c in 0..4 {
+        sum += h4([rows[0][c], rows[1][c], rows[2][c], rows[3][c]]).iter().map(|v| v.unsigned_abs()).sum::<u32>();
+    }
+    sum
 }
 
 fn smooth(m: u8) -> i32 {
@@ -1562,7 +1639,8 @@ impl BlockWrite {
                     t.y4 as usize,
                     t.tx,
                     self.bs,
-                    &t.coefs,
+                    t.coefs.txtp,
+                    &t.coefs.levels,
                     t.eob,
                     &self.intra,
                     self.lossless,
@@ -1683,6 +1761,12 @@ struct EdgePx([u8; EDGE_LEN]);
 #[repr(C, align(64))]
 struct Coef([i16; 32 * 32]);
 
+struct Px([u8; 64 * 64]);
+
+struct Res([i16; 64 * 64]);
+
+struct Lv([i32; 32 * 32]);
+
 fn coef_ctx<'a>(above: &'a mut Ctx, left: &'a mut Ctx, plane: usize) -> (&'a mut [u8], &'a mut [u8]) {
     if plane == 0 {
         (&mut above.lcoef, &mut left.lcoef)
@@ -1733,7 +1817,8 @@ fn write_coefs<S: Sink>(
     y4: usize,
     tx: TxfmSize,
     bs: BlockSize,
-    c: &Coefs,
+    txtp: TxfmType,
+    coefs: &[i32],
     eob: i32,
     intra: &Intra,
     lossless: bool,
@@ -1765,7 +1850,6 @@ fn write_coefs<S: Sink>(
         set_ctx(a, l, 0x40);
         return;
     }
-    let txtp = c.txtp;
     if !lossless && qidx != 0 && plane == 0 && t_dim.max < TxfmSize::S32x32 as u8 {
         let y_mode = if intra.y_mode == FILTER_PRED {
             DAV1D_FILTER_MODE_TO_Y_MODE[intra.y_angle as usize]
@@ -1803,7 +1887,7 @@ fn write_coefs<S: Sink>(
         w.bools(eob & ((1 << (bin - 2)) - 1), bin - 2);
     }
 
-    let level_at = |i: usize| c.levels[scan_rc(tx, class, i).0].unsigned_abs();
+    let level_at = |i: usize| coefs[scan_rc(tx, class, i).0].unsigned_abs();
     let pack = |l: u32| ((cmp::min(l, 3) << 6) | cmp::min(l, 15)) as u8;
     let hi_ctx = cmp::min(t_dim.ctx, 3) as usize;
     let mut levels = [0u8; 1088];
@@ -1878,7 +1962,7 @@ fn write_coefs<S: Sink>(
     }
     let mut cul_level = 0u32;
     let dc_sign_level;
-    let dc = c.levels[0];
+    let dc = coefs[0];
     if dc_level == 0 {
         dc_sign_level = 0x40;
     } else {
@@ -1891,7 +1975,7 @@ fn write_coefs<S: Sink>(
         cul_level = dc_level;
     }
     for i in 1..=eob as usize {
-        let v = c.levels[scan_rc(tx, class, i).0];
+        let v = coefs[scan_rc(tx, class, i).0];
         if v == 0 {
             continue;
         }
@@ -2271,5 +2355,31 @@ pub(crate) mod tests {
             assert!(filtered > unfiltered + 0.05);
             assert!(coded.data.len() <= plain.data.len() + 8);
         }
+    }
+
+    /// Ranking luma modes by SATD first and keeping 4 for rate and distortion loses little.
+    #[test]
+    fn satd_ranking() {
+        let (w, h) = (192, 128);
+        let img = photo(w, h, 3, 7);
+        let (seq, fr) = crate::enc::headers(w as u32, h as u32, false, 120);
+        let run = |keep: usize| {
+            let mut e = Encoder::new(seq.clone(), fr.clone(), Rd);
+            e.keep_modes = keep;
+            e.recon = Some(vec![Vec::new(); 3]);
+            let t = std::time::Instant::now();
+            for y in 0..h {
+                let rows: Vec<&[u8]> = img.iter().map(|p| &p[y * w..][..w]).collect();
+                e.push(&rows);
+            }
+            let c = e.finish();
+            let db = psnr(&img, &decode_with(c.data.clone(), w, h, 3, true));
+            assert!(c.recon.as_ref().unwrap() == &decode(c.data.clone(), w, h, 3));
+            (c.data.len(), db, t.elapsed().as_millis())
+        };
+        let full = run(0);
+        let kept = run(4);
+        eprintln!("satd ranking: all modes {full:?}, 4 kept {kept:?}");
+        assert!(kept.2 < full.2 && kept.0 as f64 <= full.0 as f64 * 1.04 && kept.1 >= full.1 - 0.15, "{full:?} {kept:?}");
     }
 }

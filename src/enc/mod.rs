@@ -54,10 +54,12 @@ fn cdef_from_q(qidx: u8) -> Cdef {
 }
 
 /// A still picture of 8-bit planes coded at `qidx` (0 is lossless): one plane is monochrome,
-/// three are 4:4:4 YCbCr, BT.601 full range, sRGB.
-pub fn still(width: u32, height: u32, planes: &[&[u8]], qidx: u8) -> Coded {
+/// three are 4:4:4 YCbCr, BT.601 full range, sRGB. `keep_modes` luma modes of the SATD ranking
+/// go on to rate and distortion, all of them when 0.
+pub fn still(width: u32, height: u32, planes: &[&[u8]], qidx: u8, keep_modes: usize) -> Coded {
     let (seq, frame) = headers(width, height, planes.len() == 1, qidx);
     let mut e = Encoder::new(seq, frame, Rd);
+    e.keep_modes = keep_modes;
     let w = width as usize;
     for y in 0..height as usize {
         let rows: Vec<&[u8]> = planes.iter().map(|p| &p[y * w..][..w]).collect();
