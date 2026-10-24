@@ -18,7 +18,7 @@ use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
 use crate::dequant_tables::DAV1D_DQ_TBL;
 use crate::disjoint_mut::DisjointMut;
 use crate::enc::ec::Writer;
-use crate::enc::fdct;
+use crate::enc::fdct_fast;
 use crate::enc::palette;
 use crate::enc::header::{obu, BitWriter, Frame, Sequence, OBU_FRAME, OBU_SEQUENCE_HEADER};
 use crate::enc::rd::{lambda, Counter, Sink};
@@ -1257,7 +1257,7 @@ impl<D: Decide> Encoder<D> {
         levels.fill(0);
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
         for &txtp in cands {
-            fdct::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
+            fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
             quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 });
             let eob = eob_of(tx, txtp, &trial[..n]);

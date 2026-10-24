@@ -14,7 +14,7 @@ use crate::scan::DAV1D_SCANS;
 use crate::tables::{DAV1D_TXFM_DIMENSIONS, DAV1D_TX_TYPE_CLASS};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(super) enum Kind {
     Dct,
     Adst,
     FlipAdst,
@@ -22,7 +22,7 @@ enum Kind {
 }
 
 /// (vertical, horizontal) 1D transforms of a 2D type.
-fn kinds(ty: TxfmType) -> (Kind, Kind) {
+pub(super) fn kinds(ty: TxfmType) -> (Kind, Kind) {
     use Kind::*;
     match ty {
         DCT_DCT => (Dct, Dct),
@@ -1745,7 +1745,7 @@ fn fadst16(input: &[i32], output: &mut [i32], cos_bit: i8) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::align::Align64;
     use crate::cpu::CpuFlags;
@@ -1753,26 +1753,26 @@ mod tests {
     use crate::include::dav1d::picture::Rav1dPictureDataComponent;
     use crate::itx::Rav1dInvTxfmDSPContext;
 
-    struct Rng(u64);
+    pub(crate) struct Rng(pub u64);
 
     impl Rng {
-        fn next(&mut self) -> u32 {
+        pub fn next(&mut self) -> u32 {
             self.0 ^= self.0 << 13;
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             (self.0 >> 32) as u32
         }
 
-        fn residual(&mut self, max: i32) -> i16 {
+        pub fn residual(&mut self, max: i32) -> i16 {
             (self.next() % (2 * max as u32 + 1)) as i16 - max as i16
         }
     }
 
-    fn sizes() -> impl Iterator<Item = TxfmSize> {
+    pub(crate) fn sizes() -> impl Iterator<Item = TxfmSize> {
         (0..TxfmSize::COUNT).map(|i| TxfmSize::from_repr(i).unwrap())
     }
 
-    fn decodable(size: TxfmSize, ty: TxfmType) -> bool {
+    pub(crate) fn decodable(size: TxfmSize, ty: TxfmType) -> bool {
         let (w, h) = dimensions(size);
         match ty {
             WHT_WHT => size == TxfmSize::S4x4,
@@ -1783,7 +1783,7 @@ mod tests {
         }
     }
 
-    fn blocks(size: TxfmSize, seed: u64, random: usize, max: i32) -> Vec<Vec<i16>> {
+    pub(crate) fn blocks(size: TxfmSize, seed: u64, random: usize, max: i32) -> Vec<Vec<i16>> {
         let (w, h) = dimensions(size);
         let mut rng = Rng(seed);
         let mut blocks = vec![
@@ -1829,7 +1829,12 @@ mod tests {
 
     /// 64-point sides drop the upper half of the frequencies, so their blocks
     /// are first projected onto the coded half by a round trip.
-    fn max_error(itx: &Rav1dInvTxfmDSPContext, size: TxfmSize, ty: TxfmType) -> i32 {
+    pub(crate) fn max_error(
+        itx: &Rav1dInvTxfmDSPContext,
+        size: TxfmSize,
+        ty: TxfmType,
+        forward: &dyn Fn(&[i16], usize, &mut [i32], TxfmSize, TxfmType),
+    ) -> i32 {
         let (w, h) = dimensions(size);
         let band_limited = w.max(h) == 64;
         let mut coefs = [0; 32 * 32];
@@ -1860,7 +1865,7 @@ mod tests {
         worst
     }
 
-    const ROUND_TRIP_BOUND: [i32; TxfmSize::COUNT] = [
+    pub(crate) const ROUND_TRIP_BOUND: [i32; TxfmSize::COUNT] = [
         0, // 4x4
         1, // 8x8
         1, // 16x16
@@ -1883,7 +1888,7 @@ mod tests {
     ];
 
     /// Every kernel level of this CPU, since each has its own `eob` shortcuts.
-    fn cpu_levels() -> Vec<CpuFlags> {
+    pub(crate) fn cpu_levels() -> Vec<CpuFlags> {
         let detected = CpuFlags::run_time_detect();
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let levels = vec![
@@ -1907,7 +1912,7 @@ mod tests {
             for size in sizes() {
                 for ty in (0..=WHT_WHT).filter(|&ty| decodable(size, ty)) {
                     assert!(supported(size, ty), "{size:?} {ty}");
-                    let worst = max_error(&itx, size, ty);
+                    let worst = max_error(&itx, size, ty, &forward);
                     let bound = if ty == WHT_WHT {
                         0
                     } else {
