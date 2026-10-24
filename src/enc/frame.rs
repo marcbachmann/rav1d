@@ -411,6 +411,8 @@ pub struct Encoder<D: Decide> {
     pub rect: u8,
     /// Transform depths are compared with `DCT_DCT` only; the chosen one searches every type.
     pub late_txtp: bool,
+    /// See `Options::reduced_txtp`.
+    pub reduced_txtp: bool,
     /// Block levels the search codes unsplit: 64×64 down to 8×8, and 4×4 when `Bl8x8` splits.
     pub levels: Range<u8>,
     /// A block whose unsplit distortion is under `prune` bits' worth per 4×4 unit is not split.
@@ -540,6 +542,7 @@ impl<D: Decide> Encoder<D> {
             keep_chroma: 0,
             rect: 1,
             late_txtp: false,
+            reduced_txtp: false,
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
@@ -1352,7 +1355,21 @@ impl<D: Decide> Encoder<D> {
                     }
                     None => {
                         let all = if set.is_empty() { std::slice::from_ref(&fixed_txtp) } else { set };
-                        let cands = if self.dct_only && !set.is_empty() { &all[1..2] } else { all };
+                        let mut reduced = [DCT_DCT; 7];
+                        let cands = if self.dct_only && !set.is_empty() {
+                            &all[1..2]
+                        } else if self.reduced_txtp && set.len() == 7 {
+                            let y_mode = if intra.y_mode == FILTER_PRED { DAV1D_FILTER_MODE_TO_Y_MODE[intra.y_angle as usize] } else { intra.y_mode };
+                            let used = REDUCED_INTRA_TXTP[y_mode as usize];
+                            let mut k = 0;
+                            for &t in set.iter().filter(|&&t| used >> t as u8 & 1 != 0) {
+                                reduced[k] = t;
+                                k += 1;
+                            }
+                            &reduced[..k]
+                        } else {
+                            all
+                        };
                         self.rd_residual(bs, plane, px, py, tx, cands, intra, levels)
                     }
                 };
@@ -2304,6 +2321,10 @@ struct Ac([i16; SCRATCH_AC_TXTP_LEN]);
 
 const EDGE_LEN: usize = 257;
 
+/// libaom's `av1_reduced_intra_tx_used_flag`: transform types by luma mode, bit per type.
+const REDUCED_INTRA_TXTP: [u16; N_INTRA_PRED_MODES] =
+    [0x80f, 0x40f, 0x80f, 0x20f, 0x80f, 0x40f, 0x80f, 0x80f, 0x40f, 0x80f, 0x40f, 0x80f, 0xc0e];
+
 #[repr(C, align(64))]
 struct EdgePx([u8; EDGE_LEN]);
 
@@ -3094,6 +3115,7 @@ pub(crate) mod tests {
             screen: std::env::var("ENC_SCREEN").map_or(true, |v| v != "0"),
             rect: std::env::var("ENC_RECT").map_or(1, |v| v.parse().unwrap()),
             late_txtp: std::env::var("ENC_LATE").is_ok_and(|v| v == "1"),
+            reduced_txtp: std::env::var("ENC_REDUCED_TXTP").is_ok_and(|v| v == "1"),
             levels: std::env::var("ENC_LEVELS").map_or(0..5, |v| {
                 let (a, b) = v.split_once("..").unwrap();
                 a.parse().unwrap()..b.parse().unwrap()
