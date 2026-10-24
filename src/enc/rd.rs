@@ -82,14 +82,43 @@ pub struct Counter {
     pub bits: u32,
 }
 
+/// log2(`x`) in fixed point with 48 fractional bits, by repeated squaring.
+const fn log2_q48(x: u32) -> u64 {
+    let k = 31 - x.leading_zeros();
+    let mut y = (x as u128) << (62 - k);
+    let mut frac = 0u64;
+    let mut bit = 47;
+    loop {
+        y = (y * y) >> 62;
+        if y >= 2 << 62 {
+            y >>= 1;
+            frac |= 1 << bit;
+        }
+        if bit == 0 {
+            break;
+        }
+        bit -= 1;
+    }
+    ((k as u64) << 48) | frac
+}
+
+/// −log2(i/1024)·512 rounded, for i in 0..=1024 (0 costs as 1).
+const COST: [u16; 1025] = {
+    let mut t = [0u16; 1025];
+    let mut i = 0;
+    while i <= 1024 {
+        let x = if i == 0 { 1 } else { i as u32 };
+        let v = ((10u64 << 48) - log2_q48(x)) as u128 * 512;
+        t[i] = ((v + (1 << 47)) >> 48) as u16;
+        i += 1;
+    }
+    t
+};
+
 /// Cost in 1/512 bits of a probability `p`/32768.
 #[inline]
 pub fn cost(p: u32) -> u32 {
-    static TABLE: std::sync::OnceLock<[u16; 1025]> = std::sync::OnceLock::new();
-    let t = TABLE.get_or_init(|| {
-        std::array::from_fn(|i| (-(i.max(1) as f64 / 1024.0).log2() * 512.0).round() as u16)
-    });
-    t[(p.clamp(1, 32768) + 16 >> 5) as usize] as u32
+    COST[(p.clamp(1, 32768) + 16 >> 5) as usize] as u32
 }
 
 impl Sink for Counter {
@@ -157,6 +186,14 @@ pub fn lambda(qidx: u8, iq: bool) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_table_is_the_rounded_logarithm() {
+        for i in 0..=1024usize {
+            let want = (-(i.max(1) as f64 / 1024.0).log2() * 512.0).round() as u16;
+            assert_eq!(COST[i], want, "{i}");
+        }
+    }
 
     #[test]
     fn costs_follow_probability() {
