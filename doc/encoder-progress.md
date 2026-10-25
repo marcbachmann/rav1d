@@ -54,6 +54,10 @@ An incremental build takes about 17 s.
   × 5 settings and the 13 full pictures: every hash equal; a planted stale read changed 6-7 of 12.
 - Dead end: skipping the quantizer's division for chunks that are all zero, ±0.5%.
 
+Against libaom (cpu-used 5, one thread, pinned) at effort 4 after this round: photos 0.69–1.25×
+libaom's time at Q75 (most 0.77–1.04×), 1.15–1.65× at Q40; graphics 0.98–1.26×, gradient
+2.1–2.6× (24 ms in libaom); quality unchanged.
+
 Left in the photo case at q140: `predict_plane` 9%, quantizer 8%, filter strength search 9-12%
 (24 full decodes: 10 deblocking, 14 CDEF; an exact rework decodes once and reruns only the
 filters), intra edge preparation 2%.
