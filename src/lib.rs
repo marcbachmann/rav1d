@@ -845,6 +845,19 @@ pub unsafe fn dav1d_set_decode_by_rows(c: Dav1dContext, by_rows: bool) {
     c.state.try_lock().unwrap().by_rows = by_rows;
 }
 
+/// Decodes the tile columns of each superblock row decoded by rows on the threads `spawner` hands
+/// out as well as on the calling thread, which [`dav1d_decode_rows`] returns once all are decoded;
+/// `None` decodes them on the calling thread alone.
+///
+/// # Safety
+///
+/// * `c` must be from [`dav1d_open`] and not be passed to [`dav1d_close`] yet.
+pub unsafe fn dav1d_set_rows_spawner(c: Dav1dContext, spawner: Option<Spawner>) {
+    // SAFETY: `c` is from `dav1d_open` and thus from `RawArc::from_arc`.
+    let c = unsafe { c.as_ref() };
+    c.state.try_lock().unwrap().rows_spawner = spawner;
+}
+
 /// Decodes the next superblock row of the frame [`dav1d_send_data`] set up to be decoded by rows,
 /// and writes how many rows from the top of its picture no later row changes or reads, its height
 /// once the frame is done. `EAGAIN` where no frame is being decoded by rows; on an error the frame is
@@ -953,6 +966,8 @@ pub(crate) fn rav1d_flush(c: &Rav1dContext) {
     rav1d_abandon_rows(c, state);
     let old_state = mem::take(state);
     state.by_rows = old_state.by_rows;
+    state.rows_spawner = old_state.rows_spawner;
+    state.rows_contexts = old_state.rows_contexts;
     state.tiles = old_state.tiles;
     state.n_tiles = old_state.n_tiles;
     state.frame_thread = old_state.frame_thread;

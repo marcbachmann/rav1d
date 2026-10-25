@@ -5,7 +5,8 @@ use std::hash::{DefaultHasher, Hasher};
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::dav1d::{Dav1dContext, Dav1dSettings};
@@ -15,7 +16,7 @@ use rav1d::send_sync_non_null::SendSyncNonNull;
 use rav1d::{
     dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_data_wrap, dav1d_decode_rows,
     dav1d_default_settings, dav1d_get_picture, dav1d_open, dav1d_picture_unref, dav1d_rows_picture,
-    dav1d_send_data, dav1d_set_decode_by_rows,
+    dav1d_send_data, dav1d_set_decode_by_rows, dav1d_set_rows_spawner, Spawner,
 };
 
 #[cfg(target_os = "macos")]
@@ -41,11 +42,28 @@ fn ivf_frames(data: &[u8]) -> Vec<&[u8]> {
     frames
 }
 
+/// `data` with every 97th byte of the last quarter of each frame flipped, where its last tiles are.
+fn damaged(data: &[u8]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    let base = data.as_ptr() as usize;
+    for frame in ivf_frames(data) {
+        let start = frame.as_ptr() as usize - base;
+        for i in (start + frame.len() * 3 / 4..start + frame.len()).step_by(97) {
+            out[i] ^= 0x5a;
+        }
+    }
+    out
+}
+
 fn open(apply_grain: bool, by_rows: bool) -> Dav1dContext {
     open_on(apply_grain, by_rows, 1)
 }
 
 fn open_on(apply_grain: bool, by_rows: bool, threads: c_int) -> Dav1dContext {
+    open_with(apply_grain, by_rows, threads, None)
+}
+
+fn open_with(apply_grain: bool, by_rows: bool, threads: c_int, spawner: Option<Spawner>) -> Dav1dContext {
     unsafe {
         let mut settings = MaybeUninit::<Dav1dSettings>::uninit();
         dav1d_default_settings(NonNull::new(settings.as_mut_ptr()).unwrap());
@@ -57,6 +75,7 @@ fn open_on(apply_grain: bool, by_rows: bool, threads: c_int) -> Dav1dContext {
         assert_eq!(dav1d_open(NonNull::new(&mut ctx), NonNull::new(&mut settings)).0, 0);
         let ctx = ctx.unwrap();
         dav1d_set_decode_by_rows(ctx, by_rows);
+        dav1d_set_rows_spawner(ctx, spawner);
         ctx
     }
 }
@@ -228,14 +247,35 @@ fn decode(file: &Path, apply_grain: bool, rows: bool, poison: bool) -> Decoded {
 }
 
 fn decode_on(file: &Path, apply_grain: bool, rows: bool, poison: bool, threads: c_int) -> Decoded {
-    let data = std::fs::read(file).unwrap();
+    decode_with(file, apply_grain, rows, poison, threads, None)
+}
+
+fn decode_with(
+    file: &Path,
+    apply_grain: bool,
+    rows: bool,
+    poison: bool,
+    threads: c_int,
+    spawner: Option<Spawner>,
+) -> Decoded {
+    decode_data(&std::fs::read(file).unwrap(), apply_grain, rows, poison, threads, spawner)
+}
+
+fn decode_data(
+    data: &[u8],
+    apply_grain: bool,
+    rows: bool,
+    poison: bool,
+    threads: c_int,
+    spawner: Option<Spawner>,
+) -> Decoded {
     let mut decoded = Decoded {
         poison,
         ..Default::default()
     };
-    let ctx = open_on(apply_grain, rows, threads);
+    let ctx = open_with(apply_grain, rows, threads, spawner);
     unsafe {
-        for frame in ivf_frames(&data) {
+        for frame in ivf_frames(data) {
             if poison && !decoded.out.is_empty() {
                 break;
             }
@@ -423,4 +463,58 @@ fn decodes_on_one_thread_as_on_four() {
     eprintln!("{pictures} pictures, {} streams differ", differ.len());
     assert!(differ.is_empty(), "{differ:#?}");
     assert!(!filter.is_empty() || pictures > 10_000, "{pictures} pictures");
+}
+
+/// The tile columns of a row decoded by rows on spawned threads, some taken and some not, or all of
+/// them run as offered so that the calling thread decodes none, come out as decoded whole, and so
+/// do the streams with columns damaged, up to their first error.
+#[test]
+fn decodes_tile_columns_on_spawned_threads_as_whole() {
+    let filter = std::env::var("ROWS_FILTER").unwrap_or_default();
+    let (asked, taken) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (mut pictures, mut differ, mut damaged_errors) = (0, Vec::new(), 0);
+    for (i, file) in streams().iter().filter(|f| f.to_string_lossy().contains(&filter)).enumerate() {
+        let offered = asked.load(Ordering::Relaxed);
+        let (a, t) = (Arc::clone(&asked), Arc::clone(&taken));
+        let spawner: Spawner = Arc::new(move |work| {
+            if i % 2 == 0 {
+                a.fetch_add(1, Ordering::Relaxed);
+                t.fetch_add(1, Ordering::Relaxed);
+                work();
+                return true;
+            }
+            if a.fetch_add(1, Ordering::Relaxed) % 3 == 2 {
+                return false;
+            }
+            t.fetch_add(1, Ordering::Relaxed);
+            std::thread::spawn(work);
+            true
+        });
+        let whole = decode(file, true, false, false);
+        let rows = decode_with(file, true, true, false, 1, Some(spawner.clone()));
+        let upto = |d: &Decoded| d.out.iter().position(|o| o.is_err()).map_or(d.out.len(), |i| i + 1);
+        if whole.out[..upto(&whole)] != rows.out[..upto(&rows)] {
+            differ.push(file.display().to_string());
+            continue;
+        }
+        pictures += whole.out.iter().filter(|o| o.is_ok()).count();
+        if asked.load(Ordering::Relaxed) == offered {
+            continue;
+        }
+        let data = damaged(&std::fs::read(file).unwrap());
+        let whole = decode_data(&data, true, false, false, 1, None);
+        let rows = decode_data(&data, true, true, false, 1, Some(spawner));
+        if whole.out[..upto(&whole)] != rows.out[..upto(&rows)] {
+            differ.push(format!("{} damaged", file.display()));
+        }
+        damaged_errors += whole.out.iter().filter(|o| o.is_err()).count();
+    }
+    let (asked, taken) = (asked.load(Ordering::Relaxed), taken.load(Ordering::Relaxed));
+    eprintln!(
+        "{pictures} pictures, {asked} columns offered, {taken} taken, {damaged_errors} errors damaged, {} streams differ",
+        differ.len()
+    );
+    assert!(differ.is_empty(), "{differ:#?}");
+    assert!(filter.len() > 0 || damaged_errors > 0, "no damaged stream failed");
+    assert!(taken > 0 && asked > taken, "{asked} offered, {taken} taken");
 }

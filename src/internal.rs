@@ -385,6 +385,11 @@ pub struct Rav1dState {
     pub(crate) by_rows: bool,
     /// The frame being decoded by rows.
     pub(crate) rows: Option<FrameRows>,
+    /// Runs the tile columns of a superblock row decoded by rows beside the calling thread, see
+    /// [`dav1d_set_rows_spawner`](crate::dav1d_set_rows_spawner).
+    pub(crate) rows_spawner: Option<crate::Spawner>,
+    /// Task contexts for the tile columns the spawner's threads decode.
+    pub(crate) rows_contexts: Arc<Mutex<Vec<Box<Rav1dTaskContext>>>>,
 }
 
 #[derive(Clone, Copy)]
