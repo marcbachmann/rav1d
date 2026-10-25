@@ -289,6 +289,19 @@ impl Rav1dPictureDataComponent {
         }
     }
 
+    /// The component's bytes, for [`Self::put_bytes`].
+    pub fn bytes(&self) -> Vec<u8> {
+        self.0.index(..).to_vec()
+    }
+
+    pub fn byte_slice(&self) -> DisjointImmutGuard<'_, Rav1dPictureDataComponentInner, [u8]> {
+        self.0.index(..)
+    }
+
+    pub fn put_bytes(&self, bytes: &[u8]) {
+        self.0.index_mut(..).copy_from_slice(bytes);
+    }
+
     pub fn copy_from(&self, src: &Self) {
         let dst = &mut *self.0.index_mut(..);
         let src = &*src.0.index(..);

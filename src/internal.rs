@@ -45,8 +45,9 @@ use crate::recon::{
     rav1d_backup_ipred_edge, rav1d_copy_pal_block_uv, rav1d_copy_pal_block_y, rav1d_filter_sbrow,
     rav1d_filter_sbrow_cdef, rav1d_filter_sbrow_deblock_cols, rav1d_filter_sbrow_deblock_rows,
     rav1d_filter_sbrow_lr, rav1d_filter_sbrow_resize, rav1d_read_coef_blocks, rav1d_read_pal_plane,
-    rav1d_read_pal_uv, rav1d_recon_b_inter, rav1d_recon_b_intra, BackupIpredEdgeFn, CopyPalBlockFn,
-    FilterSbrowFn, ReadCoefBlocksFn, ReadPalPlaneFn, ReadPalUVFn, ReconBInterFn, ReconBIntraFn,
+    rav1d_read_pal_uv, rav1d_recon_b_inter, rav1d_recon_b_intra, rav1d_refilter_sbrow,
+    BackupIpredEdgeFn, CopyPalBlockFn, FilterSbrowFn, ReadCoefBlocksFn, ReadPalPlaneFn,
+    ReadPalUVFn, ReconBInterFn, ReconBIntraFn,
 };
 use crate::refmvs::{Rav1dRefmvsDSPContext, RefMvsFrame, RefMvsTemporalBlock, RefmvsTile};
 use crate::relaxed_atomic::RelaxedAtomic;
@@ -426,6 +427,9 @@ pub struct Rav1dContext {
     pub(crate) strict_std_compliance: bool,
     pub(crate) output_invisible_frames: bool,
     pub(crate) inloop_filters: Rav1dInloopFilterType,
+    /// The loop filter's levels and masks are kept for the whole frame on one thread too, for the
+    /// encoder's filter trials.
+    pub(crate) keep_filter_data: AtomicBool,
     pub(crate) decode_frame_type: Rav1dDecodeFrameType,
 
     pub(crate) logger: Option<Rav1dLogger>,
@@ -506,6 +510,7 @@ pub(crate) struct Rav1dFrameContextBdFn {
     pub recon_b_intra: ReconBIntraFn,
     pub recon_b_inter: ReconBInterFn,
     pub filter_sbrow: FilterSbrowFn,
+    pub refilter_sbrow: FilterSbrowFn,
     pub filter_sbrow_deblock_cols: FilterSbrowFn,
     pub filter_sbrow_deblock_rows: FilterSbrowFn,
     pub filter_sbrow_cdef: fn(&Rav1dContext, &Rav1dFrameData, &mut Rav1dTaskContext, c_int) -> (),
@@ -525,6 +530,7 @@ impl Rav1dFrameContextBdFn {
             recon_b_inter: rav1d_recon_b_inter::<BD>,
             recon_b_intra: rav1d_recon_b_intra::<BD>,
             filter_sbrow: rav1d_filter_sbrow::<BD>,
+            refilter_sbrow: rav1d_refilter_sbrow::<BD>,
             filter_sbrow_deblock_cols: rav1d_filter_sbrow_deblock_cols::<BD>,
             filter_sbrow_deblock_rows: rav1d_filter_sbrow_deblock_rows::<BD>,
             filter_sbrow_cdef: rav1d_filter_sbrow_cdef::<BD>,

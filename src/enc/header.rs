@@ -174,7 +174,7 @@ impl Quant {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct Cdef {
     pub damping: u8,
     pub bits: u8,

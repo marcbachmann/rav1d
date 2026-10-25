@@ -3698,10 +3698,12 @@ pub(crate) fn rav1d_filter_sbrow_deblock_cols<BD: BitDepth>(
     _t: &mut Rav1dTaskContext,
     sby: c_int,
 ) {
-    if !c.inloop_filters.contains(Rav1dInloopFilterType::DEBLOCK) {
-        return;
+    if c.inloop_filters.contains(Rav1dInloopFilterType::DEBLOCK) {
+        deblock_cols::<BD>(f, sby);
     }
+}
 
+fn deblock_cols<BD: BitDepth>(f: &Rav1dFrameData, sby: c_int) {
     let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
     if frame_hdr.loopfilter.level_y == [0; 2] {
         return;
@@ -3726,6 +3728,10 @@ pub(crate) fn rav1d_filter_sbrow_deblock_rows<BD: BitDepth>(
     _t: &mut Rav1dTaskContext,
     sby: c_int,
 ) {
+    deblock_rows::<BD>(c, f, sby, c.inloop_filters.contains(Rav1dInloopFilterType::DEBLOCK));
+}
+
+fn deblock_rows<BD: BitDepth>(c: &Rav1dContext, f: &Rav1dFrameData, sby: c_int, deblock: bool) {
     let y = sby * f.sb_step * 4;
     let p = f.cur.lf_offsets::<BD>(y);
     let seq_hdr = &***f.seq_hdr.as_ref().unwrap();
@@ -3733,9 +3739,7 @@ pub(crate) fn rav1d_filter_sbrow_deblock_rows<BD: BitDepth>(
     let cdef = seq_hdr.cdef;
     let mask_offset = f.lf_mask_row(sby >> (sb128 == 0) as c_int);
     let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
-    if c.inloop_filters.contains(Rav1dInloopFilterType::DEBLOCK)
-        && (frame_hdr.loopfilter.level_y != [0; 2])
-    {
+    if deblock && frame_hdr.loopfilter.level_y != [0; 2] {
         rav1d_loopfilter_sbrow_rows::<BD>(f, p, mask_offset, sby);
     }
     if cdef != 0 || !f.lf.restore_planes.is_empty() {
@@ -3750,10 +3754,12 @@ pub(crate) fn rav1d_filter_sbrow_cdef<BD: BitDepth>(
     tc: &mut Rav1dTaskContext,
     sby: c_int,
 ) {
-    if !c.inloop_filters.contains(Rav1dInloopFilterType::CDEF) {
-        return;
+    if c.inloop_filters.contains(Rav1dInloopFilterType::CDEF) {
+        cdef::<BD>(c, f, tc, sby);
     }
+}
 
+fn cdef<BD: BitDepth>(c: &Rav1dContext, f: &Rav1dFrameData, tc: &mut Rav1dTaskContext, sby: c_int) {
     let sbsz = f.sb_step;
     let y = sby * sbsz * 4;
     let p = f.cur.lf_offsets::<BD>(y);
@@ -3848,6 +3854,21 @@ pub(crate) fn rav1d_filter_sbrow<BD: BitDepth>(
     }
     if !f.lf.restore_planes.is_empty() {
         rav1d_filter_sbrow_lr::<BD>(c, f, t, sby);
+    }
+}
+
+/// `rav1d_filter_sbrow` with deblocking and CDEF on whatever the context's filters: the
+/// encoder's filter trials filter a frame decoded with them off, under headers of its own.
+pub(crate) fn rav1d_refilter_sbrow<BD: BitDepth>(
+    c: &Rav1dContext,
+    f: &Rav1dFrameData,
+    t: &mut Rav1dTaskContext,
+    sby: c_int,
+) {
+    deblock_cols::<BD>(f, sby);
+    deblock_rows::<BD>(c, f, sby, true);
+    if f.seq_hdr.as_ref().unwrap().cdef != 0 {
+        cdef::<BD>(c, f, t, sby);
     }
 }
 

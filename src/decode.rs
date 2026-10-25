@@ -31,11 +31,12 @@ use crate::include::common::bitdepth::BPC;
 use crate::include::common::intops::{apply_sign64, clip, clip_u8, iclip};
 use crate::include::dav1d::common::Rav1dDataProps;
 use crate::include::dav1d::headers::{
-    Rav1dFilterMode, Rav1dFrameHeader, Rav1dPixelLayout,
+    DRav1d, Rav1dFilterMode, Rav1dFrameHeader, Rav1dPixelLayout,
     Rav1dRestorationType, Rav1dSequenceHeader, Rav1dTxfmMode, Rav1dWarpedMotionParams,
     Rav1dWarpedMotionType, SgrIdx, RAV1D_PRIMARY_REF_NONE,
 };
 use crate::include::dav1d::picture::Rav1dPicture;
+use crate::strided::Strided as _;
 use crate::Spawner;
 use crate::internal::{
     Bxy, Rav1dBitDepthDSPContext, Rav1dContext, Rav1dContextTaskType, Rav1dFrameContext,
@@ -4449,7 +4450,7 @@ pub(crate) fn rav1d_decode_frame_init(c: &Rav1dContext, fc: &Rav1dFrameContext) 
 
     // update allocation for loopfilter masks
 
-    f.lf.ring = c.tc.len() == 1;
+    f.lf.ring = c.tc.len() == 1 && !c.keep_filter_data.load(Ordering::Relaxed);
     let (mask_rows, level_rows) = if f.lf.ring {
         (2, 1 + f.sb_step)
     } else {
@@ -4962,26 +4963,130 @@ pub(crate) fn rav1d_decode_frame_rows(
     };
     match res {
         Ok((rows, false)) => Ok((rows, false)),
-        Ok((rows, true)) => {
-            {
-                let mut f = fc.data.try_write().unwrap();
-                let f = &mut *f;
-                let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
-                if frame_hdr.refresh_context != 0 && fc.task_thread.update_set.get() {
-                    rav1d_cdf_thread_update(
-                        frame_hdr,
-                        &mut f.out_cdf.cdf_write(),
-                        &f.ts[frame_hdr.tiling.update as usize]
-                            .context
-                            .try_lock()
-                            .unwrap()
-                            .cdf,
-                    );
-                }
-            }
-            rav1d_decode_frame_exit(c, fc, Ok(())).map(|()| (rows, true))
-        }
+        Ok((rows, true)) => finish_frame_rows(c, fc).map(|()| (rows, true)),
         Err(e) => rav1d_decode_frame_exit(c, fc, Err(e)).map(|()| (0, true)),
+    }
+}
+
+/// Ends a frame whose rows are all decoded: its CDFs for the next frame, then the frame's exit.
+fn finish_frame_rows(c: &Rav1dContext, fc: &Rav1dFrameContext) -> Rav1dResult {
+    {
+        let mut f = fc.data.try_write().unwrap();
+        let f = &mut *f;
+        let frame_hdr = &***f.frame_hdr.as_ref().unwrap();
+        if frame_hdr.refresh_context != 0 && fc.task_thread.update_set.get() {
+            rav1d_cdf_thread_update(
+                frame_hdr,
+                &mut f.out_cdf.cdf_write(),
+                &f.ts[frame_hdr.tiling.update as usize]
+                    .context
+                    .try_lock()
+                    .unwrap()
+                    .cdf,
+            );
+        }
+    }
+    rav1d_decode_frame_exit(c, fc, Ok(()))
+}
+
+/// What a filter trial measures of a plane: its index, its pixels, their stride, width and height.
+pub(crate) type Measure<'a> = dyn FnMut(usize, &[u8], usize, usize, usize) -> u64 + 'a;
+
+/// One filter trial: puts the unfiltered picture back, filters it under a copy of the frame
+/// header as the edit leaves it, and measures each plane.
+pub(crate) type Trial<'a> = dyn FnMut(&dyn Fn(&mut Rav1dFrameHeader)) -> [u64; 3] + 'a;
+
+/// For the encoder's filter strength search: decodes the frame set up to be decoded by rows, with
+/// the context's in-loop filters off and its loop filter data kept for the whole frame, then lets
+/// `search` run trials on it, as many as it likes, before the frame ends. Frames with deltas of
+/// the loop filter level by superblock, 8-bit 4:4:4 or monochrome only.
+pub(crate) fn rav1d_filter_trials(
+    c: &Rav1dContext,
+    state: &mut Rav1dState,
+    measure: &mut Measure,
+    search: &mut dyn FnMut(&mut Trial),
+) -> Rav1dResult {
+    let Some(rows) = state.rows.take() else {
+        return Err(Rav1dError::TryAgain);
+    };
+    let fc = &c.fc[0];
+    let Rav1dContextTaskType::Single(t) = &c.tc[0].task else {
+        panic!("Expected a single-threaded context");
+    };
+    let decoded = {
+        let mut f = fc.data.try_write().unwrap();
+        let mut t = t.lock();
+        let usable = !f.lf.ring
+            && f.bitdepth_max == 0xff
+            && matches!(f.cur.p.layout, Rav1dPixelLayout::I444 | Rav1dPixelLayout::I400)
+            && f.frame_hdr().delta.lf.present == 0
+            && f.frame_hdr().loopfilter.level_y != [0; 2];
+        let mut sby = rows.sby;
+        let mut res = if usable { Ok(()) } else { Err(Rav1dError::InvalidArgument) };
+        while res.is_ok() {
+            let Some(tile_row) = sbrow_tile_row(&f, sby) else {
+                break;
+            };
+            res = decode_sbrow(c, &mut t, &mut f, tile_row, sby, None);
+            sby += 1;
+        }
+        res
+    };
+    if let Err(e) = decoded {
+        let _ = mem::take(&mut state.in_0);
+        let _ = rav1d_decode_frame_exit(c, fc, Err(e));
+        drop_failed_frame(state, fc, rows.refresh_frame_flags);
+        return Err(e);
+    }
+    {
+        let mut f = fc.data.try_write().unwrap();
+        let f = &mut *f;
+        let mut t = t.lock();
+        let original = f.frame_hdr.clone().unwrap();
+        let pic = f.cur.data.clone().unwrap();
+        let planes = if f.cur.p.layout == Rav1dPixelLayout::I400 { 1 } else { 3 };
+        let unfiltered: Vec<Vec<u8>> = (0..planes).map(|p| pic.data[p].bytes()).collect();
+        let (w, h) = (f.cur.p.w as usize, f.cur.p.h as usize);
+        let mut trial = |edit: &dyn Fn(&mut Rav1dFrameHeader)| {
+            let mut hdr = original.rav1d.clone();
+            edit(&mut hdr);
+            set_filter_levels(f, &hdr);
+            f.frame_hdr = Some(Arc::new(DRav1d::from_rav1d(hdr)));
+            for (p, bytes) in unfiltered.iter().enumerate() {
+                pic.data[p].put_bytes(bytes);
+            }
+            for sby in 0..f.sbh {
+                (f.bd_fn().refilter_sbrow)(c, f, &mut t, sby);
+            }
+            let mut out = [0; 3];
+            for (p, o) in out[..planes].iter_mut().enumerate() {
+                let stride = pic.data[p].stride() as usize;
+                *o = measure(p, &pic.data[p].byte_slice(), stride, w, h);
+            }
+            out
+        };
+        search(&mut trial);
+        f.frame_hdr = Some(original);
+    }
+    finish_frame_rows(c, fc)
+}
+
+/// The loop filter levels a frame decoded under one header has for every 4×4 block under `hdr`:
+/// one level per plane and direction, without segments or deltas.
+fn set_filter_levels(f: &mut Rav1dFrameData, hdr: &Rav1dFrameHeader) {
+    rav1d_calc_lf_values(&mut f.lf.lvl, hdr, &[0; 4]);
+    let yuv = f.lf.lvl[0].0.map(|a| a[0][0]);
+    let stride = f.b4_stride as usize;
+    let chroma = f.cur.p.layout != Rav1dPixelLayout::I400;
+    for y in 0..f.h4 {
+        let row = f.lf_level_row(y) * stride;
+        let mut cells = f.lf.level.index_mut((4 * row.., ..4 * f.w4 as usize));
+        for cell in cells.chunks_exact_mut(4) {
+            cell[..2].copy_from_slice(&yuv[..2]);
+            if chroma {
+                cell[2..].copy_from_slice(&yuv[2..]);
+            }
+        }
     }
 }
 

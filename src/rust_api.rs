@@ -270,6 +270,25 @@ impl Decoder {
     }
 }
 
+#[cfg(feature = "encoder")]
+impl Decoder {
+    /// Decodes `data`, one frame, once, and lets `search` filter it under headers of its choice:
+    /// see `rav1d_filter_trials`. The decoder must have one thread, a frame delay of 1 and its
+    /// in-loop filters off. `Err` where the frame cannot be tried so: nothing was run.
+    pub(crate) fn filter_trials(
+        &mut self,
+        data: Box<[u8]>,
+        measure: &mut crate::decode::Measure,
+        search: &mut dyn FnMut(&mut crate::decode::Trial),
+    ) -> Result<(), Rav1dError> {
+        self.ctx.keep_filter_data.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.ctx.state.try_lock().unwrap().by_rows = true;
+        self.send_data(data, None, None, None)?;
+        let state = &mut *self.ctx.state.try_lock().unwrap();
+        crate::decode::rav1d_filter_trials(&self.ctx, state, measure, search)
+    }
+}
+
 impl Drop for Decoder {
     fn drop(&mut self) {
         rav1d_close(&self.ctx);
