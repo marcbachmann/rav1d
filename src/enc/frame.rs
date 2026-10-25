@@ -17,6 +17,7 @@ use crate::cdf::{rav1d_cdf_thread_copy, rav1d_cdf_thread_init_static, CdfContext
 use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
 use crate::dequant_tables::DAV1D_DQ_TBL;
 use crate::disjoint_mut::DisjointMut;
+use crate::enc::contexts::{self, scan_rc};
 use crate::enc::dist;
 use crate::enc::ec::Writer;
 use crate::enc::fdct_fast;
@@ -42,10 +43,9 @@ use crate::levels::{
 };
 use crate::qm::DAV1D_QM_TBL;
 use crate::recon::{get_dc_sign_ctx, get_skip_ctx};
-use crate::scan::DAV1D_SCANS;
 use crate::tables::{
-    LoCtxOffset, TxfmInfo, CFL_ALLOWED_MASK, DAV1D_AL_PART_CTX, DAV1D_BLOCK_SIZES, DAV1D_FILTER_MODE_TO_Y_MODE,
-    DAV1D_INTRA_MODE_CONTEXT, DAV1D_LO_CTX_OFFSETS, DAV1D_MAX_TXFM_SIZE_FOR_BS,
+    TxfmInfo, CFL_ALLOWED_MASK, DAV1D_AL_PART_CTX, DAV1D_BLOCK_SIZES, DAV1D_FILTER_MODE_TO_Y_MODE,
+    DAV1D_INTRA_MODE_CONTEXT, DAV1D_MAX_TXFM_SIZE_FOR_BS,
     DAV1D_PARTITION_TYPE_COUNT, DAV1D_TXFM_DIMENSIONS, DAV1D_TXTP_FROM_UVMODE,
     DAV1D_TX_TYPES_PER_SET, DAV1D_TX_TYPE_CLASS,
 };
@@ -2677,29 +2677,6 @@ fn coef_ctx<'a>(above: &'a mut Ctx, left: &'a mut Ctx, plane: usize) -> (&'a mut
     }
 }
 
-/// Coefficient positions in coding order: scan index to rav1d's coefficient index.
-fn scan_rc(tx: TxfmSize, class: TxClass, i: usize) -> (usize, u8, u8) {
-    let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
-    let slw = cmp::min(t_dim.lw, TxfmSize::S32x32 as u8);
-    let slh = cmp::min(t_dim.lh, TxfmSize::S32x32 as u8);
-    match class {
-        TxClass::TwoD => {
-            let rc = DAV1D_SCANS[tx as usize][i].get() as usize;
-            (rc, (rc >> (slh + 2)) as u8, (rc & ((4 << slh) - 1)) as u8)
-        }
-        TxClass::H => {
-            let x = (i & ((4 << slh) - 1)) as u8;
-            let y = (i >> (slh + 2)) as u8;
-            (i, x, y)
-        }
-        TxClass::V => {
-            let x = (i & ((4 << slw) - 1)) as u8;
-            let y = (i >> (slw + 2)) as u8;
-            ((x as usize) << (slh + 2) | y as usize, x, y)
-        }
-    }
-}
-
 /// Scan index by coefficient index, the inverse of `scan_rc`, per transform size and class.
 fn scan_index(tx: TxfmSize, class: TxClass) -> &'static [u16] {
     static TABLES: std::sync::OnceLock<Vec<Vec<u16>>> = std::sync::OnceLock::new();
@@ -2724,58 +2701,6 @@ fn scan_index(tx: TxfmSize, class: TxClass) -> &'static [u16] {
         TxClass::V => 2,
     };
     &tables[tx as usize * 3 + c]
-}
-
-/// Coding order per transform size and class: coefficient index, x, y, and the offset in
-/// `write_coefs`' level buffer.
-fn scan_table(tx: TxfmSize, class: TxClass) -> &'static [(u16, u8, u8, u16)] {
-    static TABLES: std::sync::OnceLock<Vec<Vec<(u16, u8, u8, u16)>>> = std::sync::OnceLock::new();
-    let tables = TABLES.get_or_init(|| {
-        (0..TxfmSize::COUNT * 3)
-            .map(|k| {
-                let tx = TxfmSize::from_repr(k / 3).unwrap();
-                let class = [TxClass::TwoD, TxClass::H, TxClass::V][k % 3];
-                let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
-                let n = cmp::min(t_dim.w as usize * 4, 32) * cmp::min(t_dim.h as usize * 4, 32);
-                (0..n)
-                    .map(|i| {
-                        let (rc, x, y) = scan_rc(tx, class, i);
-                        let off = if class == TxClass::TwoD { rc } else { x as usize * 16 + y as usize };
-                        (rc as u16, x, y, off as u16)
-                    })
-                    .collect()
-            })
-            .collect()
-    });
-    let c = match class {
-        TxClass::TwoD => 0,
-        TxClass::H => 1,
-        TxClass::V => 2,
-    };
-    &tables[tx as usize * 3 + c]
-}
-
-/// rav1d's `get_lo_ctx` at `off` in the level buffer: the base token context and the
-/// neighbourhood magnitude the base-range context takes.
-#[inline(always)]
-fn lo_ctx(levels: &[u8], off: usize, offsets: Option<&[[LoCtxOffset; 32]; 32]>, x: u8, y: u8, stride: usize) -> (usize, u32) {
-    let l = |d: usize| levels[off + d] as u32;
-    let mut mag = l(1) + l(stride);
-    let (hi, offset) = match offsets {
-        Some(o) => {
-            mag += l(stride + 1);
-            let hi = mag;
-            mag += l(2) + l(2 * stride);
-            (hi, o[y as usize][x as usize].get() as usize)
-        }
-        None => {
-            mag += l(2);
-            let hi = mag;
-            mag += l(3) + l(4);
-            (hi, 26 + if y > 1 { 10 } else { y as usize * 5 })
-        }
-    };
-    (offset + if mag > 512 { 4 } else { ((mag + 64) >> 7) as usize }, hi)
 }
 
 fn pal_key(chroma: bool, x: i32, y: i32, bw4: i32, bh4: i32, intra: &Intra) -> (bool, u8, i32, i32, i32, i32, [[u8; 8]; 2]) {
@@ -2886,18 +2811,12 @@ fn write_coefs<S: Sink>(
         w.bools(eob & ((1 << (bin - 2)) - 1), bin - 2);
     }
 
-    let scan = scan_table(tx, class);
+    let lay = contexts::layout(tx, class);
+    let scan = &lay.scan[..];
     let level_at = |i: usize| coefs[scan[i].0 as usize].unsigned_abs();
-    let pack = |l: u32| ((cmp::min(l, 3) << 6) | cmp::min(l, 15)) as u8;
     let hi_ctx = cmp::min(t_dim.ctx, 3) as usize;
-    let mut levels = [0u8; 1088];
-    let stride: usize = if class == TxClass::TwoD { 4 << slh } else { 16 };
-    let offsets = if class == TxClass::TwoD {
-        let is_rect = tx.is_rect() as usize;
-        Some(&DAV1D_LO_CTX_OFFSETS[is_rect + (tx as usize & is_rect)])
-    } else {
-        None
-    };
+    let mut scratch = contexts::Scratch::new();
+    let (base_ctx, br_mag) = contexts::contexts(lay, coefs, eob as usize, &mut scratch);
     // Counted, the AC signs and Golomb tails cost the same wherever they fall, so they are
     // added in this pass; the AC levels' sum is kept for the contexts.
     let (mut tail_sum, mut tail_bits) = (0u32, 0u32);
@@ -2912,7 +2831,7 @@ fn write_coefs<S: Sink>(
     };
     let dc_level;
     if eob > 0 {
-        let (_, x, y, off) = scan[eob as usize];
+        let (_, x, y, _) = scan[eob as usize];
         let lv = level_at(eob as usize);
         tail(lv);
         let ctx = 1 + (eob > (2 << tx2dszctx)) as usize + (eob > (4 << tx2dszctx)) as usize;
@@ -2922,35 +2841,25 @@ fn write_coefs<S: Sink>(
             let ctx = if far { 14 } else { 7 };
             br_tok(w, costs, cdf, hi_ctx, chroma, ctx, cmp::min(lv, 15) as u8);
         }
-        levels[off as usize] = pack(lv);
         for i in (1..eob as usize).rev() {
             let (rc, x, mut y, off) = scan[i];
             let off = off as usize;
-            let (lo, mag) = lo_ctx(&levels, off, offsets, x, y, stride);
             let lv = coefs[rc as usize].unsigned_abs();
             tail(lv);
-            base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, lo, cmp::min(lv, 3) as u8);
+            base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, base_ctx[off] as usize, cmp::min(lv, 3) as u8);
             if class == TxClass::TwoD {
                 y |= x;
             }
             if lv >= 3 {
-                let mag = mag as u8 & 63;
-                let ctx = if y > (class == TxClass::TwoD) as u8 { 14 } else { 7 }
-                    + if mag > 12 { 6 } else { (mag + 1) >> 1 } as usize;
+                let ctx = if y > (class == TxClass::TwoD) as u8 { 14 } else { 7 } + br_mag[off] as usize;
                 br_tok(w, costs, cdf, hi_ctx, chroma, ctx, cmp::min(lv, 15) as u8);
             }
-            levels[off] = pack(lv);
         }
-        let (lo, mut mag) = if class == TxClass::TwoD { (0, 0) } else { lo_ctx(&levels, 0, offsets, 0, 0, stride) };
+        let lo = if class == TxClass::TwoD { 0 } else { base_ctx[0] as usize };
         let lv = level_at(0);
         base_tok(w, costs, cdf, t_dim.ctx as usize, chroma, lo, cmp::min(lv, 3) as u8);
         if lv >= 3 {
-            if class == TxClass::TwoD {
-                mag = levels[1] as u32 + levels[stride] as u32 + levels[stride + 1] as u32;
-            }
-            let mag = mag as u8 & 63;
-            let ctx = if mag > 12 { 6 } else { (mag + 1) >> 1 } as usize;
-            br_tok(w, costs, cdf, hi_ctx, chroma, ctx, cmp::min(lv, 15) as u8);
+            br_tok(w, costs, cdf, hi_ctx, chroma, br_mag[0] as usize, cmp::min(lv, 15) as u8);
         }
         dc_level = lv;
     } else {
