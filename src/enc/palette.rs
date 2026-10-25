@@ -195,14 +195,25 @@ pub fn candidates_y(px: &[u8]) -> Vec<Vec<u8>> {
     }
 }
 
+/// The first of the smallest distances, as `min_by` with `total_cmp` picks it.
+fn nearest_of(d: impl Iterator<Item = f64>) -> usize {
+    let mut best = (f64::INFINITY, 0);
+    for (i, d) in d.enumerate() {
+        if i == 0 || d.total_cmp(&best.0).is_lt() {
+            best = (d, i);
+        }
+    }
+    best.1
+}
+
 fn kmeans1(hist: &[u32; 256], colors: &[u8], k: usize) -> Vec<u8> {
     let mut by_count = colors.to_vec();
     by_count.sort_by_key(|&c| cmp::Reverse(hist[c as usize]));
     let mut centres: Vec<f64> = by_count[..k].iter().map(|&c| c as f64).collect();
     for _ in 0..8 {
-        let mut sum = vec![(0f64, 0f64); k];
+        let mut sum = [(0f64, 0f64); 8];
         for &c in colors {
-            let i = (0..k).min_by(|&a, &b| (centres[a] - c as f64).abs().total_cmp(&(centres[b] - c as f64).abs())).unwrap();
+            let i = nearest_of(centres.iter().map(|&m| (m - c as f64).abs()));
             let w = hist[c as usize] as f64;
             sum[i].0 += w * c as f64;
             sum[i].1 += w;
@@ -254,9 +265,9 @@ fn kmeans2(counts: &[((u8, u8), u32)], k: usize) -> Vec<(u8, u8)> {
     let mut centres: Vec<(f64, f64)> = by_count[..k].iter().map(|c| (c.0 .0 as f64, c.0 .1 as f64)).collect();
     let dist = |a: (f64, f64), b: (u8, u8)| (a.0 - b.0 as f64).powi(2) + (a.1 - b.1 as f64).powi(2);
     for _ in 0..8 {
-        let mut sum = vec![(0f64, 0f64, 0f64); k];
+        let mut sum = [(0f64, 0f64, 0f64); 8];
         for &(p, n) in counts {
-            let i = (0..k).min_by(|&a, &b| dist(centres[a], p).total_cmp(&dist(centres[b], p))).unwrap();
+            let i = nearest_of(centres.iter().map(|&m| dist(m, p)));
             let w = n as f64;
             sum[i].0 += w * p.0 as f64;
             sum[i].1 += w * p.1 as f64;
