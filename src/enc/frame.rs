@@ -21,6 +21,7 @@ use crate::enc::ec::Writer;
 use crate::enc::fdct_fast;
 use crate::enc::palette;
 use crate::enc::partition_cnn::{Cnn, Prune};
+use crate::enc::quant;
 use crate::enc::header::{obu, BitWriter, Frame, Sequence, OBU_FRAME, OBU_SEQUENCE_HEADER};
 use crate::enc::rd::{lambda, CoefCosts, Counter, Sink};
 use crate::enum_map::DefaultValue;
@@ -1459,7 +1460,9 @@ impl<D: Decide> Encoder<D> {
                 self.recon_ready = false;
                 self.residual_bits = None;
                 self.residual_dist = 0;
+                let mut known_eob = None;
                 let decided = if self.predict_only {
+                    known_eob = Some(-1);
                     Some(fixed_txtp)
                 } else if let Some(replay) = self.replay.as_mut() {
                     let t = replay.pop().expect("a replayed residual per transform block");
@@ -1468,6 +1471,7 @@ impl<D: Decide> Encoder<D> {
                         levels.copy_from_slice(&t.coefs.levels);
                     }
                     self.residual_bits = t.bits;
+                    known_eob = Some(t.eob);
                     Some(t.coefs.txtp)
                 } else if self.dry || self.decide.searches() {
                     None
@@ -1501,10 +1505,12 @@ impl<D: Decide> Encoder<D> {
                         } else {
                             all
                         };
-                        self.rd_residual(bs, plane, px, py, tx, cands, intra, levels)
+                        let (txtp, eob) = self.rd_residual(bs, plane, px, py, tx, cands, intra, levels);
+                        known_eob = Some(eob);
+                        txtp
                     }
                 };
-                let eob = eob_of(tx, txtp, levels);
+                let eob = known_eob.unwrap_or_else(|| eob_of(tx, txtp, levels));
                 if eob >= 0 && self.recon_ready {
                     let rec = &self.rec[plane];
                     for r in 0..ph {
@@ -1564,16 +1570,7 @@ impl<D: Decide> Encoder<D> {
         fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, DCT_DCT);
         let qm = self.qm[tx as usize][0];
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
-        let eob = quantize(&coefs[..n], &mut trial[..n], self.dq[0], qm, shift, 48, scan_index(tx, TxClass::TwoD));
-        let dq = self.dq[0];
-        let err: i64 = (0..n)
-            .map(|rc| {
-                let q = dq[(rc != 0) as usize];
-                let q = qm.map_or(q, |m| q * m[rc] as u32 + 16 >> 5) as i64;
-                let d = ((coefs[rc].unsigned_abs() as i64) << shift) - q * trial[rc].unsigned_abs() as i64;
-                d * d
-            })
-            .sum();
+        let (eob, err) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[0], qm, shift, 48, scan_index(tx, TxClass::TwoD));
         let (ax, ly) = (x as usize, (y & 15) as usize);
         let (mut a, mut l) = ([0x40u8; 48], [0x40u8; 48]);
         a[..16].copy_from_slice(&self.above.lcoef[ax..][..16]);
@@ -1585,8 +1582,8 @@ impl<D: Decide> Encoder<D> {
         err as f64 / 64.0 + self.lambda * c.bits as f64 / 512.0
     }
 
-    /// Chooses a transform type from `cands` and its levels by rate and distortion; the
-    /// prediction is in place in the reconstruction.
+    /// Chooses a transform type from `cands`, its levels and their end of block by rate and
+    /// distortion; the prediction is in place in the reconstruction.
     #[allow(clippy::too_many_arguments)]
     fn rd_residual(
         &mut self,
@@ -1598,7 +1595,7 @@ impl<D: Decide> Encoder<D> {
         cands: &[TxfmType],
         intra: &Intra,
         levels: &mut [i32],
-    ) -> TxfmType {
+    ) -> (TxfmType, i32) {
         let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
         let (pw, ph) = (t_dim.w as usize * 4, t_dim.h as usize * 4);
         let wy = (py as usize * 4) % SB;
@@ -1627,7 +1624,7 @@ impl<D: Decide> Encoder<D> {
         if self.skip_predicted {
             levels.fill(0);
             self.bufs = Some(b);
-            return cands[0];
+            return (cands[0], -1);
         }
         let sse = |a: &[u8], b: &[u8], stride: usize| -> u64 {
             let mut s = 0;
@@ -1659,7 +1656,7 @@ impl<D: Decide> Encoder<D> {
         let zero_dist = if lossless { 0 } else { sse(&src[..], &pred[..], pw) };
         self.residual_dist = zero_dist;
         let zero = if lossless { f64::MAX } else { zero_dist as f64 + self.lambda * zero_rate as f64 / 512.0 };
-        let mut best = (zero, cands[0]);
+        let mut best = (zero, cands[0], -1);
         levels.fill(0);
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
         if self.tx_domain_dist && cands.len() > 1 && self.rdoq == 0 && !lossless && (vw, vh) == (pw, ph) {
@@ -1667,20 +1664,11 @@ impl<D: Decide> Encoder<D> {
             for &txtp in cands {
                 fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
                 let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
-                let eob = quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, 48, scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]));
+                let (eob, err) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, 48, scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]));
                 if eob < 0 {
                     continue;
                 }
                 let bits = rate(self, txtp, &trial[..n], eob);
-                let dq = self.dq[plane];
-                let err: i64 = (0..n)
-                    .map(|rc| {
-                        let q = dq[(rc != 0) as usize];
-                        let q = qm.map_or(q, |m| q * m[rc] as u32 + 16 >> 5) as i64;
-                        let d = ((coefs[rc].unsigned_abs() as i64) << shift) - q * trial[rc].unsigned_abs() as i64;
-                        d * d
-                    })
-                    .sum();
                 let cost = err as f64 / 64.0 + self.lambda * bits as f64 / 512.0;
                 if winner.is_none_or(|w| cost < w.0) {
                     winner = Some((cost, txtp, eob, bits));
@@ -1698,19 +1686,19 @@ impl<D: Decide> Encoder<D> {
                     self.residual_bits = Some(bits);
                     self.residual_dist = dist;
                     self.bufs = Some(b);
-                    return txtp;
+                    return (txtp, eob);
                 }
                 levels.fill(0);
             }
             self.bufs = Some(b);
-            return cands[0];
+            return (cands[0], -1);
         }
         let mut last = None;
         for &txtp in cands {
             fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
             let index = scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]);
-            let eob = quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 }, index);
+            let (eob, _) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 }, index);
             if eob < 0 {
                 continue;
             }
@@ -1771,7 +1759,7 @@ impl<D: Decide> Encoder<D> {
             }
             let cost = dist as f64 + self.lambda * bits as f64 / 512.0;
             if cost < best.0 {
-                best = (cost, txtp);
+                best = (cost, txtp, eob);
                 levels.copy_from_slice(&trial[..n]);
                 self.residual_bits = Some(bits);
                 self.residual_dist = dist;
@@ -1779,27 +1767,14 @@ impl<D: Decide> Encoder<D> {
         }
         self.recon_ready = best.0 < zero && last == Some(best.1);
         self.bufs = Some(b);
-        best.1
+        (best.1, best.2)
     }
 
     fn dequant(&self, plane: usize, tx: TxfmSize, txtp: TxfmType, levels: &[i32], cf: &mut [i16]) {
         let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
-        let shift = cmp::max(0, t_dim.ctx as i32 - 2);
+        let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
         let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
-        for (rc, (&l, c)) in levels.iter().zip(cf.iter_mut()).enumerate() {
-            if l == 0 {
-                *c = 0;
-                continue;
-            }
-            let mut dq = self.dq[plane][(rc != 0) as usize];
-            if let Some(qm) = qm {
-                dq = dq * qm[rc] as u32 + 16 >> 5;
-            }
-            let tok = l.unsigned_abs() & 0xfffff;
-            let v = ((dq.wrapping_mul(tok) & 0xffffff) >> shift) as i32;
-            let v = cmp::min(v, 0x7fff + (l < 0) as i32);
-            *c = if l < 0 { -v } else { v } as i16;
-        }
+        quant::dequantize(levels, cf, self.dq[plane], qm, shift);
     }
 
     /// The squared error of the reconstruction in a block's visible area, in the given planes.
@@ -2415,7 +2390,6 @@ fn delta_steps(res: i32, last: u8, want: u8) -> i32 {
     }
 }
 
-/// The quantized level of each coefficient: `rounding` in 1/128 of a step.
 /// libaom's `predict_skip_txfm` at level 1 for an 8-bit luma residual of `pw`×`ph`, `vw`×`vh`
 /// of it visible: a mean square error under (dc_q / 8)² / 8 and DCT coefficients, in tiles of up
 /// to 16×16, all under a block-size multiple of the quantizer.
@@ -2459,25 +2433,6 @@ fn predicts_skip(residual: &[i16], pw: usize, ph: usize, vw: usize, vh: usize, d
         }
     }
     true
-}
-
-/// Returns the end of block, the last nonzero level's position in `index` (the scan), or -1.
-#[allow(clippy::too_many_arguments)]
-fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> i32 {
-    let mut eob = -1;
-    for (rc, ((&c, l), &i)) in coefs.iter().zip(levels.iter_mut()).zip(index).enumerate() {
-        let mut q = dq[(rc != 0) as usize];
-        if let Some(qm) = qm {
-            q = q * qm[rc] as u32 + 16 >> 5;
-        }
-        let a = (c.unsigned_abs() as u64) << shift;
-        let v = ((a * 128 + q as u64 * rounding as u64) / (q as u64 * 128)) as i32;
-        *l = if c < 0 { -v } else { v };
-        if v != 0 {
-            eob = cmp::max(eob, i as i32);
-        }
-    }
-    eob
 }
 
 /// The context a transform block leaves for its neighbours: the sum of its levels, capped, and

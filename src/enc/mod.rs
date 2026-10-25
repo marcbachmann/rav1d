@@ -8,6 +8,7 @@ pub mod frame;
 pub mod header;
 pub mod palette;
 pub mod partition_cnn;
+pub mod quant;
 pub mod rd;
 
 use std::cmp;
