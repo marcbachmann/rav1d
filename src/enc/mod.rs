@@ -1,5 +1,6 @@
 //! An AV1 still-image encoder, see `doc/encoder.md`.
 
+pub mod dist;
 pub mod ec;
 pub mod fdct;
 pub mod fdct_fast;

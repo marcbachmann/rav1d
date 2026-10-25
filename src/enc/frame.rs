@@ -17,6 +17,7 @@ use crate::cdf::{rav1d_cdf_thread_copy, rav1d_cdf_thread_init_static, CdfContext
 use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
 use crate::dequant_tables::DAV1D_DQ_TBL;
 use crate::disjoint_mut::DisjointMut;
+use crate::enc::dist;
 use crate::enc::ec::Writer;
 use crate::enc::fdct_fast;
 use crate::enc::palette;
@@ -1811,24 +1812,13 @@ impl<D: Decide> Encoder<D> {
         let x0 = x as usize * 4;
         let w = cmp::min(w4 * 4, (self.seq.width as usize).saturating_sub(x0)).next_multiple_of(4);
         let h = cmp::min(h4 * 4, (self.seq.height as usize).saturating_sub(y as usize * 4)).next_multiple_of(4);
-        let wy = (y as usize * 4) % SB;
-        let (src, rec) = (&self.src[plane], &self.rec[plane]);
-        let mut total = 0;
-        for by in (0..h).step_by(4) {
-            for bx in (0..w).step_by(4) {
-                let mut d = [[0i32; 4]; 4];
-                for (r, row) in d.iter_mut().enumerate() {
-                    let at = (wy + by + r) * src.stride + x0 + bx;
-                    let s = src.comp.slice::<BD, _>((at.., ..4));
-                    let p = rec.comp.slice::<BD, _>((at.., ..4));
-                    for c in 0..4 {
-                        row[c] = s[c] as i32 - p[c] as i32;
-                    }
-                }
-                total += hadamard4(&d) as u64;
-            }
+        if w == 0 || h == 0 {
+            return 0;
         }
-        total
+        let (src, rec) = (&self.src[plane], &self.rec[plane]);
+        let at = (y as usize * 4) % SB * src.stride + x0;
+        let len = (h - 1) * src.stride + w;
+        dist::satd(&src.comp.slice::<BD, _>((at.., ..len)), &rec.comp.slice::<BD, _>((at.., ..len)), src.stride, w, h)
     }
 
     fn snap(&self, x: i32, y: i32, w4: usize, h4: usize) -> Snap {
@@ -2354,19 +2344,6 @@ fn coef_bits<D: Decide>(e: &mut Encoder<D>, txs: &[TxDone], bs: BlockSize, intra
     e.above.restore_coef(ax, &saved_a);
     e.left.restore_coef(ly, &saved_l);
     c.bits
-}
-
-fn hadamard4(d: &[[i32; 4]; 4]) -> u32 {
-    let h4 = |v: [i32; 4]| {
-        let (a, b, c, e) = (v[0] + v[1], v[0] - v[1], v[2] + v[3], v[2] - v[3]);
-        [a + c, b + e, a - c, b - e]
-    };
-    let rows = d.map(h4);
-    let mut sum = 0;
-    for c in 0..4 {
-        sum += h4([rows[0][c], rows[1][c], rows[2][c], rows[3][c]]).iter().map(|v| v.unsigned_abs()).sum::<u32>();
-    }
-    sum
 }
 
 fn smooth(m: u8) -> i32 {
