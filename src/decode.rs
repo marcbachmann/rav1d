@@ -4998,8 +4998,9 @@ pub(crate) type Trial<'a> = dyn FnMut(&dyn Fn(&mut Rav1dFrameHeader)) -> [u64; 3
 
 /// For the encoder's filter strength search: decodes the frame set up to be decoded by rows, with
 /// the context's in-loop filters off and its loop filter data kept for the whole frame, then lets
-/// `search` run trials on it, as many as it likes, before the frame ends. Frames with deltas of
-/// the loop filter level by superblock, 8-bit 4:4:4 or monochrome only.
+/// `search` run trials on it, as many as it likes, before the frame ends. Frames without
+/// segmentation or deltas of the loop filter level, 8-bit 4:4:4 or monochrome only; a trial keeps
+/// the CDEF index bits, sharpness and mode deltas the frame was decoded with.
 pub(crate) fn rav1d_filter_trials(
     c: &Rav1dContext,
     state: &mut Rav1dState,
@@ -5020,6 +5021,7 @@ pub(crate) fn rav1d_filter_trials(
             && f.bitdepth_max == 0xff
             && matches!(f.cur.p.layout, Rav1dPixelLayout::I444 | Rav1dPixelLayout::I400)
             && f.frame_hdr().delta.lf.present == 0
+            && f.frame_hdr().segmentation.enabled == 0
             && f.frame_hdr().loopfilter.level_y != [0; 2];
         let mut sby = rows.sby;
         let mut res = if usable { Ok(()) } else { Err(Rav1dError::InvalidArgument) };
@@ -5050,6 +5052,14 @@ pub(crate) fn rav1d_filter_trials(
         let mut trial = |edit: &dyn Fn(&mut Rav1dFrameHeader)| {
             let mut hdr = original.rav1d.clone();
             edit(&mut hdr);
+            assert!(
+                hdr.cdef.n_bits == original.cdef.n_bits
+                    && hdr.loopfilter.sharpness == original.loopfilter.sharpness
+                    && hdr.loopfilter.mode_ref_delta_enabled == original.loopfilter.mode_ref_delta_enabled
+                    && hdr.loopfilter.mode_ref_deltas.mode_delta == original.loopfilter.mode_ref_deltas.mode_delta
+                    && hdr.loopfilter.mode_ref_deltas.ref_delta == original.loopfilter.mode_ref_deltas.ref_delta,
+                "a trial changes the filter levels and strengths only"
+            );
             set_filter_levels(f, &hdr);
             f.frame_hdr = Some(Arc::new(DRav1d::from_rav1d(hdr)));
             for (p, bytes) in unfiltered.iter().enumerate() {
