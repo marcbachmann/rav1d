@@ -36,6 +36,22 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-25, libaom's intra CNN partition pruning** (branch `encoder-cnn`). `partition_cnn.rs`
+ports `intra_mode_cnn_partition` with the CNN and dense layers it runs, in f32 in libaom's C
+order; `scripts/cnn-partition-compare.sh <libaom>` builds libaom's own `cnn.c`/`ml.c` and model
+(generic C, no FMA) and compares: 5304 blocks (2400 random, all 256 qindexes, 2648 corpus
+superblocks), 9.1 M values, all bit-identical, no decision differs at any of the three
+resolutions. `Options::cnn_prune` (off by default, `ENC_CNN_PRUNE`): level 1 prunes Split below
+the no-split threshold and H/V above the split threshold, level 2 also None; only in superblocks
+wholly inside the picture, from the superblock's coded qindex, None never pruned where Split is
+not searched (`levels`). Pinned on the 13 crops at the product settings, best of 3 rounds:
+qindex 32 7038 / 5243 / 4496 ms (off / 1 / 2), qindex 140 3914 / 2961 / 2680 ms. At equal bytes
+(slopes from qindex 28/36 and 132/148: 1% bytes is 0.093 dB at 32, 0.049 at 140) the ten photos
+lose 0.015 / 0.033 dB at 32 for -28% / -38% and nothing at 140 (+0.003 / +0.007) for -24% /
+-32%; the three synthetic pictures (gradient, logo, UI) lose 0.25 / 1.19 dB at 32 and 0.44 /
+0.90 at 140 (graphic-logo 61.49 -> 58.82 dB at 32 with level 2, graphic-ui +12% bytes at 140).
+Over all 13: -0.133 / -0.280 dB at 32, -0.083 / -0.104 at 140.
+
 **2026-10-25, libaom's search shortcuts.** Timed against libaom (cpu-used 5, one thread, every
 crate at opt-level 3, pinned): 1.9-6.5x slower, graphics worst. A read of libaom's all-intra
 speed features listed what its search skips; taken so far:
