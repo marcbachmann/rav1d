@@ -72,7 +72,8 @@ pub struct Options {
     pub keep_chroma: usize,
     /// Screen content tools: palettes.
     pub screen: bool,
-    /// H and V partitions: 0 never, 1 always, 2 where Split beat None.
+    /// H and V partitions: 0 never, 1 always, 2 where Split beat None, 3 also the one along the
+    /// direction of None's luma mode where None did (libaom's `prune_rect_part_using_none_pred_mode`).
     pub rect: u8,
     /// Transform types are searched for the chosen depth only.
     pub late_txtp: bool,
@@ -143,6 +144,8 @@ impl Options {
             _ => (2, 2, 0, 0..4, 4.0),
         };
         let levels = if effort <= 3 && qidx > 100 { levels.start..levels.end.min(3) } else { levels };
+        // Text and graphics need the H or V partition along None's direction; photos gain 0.03 dB for 30% more time.
+        let rect = if screen && rect == 2 { 3 } else { rect };
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };

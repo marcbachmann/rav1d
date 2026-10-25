@@ -38,8 +38,9 @@ use crate::ipred_prepare::rav1d_prepare_intra_edges;
 use crate::itx::Rav1dInvTxfmDSPContext;
 use crate::levels::{
     BlockLevel, BlockPartition, BlockSize, TxClass, TxfmSize, TxfmType, CFL_PRED, DCT_DCT,
-    DC_PRED, FILTER_PRED, IDTX, N_INTRA_PRED_MODES, N_UV_INTRA_PRED_MODES, SMOOTH_H_PRED,
-    SMOOTH_PRED, SMOOTH_V_PRED, VERT_LEFT_PRED, VERT_PRED, WHT_WHT,
+    DC_PRED, FILTER_PRED, HOR_DOWN_PRED, HOR_PRED, HOR_UP_PRED, IDTX, N_INTRA_PRED_MODES,
+    N_UV_INTRA_PRED_MODES, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, VERT_LEFT_PRED, VERT_PRED,
+    VERT_RIGHT_PRED, WHT_WHT,
 };
 use crate::qm::DAV1D_QM_TBL;
 use crate::recon::{get_dc_sign_ctx, get_skip_ctx};
@@ -1972,8 +1973,16 @@ impl<D: Decide> Encoder<D> {
                     continue;
                 }
             }
-            if matches!(bp, H | V) && halves == Halves::Both && self.rect == 2 && best.as_ref().is_some_and(|b| b.3.first().is_some_and(|n| matches!(n, Node::Part(None)))) {
-                break;
+            if matches!(bp, H | V) && halves == Halves::Both && self.rect >= 2 {
+                if let Some([Node::Part(None), Node::Block(intra, ..), ..]) = best.as_ref().map(|b| b.3.as_slice()) {
+                    let along = match bp {
+                        V => matches!(intra.y_mode, VERT_PRED | VERT_LEFT_PRED | VERT_RIGHT_PRED),
+                        _ => matches!(intra.y_mode, HOR_PRED | HOR_DOWN_PRED | HOR_UP_PRED),
+                    };
+                    if !(self.rect == 3 && along) {
+                        continue;
+                    }
+                }
             }
             if bp != None && self.prune > 0.0 && best.as_ref().is_some_and(|b| b.0 < self.prune * self.lambda * (n4 * n4) as f64) {
                 break;
