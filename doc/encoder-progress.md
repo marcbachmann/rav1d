@@ -63,7 +63,11 @@ an `i32::MIN` level (unreachable: levels stay under 2^15) and lane tests that co
 scalar lane with itself: `Lane::detect()` reads rav1d's CPU flags, empty on x86 until a decoder
 or `Dsp::new` sets them; tests take `Lane::testable()`. It found the bytes equal on AVX2, NEON
 and 845161bb over 140 encodes. Dead end: the quantizer in 8 f32 lanes with an integer
-correction, plus skipping chunks past the end of block in `ac_bits`, −0.5% / −0.3%. The `ip-build:trixie` image on `worker` was gone (all images pruned) and was rebuilt
+correction, plus skipping chunks past the end of block in `ac_bits`, −0.5% / −0.3%.
+Against libaom (cpu-used 5, one thread, pinned, image-processing `own::compare` at opt-level 3)
+at effort 4 after this round: photos 0.81–1.46× libaom's time at Q75 and 1.36–1.92× at Q40,
+graphics 1.11–3.04× (gradient, 25 ms in libaom); quality at libaom's bytes as before (photos
+−0.08 to +0.30 dB, hills Q75 −0.71). The `ip-build:trixie` image on `worker` was gone (all images pruned) and was rebuilt
 from image-processing `scripts/build.Dockerfile`.
 
 **2026-10-25, libaom's intra CNN partition pruning** (branch `encoder-cnn`). `partition_cnn.rs`
