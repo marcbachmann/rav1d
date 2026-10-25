@@ -3,7 +3,6 @@
 
 use std::cmp;
 
-use crate::decode::order_palette;
 use crate::enc::rd::Sink;
 
 /// The colours above and left that a block's palette may reuse, sorted and without repeats, as
@@ -118,18 +117,41 @@ pub fn write_v<S: Sink>(s: &mut S, v: &[u8]) {
 /// A block's colour indexes, `w`×`h` visible of a map `stride` wide, in wavefront order.
 pub fn write_indices<S: Sink>(s: &mut S, cdf: &mut [[u16; 8]; 5], map: &[u8], stride: usize, w: usize, h: usize, n: u8) {
     s.uniform(map[0] as u32, n as u32);
-    let mut order = [[0u8; 8]; 64];
-    let mut ctx = [0u8; 64];
     for i in 1..w + h - 1 {
         let first = cmp::min(i, w - 1);
         let last = (i + 1).saturating_sub(h);
-        order_palette(map, stride, i, first, last, &mut order, &mut ctx);
-        for (m, j) in (last..=first).rev().enumerate() {
-            let idx = map[(i - j) * stride + j];
-            let sym = order[m].iter().position(|&o| o == idx).unwrap();
-            s.symbol(sym as u8, &mut cdf[ctx[m] as usize], n - 1);
+        for j in (last..=first).rev() {
+            let (sym, ctx) = symbol(map, stride, (i - j) * stride + j, j > 0, i > j);
+            s.symbol(sym, &mut cdf[ctx], n - 1);
         }
     }
+}
+
+/// The symbol and context of the index at `at`: its place in rav1d's `order_palette` order,
+/// the distinct neighbours first and then the other colours ascending.
+fn symbol(map: &[u8], stride: usize, at: usize, left: bool, top: bool) -> (u8, usize) {
+    let v = map[at];
+    let (ctx, near, k) = if !left {
+        (0, [map[at - stride], 0, 0], 1)
+    } else if !top {
+        (0, [map[at - 1], 0, 0], 1)
+    } else {
+        let (l, t, tl) = (map[at - 1], map[at - stride], map[at - stride - 1]);
+        if t == l && t == tl {
+            (4, [t, 0, 0], 1)
+        } else if t == l {
+            (3, [t, tl, 0], 2)
+        } else if t == tl || l == tl {
+            (2, [tl, if t == tl { l } else { t }, 0], 2)
+        } else {
+            (1, [cmp::min(t, l), cmp::max(t, l), tl], 3)
+        }
+    };
+    if let Some(m) = near[..k].iter().position(|&c| c == v) {
+        return (m as u8, ctx);
+    }
+    let below = near[..k].iter().filter(|&&c| c < v).count();
+    ((k + v as usize - below) as u8, ctx)
 }
 
 /// The index of the nearest colour, the first of equals.
@@ -250,4 +272,35 @@ fn kmeans2(counts: &[((u8, u8), u32)], k: usize) -> Vec<(u8, u8)> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::order_palette;
+    use crate::enc::frame::tests::Rng;
+
+    /// The symbols and contexts are those of rav1d's `order_palette` in wavefront order.
+    #[test]
+    fn symbols_as_rav1d_orders() {
+        let mut rng = Rng(0x5eed_9a1e);
+        for _ in 0..3000 {
+            let (w, h) = (cmp::min(4usize << rng.below(5), 64), cmp::min(4usize << rng.below(5), 64));
+            let n = 2 + rng.below(7) as u8;
+            let spread = 1 + rng.below(n as u32);
+            let map: Vec<u8> = (0..w * h).map(|_| rng.below(spread) as u8).collect();
+            let mut order = [[0u8; 8]; 64];
+            let mut ctx = [0u8; 64];
+            for i in 1..w + h - 1 {
+                let first = cmp::min(i, w - 1);
+                let last = (i + 1).saturating_sub(h);
+                order_palette(&map, w, i, first, last, &mut order, &mut ctx);
+                for (m, j) in (last..=first).rev().enumerate() {
+                    let idx = map[(i - j) * w + j];
+                    let want = (order[m].iter().position(|&o| o == idx).unwrap() as u8, ctx[m] as usize);
+                    assert_eq!(want, symbol(&map, w, (i - j) * w + j, j > 0, i > j), "{w}x{h} n {n} at {i},{j}");
+                }
+            }
+        }
+    }
 }
