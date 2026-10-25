@@ -164,6 +164,14 @@ impl Options {
     pub fn tune_iq(self) -> Self {
         Self { variance_boost: true, ssim: true, quant_matrices: true, chroma_delta_q: true, iq_rdmult: true, iq_filters: true, ..self }
     }
+
+    /// libaom's shortcuts from cpu-used 5 that cost AVIF gates at effort 4, for speed: partitions
+    /// pruned by its intra CNN, no 8×8 blocks above qindex 100, and luma modes pre-ranked by SATD
+    /// at every qindex.
+    pub fn fast(self) -> Self {
+        let levels = if self.qidx > 100 { self.levels.start..self.levels.end.min(3) } else { self.levels.clone() };
+        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre: 6, ..self }
+    }
 }
 
 /// libaom's `aom_get_qmlevel_allintra`, tune IQ's range 2 to 10.
