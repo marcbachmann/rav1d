@@ -39,6 +39,16 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-25, rebased onto `main`; the filter search on one decode.** `encoder` now sits on
+marcbachmann/main 082c9e21 (frames decoded by superblock rows, a superblock row of filter and
+edge buffers on one thread, tile columns on the caller's threads), no conflicts; bytes and
+speed as before, the lib suite and `tests/decode_rows.rs` pass. The strength search decoded the
+frame 24 times; now one decode with the filters off keeps the loop filter's levels and masks
+frame-wide (`keep_filter_data`, the multi-thread layout) and an unfiltered copy of the picture,
+and each candidate refilters it (`rav1d_filter_trials`, `rav1d_refilter_sbrow`) (b9f14be4).
+Same bytes; −10.0% photo case q140, −8.7% screen q140, −12.0% q32. Memory: the search holds
+the picture twice, a 1400×1400 frame peaks at 46 MB VmHWM instead of 39–40.
+
 **2026-10-25, the block search's own overhead.** Same bytes at every step, pinned on 13 crops:
 - Trials restore only the planes they write (d05b0004): −3.3% q32, −3.8% q140.
 - Level vectors and transform block lists recycled, replays reuse their levels, the chroma
@@ -59,8 +69,7 @@ libaom's time at Q75 (most 0.77–1.04×), 1.15–1.65× at Q40; graphics 0.98�
 2.1–2.6× (24 ms in libaom); quality unchanged.
 
 Left in the photo case at q140: `predict_plane` 9%, quantizer 8%, filter strength search 9-12%
-(24 full decodes: 10 deblocking, 14 CDEF; an exact rework decodes once and reruns only the
-filters), intra edge preparation 2%.
+(24 full decodes; since b9f14be4 one), intra edge preparation 2%.
 
 **2026-10-25, SIMD for the search.** Profile at 845161bb, qindex 32: rate counting
 (`write_coefs` with a counter) 23%, quantizer 8%, dequantizer and `eob_of` 6%; at qindex 140
