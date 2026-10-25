@@ -28,7 +28,6 @@ every search can take its own shortcuts, and that is where the speed comes from.
   lower than the reference).
 - Film grain, superres, 4:2:0/4:2:2 input, 10/12-bit. The data structures stay generic over
   `BitDepth` like the rest of rav1d, so high bit depth can come later without a rewrite.
-- AV1 tiles inside a frame. Threads come from a wavefront instead (see [Threads](#threads)).
 
 ## What has to be coded
 
@@ -239,15 +238,19 @@ and a change that raises the peak needs a reason.
 
 ### Threads
 
-Single core comes first. Threads come once that is fast.
+Two uniform tile columns for photos over 512×512, each coded by its own encoder: `still_on`
+hands the columns after the first to the caller's spawner (the `Spawner` of
+`dav1d_open_with_spawner`), so image-processing's thread pool stays in charge, and the caller
+codes every column no worker started. The tiles are merged before the filter search, and the
+bytes do not depend on the threads. On the full-size corpus at qindex 140 two threads take
+3311 → 1947 ms, a second encoder about 2 MB; the second column costs photos +0.5% bytes at
++0.02 to +0.05 dB. Screen content and smaller pictures stay one tile: each tile learns its
+CDFs afresh, a fixed 100–300 B that grew graph paper 60% and failed three AVIF gates.
 
-- **Wavefront search.** Superblock rows search in parallel, each row two superblocks behind the
-  one above, so the above-right neighbours are always reconstructed. This needs no AV1 tiles,
-  so no bytes are lost to tile edges, and it works on one big frame, which is the case grid
-  tiles do not cover.
-- **Serial writing.** Writing the tokens is a small part of the time and stays on one thread.
-- Workers run on the caller's helpers through the same spawner API as `helpers`
-  (`dav1d_open_with_spawner`), so image-processing's thread pool and budget stay in charge.
+A wavefront over superblock rows was the first plan: no tile edges, but each row's search
+would take the CDFs of the superblock above-right (−0.02 to −0.05 dB at equal bytes, measured
+on branch `wavefront`), and the writer, the delta-q chain and the row handoffs would need a
+symbol recorder. Tiles cost about as much and decode on rav1d's tile threads too.
 
 ### API sketch
 
@@ -329,7 +332,7 @@ step, with a running handoff file.
 | M5 | Tune IQ: QM, variance-boost delta q, chroma delta q, SSIM rate weighting with a fixed or running reference; tune PSNR for alpha | photos within the gate including SSIMULACRA2; alpha within the gate |
 | M6 | Screen content per superblock (the `aom::Screen` counts, applied locally), palette search with the palette cache, screen-content transform choices | every graphics image within the gate, with no whole-image pre-pass |
 | M7 | Speed: pruning per effort, AVX2 + NEON kernels, profile-driven | at default effort, single core, the targets below; every effort within the gate |
-| M8 | Threads: wavefront on the caller's helpers | 2 and 3 CPU numbers; output identical to single-threaded |
+| M8 | Threads: tile columns on the caller's helpers | 2 and 3 CPU numbers; output identical to single-threaded |
 | M9 | image-processing: `aom.rs` replaced, `shiguredo_aom` and its cmake/libclang/llvm-tools build removed, `frame_memory`/`context` replaced by `Encoder::memory`, the rows no longer kept aside for the screen-content pre-pass; then the grid tile size revisited, since memory no longer forces small tiles and every tile edge costs 100–700 bytes | full Rust + JS suite green on worker |
 
 M1 and M2 make the bitstream correct; M3–M6 bring the quality; M7–M8 bring the speed.

@@ -39,6 +39,18 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-25, tile columns on threads.** Two tile columns on the full-size corpus (qindex 140
+and 60) cost +0.67% and +0.49% bytes at +0.048 and +0.020 dB; on threads the corpus took
+3311 → 1947 ms, hills 960×512 646 → 395 ms at 17.4 MB peak (16.1 MB on one tile). The fixed cost
+of a tile's own CDFs failed three AVIF gates on small and flat pictures (graph paper 431 → 704 B,
+a 300×200 grey ramp −1.5 dB, a posterised sepia photo −1.1 dB at libvips' bytes), so screen
+content and pictures up to 512×512 stay one tile. A refuter broke the first version's borrowed
+planes (a spawner that panics after taking work, or refuses and runs it later, left workers
+reading freed planes); workers now hold the planes through an `Arc` and the caller codes every
+column no worker started. The wavefront's first step (search CDFs from the superblock
+above-right, a row's first qindex from the base) costs −0.017 to −0.047 dB at equal bytes and
+stays on branch `wavefront`.
+
 **2026-10-25, three exact steps that gained nothing.** Profile at f5df65cb (crops, qindex 140,
 effort 4): `predict_plane` 10% self with no hot line, the quantizer 9.6%, `write_coefs` 5.9%,
 `ac_bits` 6.2%, `sse` 4.7%; stages rank, depth and chroma about a quarter each. Each step below
