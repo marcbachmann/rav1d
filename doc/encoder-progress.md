@@ -89,6 +89,12 @@ speed features listed what its search skips; taken so far:
   above qindex 100 measured -37.6% at qindex 140 on the crops for -0.04 dB, yet failed four
   more AVIF gates (alpha PNG, grey ramp, HEIC, text page); a stronger whole-cost split prune
   at 16x16 changed almost nothing. Partition pruning needs a predictor (libaom's intra CNN).
+- libaom's intra CNN partition prune (merged off by default, bit-identical to libaom's C):
+  photos -24 to -38% for at most 0.03 dB at equal bytes, but as a default it fails AVIF gates
+  at level 2 (natural 2, screen 1: a HEIC 44% larger, two flat halves -1.4 dB, sepia Q80) and
+  at level 1 for all (the same plus a product on white Q50). The model learned libaom's
+  partitions; our RD wants others on flat and patterned content. Parked: it needs a guard for
+  those or a model of our own decisions.
 - Trap: the image-processing calibration in the dev profile compiles `Encoder<Rd>` at
   opt-level 0 and timed the encoder 4-5x too slow.
 
