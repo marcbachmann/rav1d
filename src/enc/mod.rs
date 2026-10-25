@@ -101,8 +101,9 @@ pub struct Options {
     pub prune: f64,
     /// libaom's Variance Boost: lower qindexes for flat superblocks, as its tune IQ codes them.
     pub variance_boost: bool,
-    /// See `Encoder::cnn_prune`; libaom uses 2 for natural content and 1 for screen content at
-    /// cpu-used 5 and above.
+    /// See `Encoder::cnn_prune`; to effort 3 2 for natural content and 1 for screen content, as
+    /// libaom from cpu-used 5. At effort 4 it fails AVIF gates (a HEIC 44% larger, two flat
+    /// halves -1.4 dB), so the shortcuts that cost gates start below it.
     pub cnn_prune: u8,
     /// See `Encoder::rdoq`.
     pub rdoq: usize,
@@ -138,10 +139,11 @@ impl Options {
             2..=3 => (3, 3, 0, 0..4, 2.0),
             _ => (2, 2, 0, 0..4, 4.0),
         };
+        let levels = if effort <= 3 && qidx > 100 { levels.start..levels.end.min(3) } else { levels };
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: 0, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
     }
 }
 
