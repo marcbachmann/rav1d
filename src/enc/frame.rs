@@ -79,6 +79,9 @@ struct Plane {
     stride: usize,
 }
 
+// SAFETY: `comp` points only into `_buf`, which the plane owns and moves with it.
+unsafe impl Send for Plane {}
+
 impl Plane {
     fn new(stride: usize, rows: usize) -> Self {
         let mut buf = AlignedVec64::new();
@@ -423,6 +426,8 @@ pub struct Encoder<D: Decide> {
     rows: usize,
     sby: usize,
     tiles: Vec<Tile>,
+    /// The tile columns this encoder codes, a bit each; the others' tiles stay empty for `merge`.
+    pub own: u64,
     coded: Vec<Vec<u8>>,
     /// The superblock's qidx and its delta from the tile's last one, until coded.
     sb_qidx: u8,
@@ -598,6 +603,7 @@ impl<D: Decide> Encoder<D> {
             rows: 0,
             sby: 0,
             tiles: Vec::new(),
+            own: u64::MAX,
             coded: Vec::new(),
             sb_qidx: q.base,
             sb_delta: None,
@@ -845,6 +851,9 @@ impl<D: Decide> Encoder<D> {
         }
         let y = (sby * 16) as i32;
         for ti in 0..self.tiles.len() {
+            if self.own >> ti & 1 == 0 {
+                continue;
+            }
             self.left.reset();
             let (start, end) = (self.tiles[ti].col_start, self.tiles[ti].col_end);
             for x in (start..end).step_by(16) {
@@ -906,8 +915,41 @@ impl<D: Decide> Encoder<D> {
     }
 
     fn finish_tiles(&mut self) {
-        for tile in self.tiles.drain(..) {
-            self.coded.push(tile.w.finish());
+        for (ti, tile) in self.tiles.drain(..).enumerate() {
+            self.coded.push(if self.own >> ti & 1 != 0 { tile.w.finish() } else { Vec::new() });
+        }
+    }
+
+    /// Takes the tiles, estimates and reconstruction of the tile columns `other` coded.
+    pub fn merge(&mut self, other: Encoder<D>) {
+        let t = self.frame.tiling;
+        for (i, data) in other.coded.into_iter().enumerate() {
+            if other.own >> (i as u32 % t.cols()) & 1 != 0 {
+                self.coded[i] = data;
+            }
+        }
+        self.estimated += other.estimated;
+        self.estimated_sse += other.estimated_sse;
+        for (a, b) in self.stats.iter_mut().zip(other.stats) {
+            a[0] += b[0];
+            a[1] += b[1];
+        }
+        for (a, b) in self.stage_ns.iter_mut().zip(other.stage_ns) {
+            *a += b;
+        }
+        for (a, b) in self.size_ns.iter_mut().zip(other.size_ns) {
+            *a += b;
+        }
+        if let (Some(mine), Some(theirs)) = (&mut self.recon, other.recon) {
+            let w = self.seq.width as usize;
+            let px = |c: u32| cmp::min(w, (c * t.tile_w * 64) as usize);
+            for c in (0..t.cols()).filter(|c| other.own >> c & 1 != 0) {
+                for (a, b) in mine.iter_mut().zip(&theirs) {
+                    for (ra, rb) in a.chunks_exact_mut(w).zip(b.chunks_exact(w)) {
+                        ra[px(c)..px(c + 1)].copy_from_slice(&rb[px(c)..px(c + 1)]);
+                    }
+                }
+            }
         }
     }
 
@@ -3312,6 +3354,72 @@ pub(crate) mod tests {
         }
     }
 
+    /// Two tile columns at effort 4 with tune IQ decode as the encoder reconstructed them.
+    #[test]
+    fn tiles_decode_as_reconstructed() {
+        for (w, h, screen) in [(320, 128, true), (320, 100, false), (500, 70, true)] {
+            for img in [graphic(w, h), photo(w, h, 3, 3)] {
+                let rows: Vec<&[u8]> = img.iter().map(|p| p.as_slice()).collect();
+                let options = crate::enc::Options { tile_cols_log2: 1, ..crate::enc::Options::effort(100, 4, screen, (w * h) as u64).tune_iq() };
+                let mut e = crate::enc::encoder(w as u32, h as u32, &rows, &options, false);
+                assert!(e.frame.tiling.cols() == 2);
+                e.recon = Some(vec![Vec::new(); 3]);
+                for y in 0..h {
+                    let r: Vec<&[u8]> = img.iter().map(|p| &p[y * w..][..w]).collect();
+                    e.push(&r);
+                }
+                let c = e.finish();
+                let decoded = decode(c.data.clone(), w, h, 3);
+                let recon = c.recon.as_ref().unwrap();
+                for p in 0..3 {
+                    if let Some(i) = (0..w * h).find(|&i| decoded[p][i] != recon[p][i]) {
+                        panic!("{w}x{h} screen {screen} plane {p}: first difference at ({}, {})", i % w, i / w);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tile columns coded on other threads, or refused by them, give the bytes of one thread.
+    #[test]
+    fn tile_threads() {
+        let (w, h) = (700, 150);
+        let img = photo(w, h, 3, 7);
+        let rows: Vec<&[u8]> = img.iter().map(|p| p.as_slice()).collect();
+        let options = crate::enc::Options { tile_cols_log2: 1, ..crate::enc::Options::effort(120, 4, false, (w * h) as u64).tune_iq() };
+        let alone = crate::enc::still(w as u32, h as u32, &rows, &options);
+        let threads: crate::Spawner = std::sync::Arc::new(|f| {
+            std::thread::spawn(f);
+            true
+        });
+        let refusing: crate::Spawner = std::sync::Arc::new(|_| false);
+        let dropping: crate::Spawner = std::sync::Arc::new(|_| true);
+        let late = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let keeping: crate::Spawner = {
+            let late = late.clone();
+            std::sync::Arc::new(move |f| {
+                late.lock().unwrap().push(f);
+                false
+            })
+        };
+        let panicking: crate::Spawner = std::sync::Arc::new(|f| {
+            std::thread::spawn(f);
+            panic!("a spawner that fails after taking work")
+        });
+        let shared = std::sync::Arc::new(img.clone());
+        for spawner in [&threads, &refusing, &dropping, &keeping] {
+            let coded = crate::enc::still_on(w as u32, h as u32, shared.clone(), &options, Some(spawner));
+            assert!(coded.data == alone.data);
+        }
+        for f in late.lock().unwrap().drain(..) {
+            f();
+        }
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::enc::still_on(w as u32, h as u32, shared.clone(), &options, Some(&panicking))));
+        assert!(failed.is_err());
+        let one = crate::enc::still(w as u32, h as u32, &rows, &crate::enc::Options { tile_cols_log2: 0, ..options });
+        assert!(one.data != alone.data);
+    }
+
     #[test]
     fn random_two_tile_columns() {
         random(4200, 72, false, 3, |f| f.tx_select = true);
@@ -3585,6 +3693,7 @@ pub(crate) mod tests {
             skip_prediction: std::env::var("ENC_SKIP_PRED").map_or(true, |v| v != "0"),
             iq_filters: std::env::var("ENC_IQ_FILTERS").is_ok_and(|v| v == "1"),
             filter_search: std::env::var("ENC_FILTER_SEARCH").is_ok_and(|v| v == "1"),
+            tile_cols_log2: std::env::var("ENC_TILES").map_or(1, |v| v.parse().unwrap()),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
         files.sort();
@@ -3603,11 +3712,13 @@ pub(crate) mod tests {
             }
             let rows: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
             let t = std::time::Instant::now();
-            let mut e = if std::env::var("ENC_STATS").is_ok() {
-                crate::enc::still_timed(w as u32, h as u32, &rows, &options)
-            } else {
-                crate::enc::still_with(w as u32, h as u32, &rows, &options)
-            };
+            let threads: crate::Spawner = std::sync::Arc::new(|f| {
+                std::thread::spawn(f);
+                true
+            });
+            let shared = std::sync::Arc::new(planes.clone());
+            let workers = std::env::var("ENC_THREADS").is_ok_and(|v| v == "1").then_some((&threads, &shared));
+            let mut e = crate::enc::still_rows(w as u32, h as u32, &rows, &options, std::env::var("ENC_STATS").is_ok(), workers);
             let searched = t.elapsed().as_millis();
             let stats = e.stats;
             let ns = e.stage_ns.map(|n| n / 1_000_000);

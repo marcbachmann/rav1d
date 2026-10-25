@@ -14,6 +14,7 @@ pub mod quant;
 pub mod rd;
 
 use std::cmp;
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::dequant_tables::DAV1D_DQ_TBL;
 use frame::{Coded, Encoder, Rd};
@@ -127,6 +128,11 @@ pub struct Options {
     /// Deblocking and CDEF strengths searched on the decoded picture (`filters::search`), as
     /// libaom's full-image picks at cpu-used 5 and below; else they come from the qindex.
     pub filter_search: bool,
+    /// At least 2^this many tile columns where the picture is 4 superblocks wide or more, each
+    /// coded on its own thread by `still_on`. Two cost photos over 512×512 about 0.5% more bytes
+    /// at 0.02-0.05 dB more; screen content and smaller pictures stay one tile, where a tile's
+    /// own CDFs cost a fixed 100-300 B (graph paper 431 -> 704 B, a 300×200 ramp -1.5 dB).
+    pub tile_cols_log2: u8,
 }
 
 impl Options {
@@ -149,7 +155,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
     }
 }
 
@@ -191,7 +197,17 @@ fn chroma_qm_level(qidx: u8) -> u8 {
 /// A still picture of 8-bit planes: one plane is monochrome, three are 4:4:4 YCbCr, BT.601 full
 /// range, sRGB.
 pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Coded {
-    let mut e = still_with(width, height, planes, options);
+    finish(still_rows(width, height, planes, options, false, None), planes, options)
+}
+
+/// `still` with the tile columns after the first coded on threads of `spawner`, as many as it
+/// takes; the output is the same.
+pub fn still_on(width: u32, height: u32, planes: Arc<Vec<Vec<u8>>>, options: &Options, spawner: Option<&crate::Spawner>) -> Coded {
+    let rows: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
+    finish(still_rows(width, height, &rows, options, false, spawner.map(|s| (s, &planes))), &rows, options)
+}
+
+fn finish(mut e: Encoder<Rd>, planes: &[&[u8]], options: &Options) -> Coded {
     if options.filter_search && options.qidx != 0 {
         e.flush();
         filters::search(&mut e, planes);
@@ -201,16 +217,87 @@ pub fn still(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Co
 
 /// `still` up to the last row pushed, the encoder kept for its statistics.
 pub fn still_with(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Encoder<Rd> {
-    still_rows(width, height, planes, options, false)
+    still_rows(width, height, planes, options, false, None)
 }
 
 /// `still_with`, timing each stage of the search into `Encoder::stage_ns`.
 pub fn still_timed(width: u32, height: u32, planes: &[&[u8]], options: &Options) -> Encoder<Rd> {
-    still_rows(width, height, planes, options, true)
+    still_rows(width, height, planes, options, true, None)
 }
 
-fn still_rows(width: u32, height: u32, planes: &[&[u8]], options: &Options, timing: bool) -> Encoder<Rd> {
+/// A tile column handed to a spawner: not started, coded by whoever started it, or done.
+enum Column {
+    Waiting,
+    Coding,
+    Done(std::thread::Result<Encoder<Rd>>),
+}
+
+pub(crate) fn still_rows(
+    width: u32,
+    height: u32,
+    planes: &[&[u8]],
+    options: &Options,
+    timing: bool,
+    workers: Option<(&crate::Spawner, &Arc<Vec<Vec<u8>>>)>,
+) -> Encoder<Rd> {
+    let mut e = encoder(width, height, planes, options, timing);
+    let cols = e.frame.tiling.cols();
+    let push = move |mut e: Encoder<Rd>, planes: &[&[u8]]| {
+        let w = width as usize;
+        for y in 0..height as usize {
+            let rows: Vec<&[u8]> = planes.iter().map(|p| &p[y * w..][..w]).collect();
+            e.push(&rows);
+        }
+        e.flush();
+        e
+    };
+    let Some((spawner, shared)) = workers.filter(|_| cols > 1) else {
+        return push(e, planes);
+    };
+    let code = move |col: u32, planes: &[&[u8]], options: &Options| {
+        let mut e = encoder(width, height, planes, options, timing);
+        e.own = 1 << col;
+        push(e, planes)
+    };
+    let slots: Vec<_> = (1..cols).map(|_| Arc::new((Mutex::new(Column::Waiting), Condvar::new()))).collect();
+    for (col, slot) in (1..).zip(&slots) {
+        let (slot, shared, options) = (slot.clone(), shared.clone(), options.clone());
+        let taken = spawner(Box::new(move || {
+            if !matches!(std::mem::replace(&mut *slot.0.lock().unwrap(), Column::Coding), Column::Waiting) {
+                return;
+            }
+            let rows: Vec<&[u8]> = shared.iter().map(|p| p.as_slice()).collect();
+            let coded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| code(col, &rows, &options)));
+            *slot.0.lock().unwrap() = Column::Done(coded);
+            slot.1.notify_all();
+        }));
+        if !taken {
+            break;
+        }
+    }
+    e.own = 1;
+    let mut e = push(e, planes);
+    // Columns no worker has started are coded here; started ones are waited for.
+    for (col, slot) in (1..).zip(&slots) {
+        let mut state = slot.0.lock().unwrap();
+        let worker = loop {
+            match std::mem::replace(&mut *state, Column::Coding) {
+                Column::Waiting => {
+                    drop(state);
+                    break code(col, planes, options);
+                }
+                Column::Coding => state = slot.1.wait(state).unwrap(),
+                Column::Done(coded) => break coded.unwrap_or_else(|p| std::panic::resume_unwind(p)),
+            }
+        };
+        e.merge(worker);
+    }
+    e
+}
+
+pub(crate) fn encoder(width: u32, height: u32, planes: &[&[u8]], options: &Options, timing: bool) -> Encoder<Rd> {
     let (seq, mut frame) = headers(width, height, planes.len() == 1, options.qidx);
+    frame.tiling = Tiling::with_cols(width, height, if width >= 4 * 64 { options.tile_cols_log2 } else { 0 });
     frame.screen_content = options.screen;
     let lossy = options.qidx != 0;
     if lossy && options.iq_filters {
@@ -261,11 +348,6 @@ fn still_rows(width: u32, height: u32, planes: &[&[u8]], options: &Options, timi
     e.prune = options.prune;
     if options.ssim && options.qidx != 0 {
         e.ssim_reference = Some(frame::ssim_reference(width as usize, height as usize, planes[0]));
-    }
-    let w = width as usize;
-    for y in 0..height as usize {
-        let rows: Vec<&[u8]> = planes.iter().map(|p| &p[y * w..][..w]).collect();
-        e.push(&rows);
     }
     e
 }
