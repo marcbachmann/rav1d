@@ -58,7 +58,12 @@ prediction 14%, SATD 3%. Each step same bytes, pinned on 13 crops (q32 full / q1
   −15.2%, −4.4%.
 
 Together: 7035 → 4540 ms at qindex 32 (−35%), 3918 → 2802 ms at qindex 140 (−28%), bytes
-unchanged. The `ip-build:trixie` image on `worker` was gone (all images pruned) and was rebuilt
+unchanged. A refuter round (009945d8) found the AVX2 `ac_bits` dropping the base-range cost of
+an `i32::MIN` level (unreachable: levels stay under 2^15) and lane tests that compared the
+scalar lane with itself: `Lane::detect()` reads rav1d's CPU flags, empty on x86 until a decoder
+or `Dsp::new` sets them; tests take `Lane::testable()`. It found the bytes equal on AVX2, NEON
+and 845161bb over 140 encodes. Dead end: the quantizer in 8 f32 lanes with an integer
+correction, plus skipping chunks past the end of block in `ac_bits`, −0.5% / −0.3%. The `ip-build:trixie` image on `worker` was gone (all images pruned) and was rebuilt
 from image-processing `scripts/build.Dockerfile`.
 
 **2026-10-25, libaom's intra CNN partition pruning** (branch `encoder-cnn`). `partition_cnn.rs`
