@@ -95,6 +95,13 @@ speed features listed what its search skips; taken so far:
   at level 1 for all (the same plus a product on white Q50). The model learned libaom's
   partitions; our RD wants others on flat and patterned content. Parked: it needs a guard for
   those or a model of our own decisions.
+- Presets against libaom (cpu-used 5, one thread, opt-level 3 everywhere, pinned; 13
+  pictures at Q40 and Q75, dB at libaom's bytes over three codes): effort 4 (gates 191/195)
+  1.12-2.64x libaom's time on photos at -0.08 to +0.30 dB (hills Q75 -0.71), graphics
+  1.48-4.17x at +0.25 to +3.19 dB; effort 3 (CNN prune 2/1, SATD pre-ranking, no 8x8 above
+  qindex 100) 0.44-0.75x on photos at -0.38 to +0.21 dB (hills Q75 -1.18), graphics
+  0.45-1.12x at -0.45 to +2.77 dB. Whether effort 4 should trade gates for speed is open with
+  Marc (escalation 2026-10-25, default: no).
 - Trap: the image-processing calibration in the dev profile compiles `Encoder<Rd>` at
   opt-level 0 and timed the encoder 4-5x too slow.
 
