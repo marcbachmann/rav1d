@@ -103,7 +103,7 @@ buffer. Making that work is the first thing to check in M1.
 | rav1e | BSD-2 | can be read and ported from: range encoder, forward transforms with Rust SIMD, RDO structure |
 | github.com/Remade-With-Rust/rusty-av1-toolkit | BSD-2 | a rav1e fork plus a dav1d port. Measured 2026-10-24 at 824300c: byte-identical to rav1e by default; its quality mode shrinks graphics 9–36% but stays 1–13 dB behind libaom, with no palette or screen-content tools. It offers nothing to port that rav1e does not |
 | SVT-AV1 | BSD-3-Clause-Clear + AOM patent licence | can be read |
-| github.com/imazen/zenav1-aom | AGPL-3.0 or paid commercial licence | **not read, not copied, not a dependency**, unless Marc buys the commercial licence or accepts AGPL for image-processing. Its README is a data point only: an all-intra libaom port that is byte-exact took about 1,500 commits and is still about 2× slower than libaom. We avoid that cost by not being exact |
+| github.com/imazen/zenav1-aom | AGPL-3.0 or paid commercial licence | **not read, not copied, not a dependency**, unless the commercial licence is bought or AGPL is accepted for image-processing. Its README is a data point only: an all-intra libaom port that is byte-exact took about 1,500 commits and is still about 2× slower than libaom. We avoid that cost by not being exact |
 | github.com/kornelski/avif-decode | BSD-3 | not for the encoder: it is a decoder (avif-parse + rav1d + yuv crate) that converts a whole image to RGB in memory, without grids, `irot`/`imir`/`clap` or row streaming, so it does not replace image-processing's AVIF reader either |
 
 ### Tune IQ
@@ -360,7 +360,7 @@ but not on graphics.
 - **Reconstruction mismatches** between search and write are the classic encoder bug. Invariant
   1 is checked on every test, so they fail loudly and early.
 
-## Decisions for Marc
+## Open decisions
 
 1. **Location.** In the rav1d fork as `src/enc/` behind feature `encoder` (proposed), or a
    separate crate with rav1d's DSP made public?

@@ -11,13 +11,13 @@ and one paragraph per step, newest first.
 - Not yet: restoration, threads, alpha and lossless parity checks.
 - SIMD (AVX2, NEON twins with the same output): forward transforms, quantizer and
   dequantizer, SATD, squared error, coefficient contexts and the counted AC rate. Lane tests
-  run on `worker` (x86) and through the queue host `local` (aarch64, Marc's laptop).
+  run on `worker` (x86) and through the queue host `local` (aarch64).
 - image-processing branch `integrate-high-quality-avif` codes AVIF colour with it
   (`src/engine/avif/own.rs`, calibration `own::compare` with `AVIF_CORPUS` of PPMs). AVIF gates
   188/195 at rav1d a12c8720: misses at libaom's bytes on the strip pattern, Q90 fine texture,
   antialiased text Q80; noise is 63% larger at its quality.
-- Open decisions in `doc/encoder.md` are taken at their proposed defaults (Marc started the
-  implementation on 2026-10-24 without answering them): in the fork, 3× at effort 4, peak by
+- Open decisions in `doc/encoder.md` are taken at their proposed defaults (the
+  implementation started on 2026-10-24 without answers to them): in the fork, 3× at effort 4, peak by
   width plus tokens, PSNR gate plus SSIMULACRA2, 8-bit 4:4:4 and monochrome first, effort 0–9
   as today.
 - Porting reference: libaom v3.15.1 at `~/Development/livingdocsIO/libaom-v3.15.1`.
@@ -170,8 +170,8 @@ speed features listed what its search skips; taken so far:
   1.12-2.64x libaom's time on photos at -0.08 to +0.30 dB (hills Q75 -0.71), graphics
   1.48-4.17x at +0.25 to +3.19 dB; effort 3 (CNN prune 2/1, SATD pre-ranking, no 8x8 above
   qindex 100) 0.44-0.75x on photos at -0.38 to +0.21 dB (hills Q75 -1.18), graphics
-  0.45-1.12x at -0.45 to +2.77 dB. Whether effort 4 should trade gates for speed is open with
-  Marc (escalation 2026-10-25, default: no).
+  0.45-1.12x at -0.45 to +2.77 dB. Whether effort 4 should trade gates for speed is open
+  (escalation 2026-10-25, default: no).
 - Hills (960x512) at Q75 is the worst photo at effort 4 (-0.71 dB at libaom's bytes): at
   qindex 68 it gets the search for big pictures; the full search there gives +0.44 dB at equal
   bytes for +68% time (+0.14 dB, +32% with SATD pre-ranking). On the crops the pre-ranking
