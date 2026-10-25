@@ -8,7 +8,10 @@ and one paragraph per step, newest first.
 - Branch `encoder`. Built: range encoder, headers, every intra tool with palettes, libaom's
   forward transforms, the RD search with RDOQ, tune IQ (Variance Boost, SSIM λ, quantizer
   matrices, chroma delta q), deblocking and CDEF strengths searched on the decoded picture.
-- Not yet: restoration, threads, SIMD for the search, alpha and lossless parity checks.
+- Not yet: restoration, threads, alpha and lossless parity checks.
+- SIMD (AVX2, NEON twins with the same output): forward transforms, quantizer and
+  dequantizer, SATD, squared error, coefficient contexts and the counted AC rate. Lane tests
+  run on `worker` (x86) and through the queue host `local` (aarch64, Marc's laptop).
 - image-processing branch `integrate-high-quality-avif` codes AVIF colour with it
   (`src/engine/avif/own.rs`, calibration `own::compare` with `AVIF_CORPUS` of PPMs). AVIF gates
   188/195 at rav1d a12c8720: misses at libaom's bytes on the strip pattern, Q90 fine texture,
@@ -35,6 +38,28 @@ docker run --rm --cgroup-parent="$COMMANDQUEUE_SLICE" -v "$PWD":/work -v $D:/dep
 An incremental build takes about 17 s.
 
 ## Log
+
+**2026-10-25, SIMD for the search.** Profile at 845161bb, qindex 32: rate counting
+(`write_coefs` with a counter) 23%, quantizer 8%, dequantizer and `eob_of` 6%; at qindex 140
+prediction 14%, SATD 3%. Each step same bytes, pinned on 13 crops (q32 full / q140 pre-ranked):
+- Quantizer in f64 lanes (exact floor for operands under 2^31) returning the end of block and
+  the levels' error; dequantizer in i32 lanes; the search hands its end of block to
+  `predict_plane` (9ea2a667): 7035 → 5798 ms, 3918 → 3307 ms.
+- SATD over a whole block, 16 columns per AVX2 register (05978c01): −2.9% at q140, +0.4% at
+  q32 where SATD is rare.
+- Squared error (29fd75f5): −6.3%, −9.1%.
+- Coefficient contexts of a block at once (e7b148a8). The log's "not possible" below was wrong:
+  the 4.9% of reads that differ from rav1d's one-by-one decode land past a column's end, and
+  libaom's level buffer with 4 rows of padding under each column reads 0 there as rav1d does
+  (0 of 1.77M reads differ). −1.9% / +0.1% alone; filling the padded buffer in a scalar pass
+  without SIMD contexts was +10% / +3%.
+- With every context known, the counted AC rate sums in raster order (307557d2): AVX2 masked
+  gathers of the base and base-range costs; NEON (no gather) takes the scalar raster loop.
+  −15.2%, −4.4%.
+
+Together: 7035 → 4540 ms at qindex 32 (−35%), 3918 → 2802 ms at qindex 140 (−28%), bytes
+unchanged. The `ip-build:trixie` image on `worker` was gone (all images pruned) and was rebuilt
+from image-processing `scripts/build.Dockerfile`.
 
 **2026-10-25, libaom's intra CNN partition pruning** (branch `encoder-cnn`). `partition_cnn.rs`
 ports `intra_mode_cnn_partition` with the CNN and dense layers it runs, in f32 in libaom's C
@@ -107,8 +132,8 @@ speed features listed what its search skips; taken so far:
   bytes for +68% time (+0.14 dB, +32% with SATD pre-ranking). On the crops the pre-ranking
   costs -0.062 dB at qindex 80 and -0.044 at 100 for -18%, so it stays; whether big pictures
   above qindex 64 should get the full search is a quality-for-time call, left open.
-- Not possible: contexts of a block computed at once (1797 context reads in the scan land on
-  levels that come earlier, which the sequential count reads as 0).
+- Refuted later the same day (see the SIMD entry): contexts of a block at once are exact in a
+  padded level buffer.
 - Trap: the image-processing calibration in the dev profile compiles `Encoder<Rd>` at
   opt-level 0 and timed the encoder 4-5x too slow.
 
