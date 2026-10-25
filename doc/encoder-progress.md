@@ -39,6 +39,25 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-25, the block search's own overhead.** Same bytes at every step, pinned on 13 crops:
+- Trials restore only the planes they write (d05b0004): −3.3% q32, −3.8% q140.
+- Level vectors and transform block lists recycled, replays reuse their levels, the chroma
+  search replays the luma list instead of a clone (cd37774a): −0.8%, −0.7%; `malloc` and
+  `free` had been 1.7%.
+- Palette index symbols from the left, top and top-left indexes instead of rav1d's
+  `order_palette` per pixel (85f4adc4): −3.9%, −5.2% with screen tools on.
+- Palette k-means takes each distance once (bc59493d): −1.6% at q140.
+- Trials within a block restore only the contexts (be69cb36): a trial predicts each transform
+  block from pixels outside the block or ones it coded itself and overwrites what it measures.
+  Photo case (screen tools off) q140 −4.6%, screen q140 −2.8%, q32 −1.6%. A refuter poisoned
+  the block's pixels (random, 0, 255) before every trial over 12 odd-sized pictures × 5 qindex
+  × 5 settings and the 13 full pictures: every hash equal; a planted stale read changed 6-7 of 12.
+- Dead end: skipping the quantizer's division for chunks that are all zero, ±0.5%.
+
+Left in the photo case at q140: `predict_plane` 9%, quantizer 8%, filter strength search 9-12%
+(24 full decodes: 10 deblocking, 14 CDEF; an exact rework decodes once and reruns only the
+filters), intra edge preparation 2%.
+
 **2026-10-25, SIMD for the search.** Profile at 845161bb, qindex 32: rate counting
 (`write_coefs` with a counter) 23%, quantizer 8%, dequantizer and `eob_of` 6%; at qindex 140
 prediction 14%, SATD 3%. Each step same bytes, pinned on 13 crops (q32 full / q140 pre-ranked):
