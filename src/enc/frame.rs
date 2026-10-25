@@ -1833,10 +1833,15 @@ impl<D: Decide> Encoder<D> {
     }
 
     fn restore(&mut self, s: &Snap) {
+        self.restore_planes(s, 0..self.rec.len());
+    }
+
+    /// `restore` of the pixels of `planes` only, the others untouched since the snapshot.
+    fn restore_planes(&mut self, s: &Snap, planes: Range<usize>) {
         let wy = (s.y as usize * 4) % SB;
         let n = s.w4 * s.h4 * 16;
-        for (i, p) in self.rec.iter().enumerate() {
-            p.write(s.x as usize * 4, wy, s.w4 * 4, s.h4 * 4, &s.pixels[i * n..][..n]);
+        for i in planes.start..cmp::min(planes.end, self.rec.len()) {
+            self.rec[i].write(s.x as usize * 4, wy, s.w4 * 4, s.h4 * 4, &s.pixels[i * n..][..n]);
         }
         self.above.restore(s.x as usize, &s.above);
         self.left.restore((s.y & 15) as usize, &s.left);
@@ -2030,7 +2035,7 @@ impl<D: Decide> Encoder<D> {
         };
 
         let luma = |e: &mut Self, intra: &Intra, depth: u8, limit: Option<f64>| -> (f64, Vec<TxDone>) {
-            e.restore(&start);
+            e.restore_planes(&start, 0..1);
             (e.limit, e.spent) = (limit, (0, 0));
             let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 0..1);
             e.limit = None;
@@ -2052,7 +2057,7 @@ impl<D: Decide> Encoder<D> {
                 return luma(e, intra, 0, None).0;
             }
             let mut clock = e.timing.then(std::time::Instant::now);
-            e.restore(&start);
+            e.restore_planes(&start, 0..1);
             e.lap(&mut clock, 6);
             e.predict_only = true;
             e.predict_block(ti, bs, x, y, edge_flags, intra, 0, 0..1);
@@ -2164,7 +2169,7 @@ impl<D: Decide> Encoder<D> {
             let luma_done = self.snap(x, y, w4, h4);
             self.stage = 2;
             let chroma = |e: &mut Self, intra: &Intra, limit: f64| -> (f64, Vec<TxDone>) {
-                e.restore(&luma_done);
+                e.restore_planes(&luma_done, 1..3);
                 (e.limit, e.spent) = (Some(limit), (0, 0));
                 let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, depth, 1..3);
                 e.limit = None;
@@ -2197,7 +2202,7 @@ impl<D: Decide> Encoder<D> {
                 modes.retain(|m| UV_FROM_LUMA[y_mode as usize] >> m.1.uv_mode & 1 != 0);
             } else if keep_chroma > 0 {
                 for m in modes.iter_mut() {
-                    self.restore(&luma_done);
+                    self.restore_planes(&luma_done, 1..3);
                     self.predict_only = true;
                     self.predict_block(ti, bs, x, y, edge_flags, &m.1, depth, 1..3);
                     self.predict_only = false;
@@ -2282,7 +2287,7 @@ impl<D: Decide> Encoder<D> {
             if a == 0 {
                 continue;
             }
-            self.restore(luma_done);
+            self.restore_planes(luma_done, 1..3);
             let c = Intra { uv_mode: CFL_PRED, cfl: [a, a], ..*intra };
             self.predict_cfl(ti, x, y, cw4, ch4, bw4, bh4, tx, uvtx, &c);
             for p in 0..2 {
