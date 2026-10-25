@@ -39,6 +39,17 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-25, three exact steps that gained nothing.** Profile at f5df65cb (crops, qindex 140,
+effort 4): `predict_plane` 10% self with no hot line, the quantizer 9.6%, `write_coefs` 5.9%,
+`ac_bits` 6.2%, `sse` 4.7%; stages rank, depth and chroma about a quarter each. Each step below
+kept the bytes and timed within noise on a pinned A/B (q140, q32, screen q100):
+the quantizer's two f64 divisions per 8 coefficients replaced by an f32 reciprocal corrected by
+its remainder (the divider was not the limit); a block stopping once its luma distortion
+passes the partition candidate's budget (3 of 465 budget crossings stop there, bits and chroma
+push the rest over); a transform type whose quantization error alone loses skipping its rate
+count. The AVX2 and scalar quantizers disagree at rounding 128 for a zero coefficient (level 1
+against 0); no caller uses it.
+
 **2026-10-25, rebased onto `main`; the filter search on one decode.** `encoder` now sits on
 marcbachmann/main 082c9e21 (frames decoded by superblock rows, a superblock row of filter and
 edge buffers on one thread, tile columns on the caller's threads), no conflicts; bytes and
