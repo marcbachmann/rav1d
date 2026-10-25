@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn lanes_agree() {
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-        let lanes = [Lane::Scalar, Lane::detect()];
+        let lanes = Lane::testable();
         for round in 0..20000 {
             let w = [4, 8, 12, 16, 20, 24, 28, 32, 36, 44, 48, 60, 64][round % 13];
             let h = 4 * (1 + rng.below(16) as usize);
@@ -341,15 +341,15 @@ mod tests {
             let src: Vec<u8> = (0..len).map(|_| if spread == 255 && rng.below(2) == 0 { 255 } else { rng.below(spread + 1) as u8 }).collect();
             let rec: Vec<u8> = (0..len).map(|i| if spread == 255 && rng.below(2) == 0 { 255 - src[i] } else { rng.below(spread + 1) as u8 }).collect();
             let want = satd_in(lanes[0], &src, &rec, stride, w, h);
-            let got = satd_in(lanes[1], &src, &rec, stride, w, h);
-            assert_eq!(want, got, "{:?} {w}x{h} stride {stride}", lanes[1]);
+            let got = satd_in(*lanes.last().unwrap(), &src, &rec, stride, w, h);
+            assert_eq!(want, got, "{w}x{h} stride {stride}");
         }
     }
 
     #[test]
     fn sse_lanes_agree() {
         let mut rng = Rng(0x5851_f42d_4c95_7f2d);
-        let lanes = [Lane::Scalar, Lane::detect()];
+        let lanes = Lane::testable();
         for _ in 0..20000 {
             let w = 1 + rng.below(64) as usize;
             let h = 1 + rng.below(64) as usize;
@@ -358,7 +358,7 @@ mod tests {
             let a: Vec<u8> = (0..(h - 1) * sa + w).map(|_| if extreme { 255 } else { rng.below(256) as u8 }).collect();
             let b: Vec<u8> = (0..(h - 1) * sb + w).map(|_| if extreme { 0 } else { rng.below(256) as u8 }).collect();
             let want = sse_in(lanes[0], &a, sa, &b, sb, w, h);
-            assert_eq!(want, sse_in(lanes[1], &a, sa, &b, sb, w, h), "{:?} {w}x{h}", lanes[1]);
+            assert_eq!(want, sse_in(*lanes.last().unwrap(), &a, sa, &b, sb, w, h), "{w}x{h}");
         }
     }
 }

@@ -254,14 +254,6 @@ mod tests {
     use super::*;
     use crate::enc::frame::tests::Rng;
 
-    fn lanes() -> Vec<Lane> {
-        let mut lanes = vec![Lane::Scalar];
-        if Lane::detect() == Lane::Simd {
-            lanes.push(Lane::Simd);
-        }
-        lanes
-    }
-
     /// Coefficients of each kind the search makes: zeros, small, near a step's rounding edge,
     /// and up to 2^20.
     fn coefs(rng: &mut Rng, n: usize, q: u32) -> Vec<i32> {
@@ -282,7 +274,7 @@ mod tests {
     #[test]
     fn lanes_agree() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        let lanes = lanes();
+        let lanes = Lane::testable();
         for round in 0..20000 {
             let n = [16, 32, 64, 128, 256, 512, 1024][round % 7];
             let dq = [4 + rng.below(1400), 4 + rng.below(1900)];

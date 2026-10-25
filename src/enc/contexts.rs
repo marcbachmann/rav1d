@@ -342,7 +342,7 @@ mod x86 {
             let word = _mm256_mask_i32gather_epi32::<4>(_mm256_setzero_si256(), c.base.as_ptr().cast(), pair, tok);
             let half = _mm256_slli_epi32::<4>(_mm256_and_si256(m3, _mm256_set1_epi32(1)));
             bits = _mm256_add_epi32(bits, _mm256_and_si256(_mm256_srlv_epi32(word, half), _mm256_set1_epi32(0xffff)));
-            let wide = _mm256_and_si256(tok, _mm256_cmpgt_epi32(lv, _mm256_set1_epi32(2)));
+            let wide = _mm256_and_si256(tok, _mm256_cmpgt_epi32(m3, _mm256_set1_epi32(2)));
             if _mm256_testz_si256(wide, wide) == 0 {
                 let ctx = _mm256_add_epi32(at8(&lay.br_offset, lay, rc, c.cols), at8(c.br_mag, lay, rc, c.cols));
                 let at = _mm256_add_epi32(_mm256_slli_epi32::<4>(ctx), _mm256_min_epu32(lv, _mm256_set1_epi32(15)));
@@ -478,7 +478,7 @@ mod tests {
                     }
                     let (mut a, mut b) = (Scratch::new(), Scratch::new());
                     let want = contexts_in(Lane::Scalar, lay, &coefs, eob, &mut a);
-                    let got = contexts_in(Lane::detect(), lay, &coefs, eob, &mut b);
+                    let got = contexts_in(*Lane::testable().last().unwrap(), lay, &coefs, eob, &mut b);
                     assert!(want == got, "{tx:?} {class:?} eob {eob}");
                 }
             }
@@ -546,13 +546,16 @@ mod tests {
                     for &(rc, ..) in &lay.scan[eob + 1..] {
                         coefs[rc as usize] = 0;
                     }
-                    let mut s = Scratch::new();
-                    let (base, br) = contexts(lay, &coefs, eob, &mut s);
-                    for (i, want_base, want_br) in decoded_one_by_one(lay, tx, class, &coefs, eob) {
-                        let off = lay.scan[i].3 as usize;
-                        let got_base = if i == 0 && class == TxClass::TwoD { 0 } else { base[off] };
-                        assert_eq!((want_base, want_br), (got_base, br[off]), "{tx:?} {class:?} eob {eob} at {i}");
-                        reads += 1;
+                    let want = decoded_one_by_one(lay, tx, class, &coefs, eob);
+                    for lane in Lane::testable() {
+                        let mut s = Scratch::new();
+                        let (base, br) = contexts_in(lane, lay, &coefs, eob, &mut s);
+                        for &(i, want_base, want_br) in &want {
+                            let off = lay.scan[i].3 as usize;
+                            let got_base = if i == 0 && class == TxClass::TwoD { 0 } else { base[off] };
+                            assert_eq!((want_base, want_br), (got_base, br[off]), "{lane:?} {tx:?} {class:?} eob {eob} at {i}");
+                            reads += 1;
+                        }
                     }
                 }
             }
@@ -614,7 +617,7 @@ mod tests {
                             }
                         }
                     }
-                    for lane in [Lane::Scalar, Lane::detect()] {
+                    for lane in Lane::testable() {
                         assert_eq!((bits, sum), ac_bits_in(lane, lay, &coefs, eob, bc, bm, &base, &br), "{lane:?} {tx:?} {class:?} eob {eob}");
                     }
                 }

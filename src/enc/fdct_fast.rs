@@ -110,6 +110,21 @@ pub enum Lane {
 }
 
 impl Lane {
+    /// Both lanes where this CPU runs the SIMD one, by its own detection: rav1d's flags read
+    /// empty until a decoder or `Dsp::new` initializes them.
+    #[cfg(test)]
+    pub fn testable() -> Vec<Lane> {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let simd = is_x86_feature_detected!("avx2");
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let simd = cfg!(target_arch = "aarch64");
+        if simd {
+            vec![Lane::Scalar, Lane::Simd]
+        } else {
+            vec![Lane::Scalar]
+        }
+    }
+
     pub fn detect() -> Self {
         let flags = rav1d_get_cpu_flags();
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
