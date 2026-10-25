@@ -102,6 +102,13 @@ speed features listed what its search skips; taken so far:
   qindex 100) 0.44-0.75x on photos at -0.38 to +0.21 dB (hills Q75 -1.18), graphics
   0.45-1.12x at -0.45 to +2.77 dB. Whether effort 4 should trade gates for speed is open with
   Marc (escalation 2026-10-25, default: no).
+- Hills (960x512) at Q75 is the worst photo at effort 4 (-0.71 dB at libaom's bytes): at
+  qindex 68 it gets the search for big pictures; the full search there gives +0.44 dB at equal
+  bytes for +68% time (+0.14 dB, +32% with SATD pre-ranking). On the crops the pre-ranking
+  costs -0.062 dB at qindex 80 and -0.044 at 100 for -18%, so it stays; whether big pictures
+  above qindex 64 should get the full search is a quality-for-time call, left open.
+- Not possible: contexts of a block computed at once (1797 context reads in the scan land on
+  levels that come earlier, which the sequential count reads as 0).
 - Trap: the image-processing calibration in the dev profile compiles `Encoder<Rd>` at
   opt-level 0 and timed the encoder 4-5x too slow.
 
