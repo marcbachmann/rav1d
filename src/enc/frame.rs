@@ -1627,16 +1627,7 @@ impl<D: Decide> Encoder<D> {
             self.bufs = Some(b);
             return (cands[0], -1);
         }
-        let sse = |a: &[u8], b: &[u8], stride: usize| -> u64 {
-            let mut s = 0;
-            for r in 0..vh {
-                for c in 0..vw {
-                    let d = a[r * pw + c] as i32 - b[r * stride + c] as i32;
-                    s += (d * d) as u64;
-                }
-            }
-            s
-        };
+        let sse = |a: &[u8], b: &[u8], stride: usize| dist::sse(a, pw, b, stride, vw, vh);
         let (a0, l0) = {
             let (a, l) = coef_ctx(&mut self.above, &mut self.left, plane);
             let mut a0 = [0x40u8; 48];
@@ -1784,13 +1775,15 @@ impl<D: Decide> Encoder<D> {
         let w = cmp::min(w4 * 4, (self.seq.width as usize).saturating_sub(x0));
         let h = cmp::min(h4 * 4, (self.seq.height as usize).saturating_sub(y as usize * 4));
         let wy = (y as usize * 4) % SB;
+        if w == 0 || h == 0 {
+            return 0;
+        }
         let mut total = 0;
         for p in planes {
-            for r in 0..h {
-                let s = self.src[p].comp.slice::<BD, _>(((wy + r) * self.src[p].stride + x0.., ..w));
-                let d = self.rec[p].comp.slice::<BD, _>(((wy + r) * self.rec[p].stride + x0.., ..w));
-                total += s.iter().zip(d.iter()).map(|(&a, &b)| ((a as i32 - b as i32).pow(2)) as u64).sum::<u64>();
-            }
+            let (src, rec) = (&self.src[p], &self.rec[p]);
+            let a = src.comp.slice::<BD, _>((wy * src.stride + x0.., ..(h - 1) * src.stride + w));
+            let b = rec.comp.slice::<BD, _>((wy * rec.stride + x0.., ..(h - 1) * rec.stride + w));
+            total += dist::sse(&a, src.stride, &b, rec.stride, w, h);
         }
         total
     }

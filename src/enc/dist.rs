@@ -56,6 +56,44 @@ fn satd_scalar(src: &[u8], rec: &[u8], stride: usize, w: usize, h: usize) -> u64
     total
 }
 
+/// The sum of squared differences of `w`×`h` 8-bit pixels, rows `sa` and `sb` apart.
+pub fn sse(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u64 {
+    sse_in(Lane::detect(), a, sa, b, sb, w, h)
+}
+
+pub fn sse_in(lane: Lane, a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u64 {
+    assert!(w <= sa && w <= sb && w <= 64);
+    if h == 0 || w == 0 {
+        return 0;
+    }
+    let (a, b) = (&a[..(h - 1) * sa + w], &b[..(h - 1) * sb + w]);
+    match lane {
+        Lane::Scalar => sse_scalar(a, sa, b, sb, w, h),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Lane::Simd => {
+            assert!(is_x86_feature_detected!("avx2"));
+            // SAFETY: AVX2 is available and the slices hold every row.
+            unsafe { x86::sse(a, sa, b, sb, w, h) }
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: NEON is part of aarch64 and the slices hold every row.
+        Lane::Simd => unsafe { arm::sse(a, sa, b, sb, w, h) },
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+        Lane::Simd => sse_scalar(a, sa, b, sb, w, h),
+    }
+}
+
+fn sse_scalar(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u64 {
+    let mut s = 0;
+    for r in 0..h {
+        for (&x, &y) in a[r * sa..][..w].iter().zip(&b[r * sb..][..w]) {
+            let d = x as i32 - y as i32;
+            s += (d * d) as u64;
+        }
+    }
+    s
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86 {
     #![allow(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
@@ -160,6 +198,37 @@ mod x86 {
         let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s));
         _mm_cvtsi128_si32(s) as u32 as u64
     }
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn sse(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u64 {
+        let mut sum = _mm256_setzero_si256();
+        let mut rest = 0u64;
+        for r in 0..h {
+            let (ra, rb) = (&a[r * sa..][..w], &b[r * sb..][..w]);
+            let mut x = 0;
+            while x + 16 <= w {
+                let d = diff16(ra, rb, x);
+                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(d, d));
+                x += 16;
+            }
+            if x + 8 <= w {
+                let d = _mm256_castsi128_si256(diff8(ra, rb, x));
+                let d = _mm256_and_si256(d, _mm256_set_epi64x(0, 0, -1, -1));
+                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(d, d));
+                x += 8;
+            }
+            for (&p, &q) in ra[x..].iter().zip(&rb[x..]) {
+                let d = p as i32 - q as i32;
+                rest += (d * d) as u64;
+            }
+        }
+        let lo = _mm256_unpacklo_epi32(sum, _mm256_setzero_si256());
+        let hi = _mm256_unpackhi_epi32(sum, _mm256_setzero_si256());
+        let s = _mm256_add_epi64(lo, hi);
+        let s = _mm_add_epi64(_mm256_castsi256_si128(s), _mm256_extracti128_si256::<1>(s));
+        let mut out = [0u64; 2];
+        _mm_storeu_si128(out.as_mut_ptr().cast(), s);
+        out[0] + out[1] + rest
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -231,6 +300,27 @@ mod arm {
         }
         vaddvq_u32(sum) as u64
     }
+    pub unsafe fn sse(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u64 {
+        let mut sum = vdupq_n_u64(0);
+        let mut rest = 0u64;
+        for r in 0..h {
+            let (ra, rb) = (&a[r * sa..][..w], &b[r * sb..][..w]);
+            let mut row = vdupq_n_u32(0);
+            let mut x = 0;
+            while x + 8 <= w {
+                let d = vabdl_u8(vld1_u8(ra[x..][..8].as_ptr()), vld1_u8(rb[x..][..8].as_ptr()));
+                row = vmlal_u16(row, vget_low_u16(d), vget_low_u16(d));
+                row = vmlal_high_u16(row, d, d);
+                x += 8;
+            }
+            sum = vpadalq_u32(sum, row);
+            for (&p, &q) in ra[x..].iter().zip(&rb[x..]) {
+                let d = p as i32 - q as i32;
+                rest += (d * d) as u64;
+            }
+        }
+        vaddvq_u64(sum) + rest
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +343,22 @@ mod tests {
             let want = satd_in(lanes[0], &src, &rec, stride, w, h);
             let got = satd_in(lanes[1], &src, &rec, stride, w, h);
             assert_eq!(want, got, "{:?} {w}x{h} stride {stride}", lanes[1]);
+        }
+    }
+
+    #[test]
+    fn sse_lanes_agree() {
+        let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+        let lanes = [Lane::Scalar, Lane::detect()];
+        for _ in 0..20000 {
+            let w = 1 + rng.below(64) as usize;
+            let h = 1 + rng.below(64) as usize;
+            let (sa, sb) = (w + rng.below(9) as usize, w + rng.below(70) as usize);
+            let extreme = rng.below(3) == 0;
+            let a: Vec<u8> = (0..(h - 1) * sa + w).map(|_| if extreme { 255 } else { rng.below(256) as u8 }).collect();
+            let b: Vec<u8> = (0..(h - 1) * sb + w).map(|_| if extreme { 0 } else { rng.below(256) as u8 }).collect();
+            let want = sse_in(lanes[0], &a, sa, &b, sb, w, h);
+            assert_eq!(want, sse_in(lanes[1], &a, sa, &b, sb, w, h), "{:?} {w}x{h}", lanes[1]);
         }
     }
 }
