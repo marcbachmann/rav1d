@@ -31,11 +31,14 @@ use crate::include::common::bitdepth::BPC;
 use crate::include::common::intops::{apply_sign64, clip, clip_u8, iclip};
 use crate::include::dav1d::common::Rav1dDataProps;
 use crate::include::dav1d::headers::{
-    DRav1d, Rav1dFilterMode, Rav1dFrameHeader, Rav1dPixelLayout,
+    Rav1dFilterMode, Rav1dFrameHeader, Rav1dPixelLayout,
     Rav1dRestorationType, Rav1dSequenceHeader, Rav1dTxfmMode, Rav1dWarpedMotionParams,
     Rav1dWarpedMotionType, SgrIdx, RAV1D_PRIMARY_REF_NONE,
 };
 use crate::include::dav1d::picture::Rav1dPicture;
+#[cfg(feature = "encoder")]
+use crate::include::dav1d::headers::DRav1d;
+#[cfg(feature = "encoder")]
 use crate::strided::Strided as _;
 use crate::Spawner;
 use crate::internal::{
@@ -4990,10 +4993,12 @@ fn finish_frame_rows(c: &Rav1dContext, fc: &Rav1dFrameContext) -> Rav1dResult {
 }
 
 /// What a filter trial measures of a plane: its index, its pixels, their stride, width and height.
+#[cfg(feature = "encoder")]
 pub(crate) type Measure<'a> = dyn FnMut(usize, &[u8], usize, usize, usize) -> u64 + 'a;
 
 /// One filter trial: puts the unfiltered picture back, filters it under a copy of the frame
 /// header as the edit leaves it, and measures each plane.
+#[cfg(feature = "encoder")]
 pub(crate) type Trial<'a> = dyn FnMut(&dyn Fn(&mut Rav1dFrameHeader)) -> [u64; 3] + 'a;
 
 /// For the encoder's filter strength search: decodes the frame set up to be decoded by rows, with
@@ -5001,6 +5006,7 @@ pub(crate) type Trial<'a> = dyn FnMut(&dyn Fn(&mut Rav1dFrameHeader)) -> [u64; 3
 /// `search` run trials on it, as many as it likes, before the frame ends. Frames without
 /// segmentation or deltas of the loop filter level, 8-bit 4:4:4 or monochrome only; a trial keeps
 /// the CDEF index bits, sharpness and mode deltas the frame was decoded with.
+#[cfg(feature = "encoder")]
 pub(crate) fn rav1d_filter_trials(
     c: &Rav1dContext,
     state: &mut Rav1dState,
@@ -5083,6 +5089,7 @@ pub(crate) fn rav1d_filter_trials(
 
 /// The loop filter levels a frame decoded under one header has for every 4×4 block under `hdr`:
 /// one level per plane and direction, without segments or deltas.
+#[cfg(feature = "encoder")]
 fn set_filter_levels(f: &mut Rav1dFrameData, hdr: &Rav1dFrameHeader) {
     rav1d_calc_lf_values(&mut f.lf.lvl, hdr, &[0; 4]);
     let yuv = f.lf.lvl[0].0.map(|a| a[0][0]);

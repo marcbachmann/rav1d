@@ -45,10 +45,12 @@ use crate::recon::{
     rav1d_backup_ipred_edge, rav1d_copy_pal_block_uv, rav1d_copy_pal_block_y, rav1d_filter_sbrow,
     rav1d_filter_sbrow_cdef, rav1d_filter_sbrow_deblock_cols, rav1d_filter_sbrow_deblock_rows,
     rav1d_filter_sbrow_lr, rav1d_filter_sbrow_resize, rav1d_read_coef_blocks, rav1d_read_pal_plane,
-    rav1d_read_pal_uv, rav1d_recon_b_inter, rav1d_recon_b_intra, rav1d_refilter_sbrow,
+    rav1d_read_pal_uv, rav1d_recon_b_inter, rav1d_recon_b_intra,
     BackupIpredEdgeFn, CopyPalBlockFn, FilterSbrowFn, ReadCoefBlocksFn, ReadPalPlaneFn,
     ReadPalUVFn, ReconBInterFn, ReconBIntraFn,
 };
+#[cfg(feature = "encoder")]
+use crate::recon::rav1d_refilter_sbrow;
 use crate::refmvs::{Rav1dRefmvsDSPContext, RefMvsFrame, RefMvsTemporalBlock, RefmvsTile};
 use crate::relaxed_atomic::RelaxedAtomic;
 use crate::thread_task::{Rav1dTaskIndex, Rav1dTasks};
@@ -510,6 +512,7 @@ pub(crate) struct Rav1dFrameContextBdFn {
     pub recon_b_intra: ReconBIntraFn,
     pub recon_b_inter: ReconBInterFn,
     pub filter_sbrow: FilterSbrowFn,
+    #[cfg(feature = "encoder")]
     pub refilter_sbrow: FilterSbrowFn,
     pub filter_sbrow_deblock_cols: FilterSbrowFn,
     pub filter_sbrow_deblock_rows: FilterSbrowFn,
@@ -530,6 +533,7 @@ impl Rav1dFrameContextBdFn {
             recon_b_inter: rav1d_recon_b_inter::<BD>,
             recon_b_intra: rav1d_recon_b_intra::<BD>,
             filter_sbrow: rav1d_filter_sbrow::<BD>,
+            #[cfg(feature = "encoder")]
             refilter_sbrow: rav1d_refilter_sbrow::<BD>,
             filter_sbrow_deblock_cols: rav1d_filter_sbrow_deblock_cols::<BD>,
             filter_sbrow_deblock_rows: rav1d_filter_sbrow_deblock_rows::<BD>,

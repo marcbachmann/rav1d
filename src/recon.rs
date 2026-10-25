@@ -3859,6 +3859,7 @@ pub(crate) fn rav1d_filter_sbrow<BD: BitDepth>(
 
 /// `rav1d_filter_sbrow` with deblocking and CDEF on whatever the context's filters: the
 /// encoder's filter trials filter a frame decoded with them off, under headers of its own.
+#[cfg(feature = "encoder")]
 pub(crate) fn rav1d_refilter_sbrow<BD: BitDepth>(
     c: &Rav1dContext,
     f: &Rav1dFrameData,
