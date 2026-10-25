@@ -7,6 +7,7 @@ pub mod filters;
 pub mod frame;
 pub mod header;
 pub mod palette;
+pub mod partition_cnn;
 pub mod rd;
 
 use std::cmp;
@@ -100,6 +101,9 @@ pub struct Options {
     pub prune: f64,
     /// libaom's Variance Boost: lower qindexes for flat superblocks, as its tune IQ codes them.
     pub variance_boost: bool,
+    /// See `Encoder::cnn_prune`; libaom uses 2 for natural content and 1 for screen content at
+    /// cpu-used 5 and above.
+    pub cnn_prune: u8,
     /// See `Encoder::rdoq`.
     pub rdoq: usize,
     /// libaom's tune-IQ rate weighting: λ per 16×16 block by its activity over the picture's.
@@ -137,7 +141,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: 0, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4 }
     }
 }
 
@@ -244,6 +248,7 @@ fn still_rows(width: u32, height: u32, planes: &[&[u8]], options: &Options, timi
     e.tx_depths = options.tx_depths;
     e.levels = options.levels.clone();
     e.variance_boost = boost;
+    e.cnn_prune = options.cnn_prune;
     e.rdoq = options.rdoq;
     e.prune = options.prune;
     if options.ssim && options.qidx != 0 {

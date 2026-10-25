@@ -20,6 +20,7 @@ use crate::disjoint_mut::DisjointMut;
 use crate::enc::ec::Writer;
 use crate::enc::fdct_fast;
 use crate::enc::palette;
+use crate::enc::partition_cnn::{Cnn, Prune};
 use crate::enc::header::{obu, BitWriter, Frame, Sequence, OBU_FRAME, OBU_SEQUENCE_HEADER};
 use crate::enc::rd::{lambda, CoefCosts, Counter, Sink};
 use crate::enum_map::DefaultValue;
@@ -459,6 +460,13 @@ pub struct Encoder<D: Decide> {
     pub prune: f64,
     /// Superblock qindexes from libaom's Variance Boost; needs `Frame::delta_q_log2`.
     pub variance_boost: bool,
+    /// libaom's `intra_cnn_based_part_prune_level`: 0 off, 1 prunes Split and, where only Split
+    /// is predicted, H and V; 2 also None (`partition_cnn`).
+    pub cnn_prune: u8,
+    /// The CNN's outputs for the superblock being searched, when it lies wholly in the picture.
+    cnn: Option<Box<Cnn>>,
+    /// The last source luma row of the superblock row above, for the CNN.
+    src_above: Vec<u8>,
     /// Levels the residual search tries one step nearer zero, from the last coefficient back,
     /// keeping each that lowers the cost.
     pub rdoq: usize,
@@ -607,6 +615,9 @@ impl<D: Decide> Encoder<D> {
             levels: 0..5,
             prune: 0.0,
             variance_boost: false,
+            cnn_prune: 0,
+            cnn: None,
+            src_above: Vec::new(),
             rdoq: 0,
             ssim_reference: None,
             skip_prediction: false,
@@ -872,6 +883,9 @@ impl<D: Decide> Encoder<D> {
                     recon[p].extend_from_slice(&plane.row(r, 0, w));
                 }
             }
+        }
+        if self.cnn_prune != 0 {
+            self.src_above = self.src[0].row(SB - 1, 0, self.src[0].stride);
         }
         for (p, plane) in self.rec.iter().enumerate() {
             let last = plane.row(SB - 1, 0, plane.stride);
@@ -1890,11 +1904,30 @@ impl<D: Decide> Encoder<D> {
         let s = self.snap(x, y, 16, 16);
         self.dry = true;
         self.counter = Counter::default();
+        self.cnn = (self.cnn_prune != 0 && x + 16 <= self.bw && y + 16 <= self.bh).then(|| Box::new(self.cnn_of(x)));
         self.pick_partition(ti, BlockLevel::Bl64x64, x, y, EdgeIndex::root());
         self.estimated += self.counter.bits as u64;
         self.estimated_sse += self.sse(x, y, 16, 16, 0..self.planes);
         self.dry = false;
         self.restore(&s);
+    }
+
+    /// The CNN of the superblock at column `x` of the current row: its luma from one row above
+    /// and one column left, the source repeated past the picture as libaom extends it.
+    fn cnn_of(&self, x: i32) -> Cnn {
+        let src = &self.src[0];
+        let x0 = x as usize * 4;
+        let mut px = [0u8; 65 * 65];
+        for (r, row) in px.chunks_exact_mut(65).enumerate() {
+            let line = match r {
+                0 if self.sby == 0 => src.row(0, 0, src.stride),
+                0 => self.src_above.clone(),
+                _ => src.row(r - 1, 0, src.stride),
+            };
+            row[0] = line[x0.saturating_sub(1)];
+            row[1..].copy_from_slice(&line[x0..x0 + 64]);
+        }
+        Cnn::new(&px, self.sb_qidx)
     }
 
     /// Finds the best partition of a block and leaves it applied; its nodes go on the plan and
@@ -1918,13 +1951,23 @@ impl<D: Decide> Encoder<D> {
             (Halves::Top, _) => &[Split, H],
             (Halves::Left, _) => &[Split, V],
         };
+        let level = bl as u8 - BlockLevel::Bl64x64 as u8;
+        let split_allowed = level + 1 < self.levels.end;
+        let none_allowed = !(level < self.levels.start && split_allowed);
+        let cnn = match &self.cnn {
+            Some(cnn) if halves == Halves::Both && level < 4 && x + n4 as i32 <= self.bw && y + n4 as i32 <= self.bh => {
+                let (bx, by) = ((x & 15) as usize / n4, (y & 15) as usize / n4);
+                cnn.prune(level as usize, bx, by, self.cnn_prune, self.seq.width, self.seq.height)
+            }
+            _ => Prune::default(),
+        };
         let mut best: Option<(f64, u32, Snap, Vec<Node>)> = Option::None;
         for &bp in cands {
             if halves == Halves::Both && cands.len() > 1 {
-                let level = bl as u8 - BlockLevel::Bl64x64 as u8;
                 let skip = match bp {
-                    Split => level + 1 >= self.levels.end,
-                    _ => level < self.levels.start && level + 1 < self.levels.end,
+                    Split => !split_allowed || cnn.split && none_allowed,
+                    None => !none_allowed || cnn.none && split_allowed,
+                    _ => !none_allowed || cnn.rect,
                 };
                 if skip {
                     continue;
@@ -3565,7 +3608,7 @@ pub(crate) mod tests {
         round_trip(&img, w, h, fr, Fixed);
     }
 
-    fn ppm(path: &std::path::Path) -> (usize, usize, Vec<u8>) {
+    pub fn ppm(path: &std::path::Path) -> (usize, usize, Vec<u8>) {
         let data = std::fs::read(path).unwrap();
         let mut fields = Vec::new();
         let mut at = 0;
@@ -3611,6 +3654,7 @@ pub(crate) mod tests {
             }),
             prune: std::env::var("ENC_PRUNE").map_or(0.0, |v| v.parse().unwrap()),
             variance_boost: std::env::var("ENC_BOOST").is_ok_and(|v| v == "1"),
+            cnn_prune: std::env::var("ENC_CNN_PRUNE").map_or(0, |v| v.parse().unwrap()),
             rdoq: std::env::var("ENC_RDOQ").map_or(0, |v| v.parse().unwrap()),
             ssim: std::env::var("ENC_SSIM").is_ok_and(|v| v == "1"),
             quant_matrices: std::env::var("ENC_QM").is_ok_and(|v| v == "1"),
@@ -3706,6 +3750,29 @@ pub(crate) mod tests {
         };
         eprintln!("variance boost: plain {} B {:.2}/{:.2} dB, boosted {} B {:.2}/{:.2} dB", plain.data.len(), db(&plain, 0), db(&plain, 1), boosted.data.len(), db(&boosted, 0), db(&boosted, 1));
         assert!(db(&boosted, 1) > db(&plain, 1) + 0.5);
+    }
+
+    /// The CNN prunes partitions of the superblocks wholly in the picture, here all but the right
+    /// column and the bottom row; the stream decodes to the reconstruction.
+    #[test]
+    fn cnn_prune() {
+        let (w, h) = (150, 140);
+        let img = photo(w, h, 3, 6);
+        let (seq, fr) = crate::enc::headers(w as u32, h as u32, false, 100);
+        let full = round_trip_with(&img, w, h, seq.clone(), fr.clone(), Rd);
+        for level in [1, 2] {
+            let mut e = Encoder::new(seq.clone(), fr.clone(), Rd);
+            e.cnn_prune = level;
+            e.recon = Some(vec![Vec::new(); 3]);
+            for y in 0..h {
+                let rows: Vec<&[u8]> = img.iter().map(|p| &p[y * w..][..w]).collect();
+                e.push(&rows);
+            }
+            let c = e.finish();
+            let recon = c.recon.as_ref().unwrap();
+            assert!(recon == &decode(c.data.clone(), w, h, 3));
+            eprintln!("cnn prune {level}: {} B {:.2} dB, full search {} B {:.2} dB", c.data.len(), psnr(&img, recon), full.data.len(), psnr(&img, full.recon.as_ref().unwrap()));
+        }
     }
 
     /// A photo beside a flat half: weighted against the picture's mean activity, the photo's
