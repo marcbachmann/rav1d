@@ -404,6 +404,8 @@ pub struct Encoder<D: Decide> {
     replay: Option<Vec<TxDone>>,
     /// The residuals of the planned blocks of the superblock.
     chosen: Vec<Vec<TxDone>>,
+    /// Emptied level and transform block lists for the next trials.
+    spare: (Vec<Vec<i32>>, Vec<Vec<TxDone>>),
     /// The bits of the levels `rd_residual` chose.
     residual_bits: Option<u32>,
     /// Their distortion.
@@ -582,6 +584,7 @@ impl<D: Decide> Encoder<D> {
             recon_ready: false,
             replay: None,
             chosen: Vec::new(),
+            spare: (Vec::new(), Vec::new()),
             residual_bits: None,
             residual_dist: 0,
             limit: None,
@@ -972,7 +975,8 @@ impl<D: Decide> Encoder<D> {
             edge_index,
             halves,
             &mut |e, ti, bs, x, y, f| {
-                e.code_b(ti, bs, x, y, f);
+                let txs = e.code_b(ti, bs, x, y, f);
+                e.recycle(txs);
             },
             &mut |e, ti, bl, x, y, edge_index| e.code_sb(ti, bl, x, y, edge_index),
         );
@@ -1123,7 +1127,9 @@ impl<D: Decide> Encoder<D> {
         } else if self.decide.searches() {
             match self.next_node() {
                 Node::Block(intra, depth, k) => {
-                    self.replay = Some(std::mem::take(&mut self.chosen[k]).into_iter().rev().collect());
+                    let mut txs = std::mem::take(&mut self.chosen[k]);
+                    txs.reverse();
+                    self.replay = Some(txs);
                     (intra, depth)
                 }
                 n => panic!("plan has {n:?} where a block is due"),
@@ -1134,7 +1140,9 @@ impl<D: Decide> Encoder<D> {
         assert!(depth <= limits.max_depth);
         let txs = self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..self.planes);
         debug_assert!(self.replay.as_ref().is_none_or(|r| r.is_empty()));
-        self.replay = None;
+        if let Some(r) = self.replay.take() {
+            self.recycle(r);
+        }
         let skip = txs.iter().all(|t| t.eob < 0);
         let b = BlockWrite {
             bs,
@@ -1167,6 +1175,18 @@ impl<D: Decide> Encoder<D> {
         txs
     }
 
+    /// Keeps the lists and level buffers of transform blocks no longer needed for later trials.
+    fn recycle(&mut self, mut txs: Vec<TxDone>) {
+        for t in txs.drain(..) {
+            if t.coefs.levels.capacity() > 0 && self.spare.0.len() < 128 {
+                self.spare.0.push(t.coefs.levels);
+            }
+        }
+        if self.spare.1.len() < 16 {
+            self.spare.1.push(txs);
+        }
+    }
+
     /// Predicts and reconstructs the given planes of a block, choosing every transform block's
     /// residual. The coefficient contexts are left as they were.
     #[allow(clippy::too_many_arguments)]
@@ -1190,7 +1210,7 @@ impl<D: Decide> Encoder<D> {
         let saved_a = self.above.save_coef(ax..ax + bw4 as usize);
         let saved_l = self.left.save_coef(ly..ly + bh4 as usize);
         let edge_filter = (self.seq.edge_filter as i32) << 10;
-        let mut txs = Vec::new();
+        let mut txs = self.spare.1.pop().unwrap_or_default();
         if planes.contains(&0) {
             let flags = self.sm_flag(ax, ly) | edge_filter;
             let pal = intra.pal_sz[0] > 0;
@@ -1462,6 +1482,7 @@ impl<D: Decide> Encoder<D> {
                 self.residual_bits = None;
                 self.residual_dist = 0;
                 let mut known_eob = None;
+                let mut replayed = None;
                 let decided = if self.predict_only {
                     known_eob = Some(-1);
                     Some(fixed_txtp)
@@ -1473,7 +1494,9 @@ impl<D: Decide> Encoder<D> {
                     }
                     self.residual_bits = t.bits;
                     known_eob = Some(t.eob);
-                    Some(t.coefs.txtp)
+                    let txtp = t.coefs.txtp;
+                    replayed = Some(t.coefs.levels);
+                    Some(txtp)
                 } else if self.dry || self.decide.searches() {
                     None
                 } else {
@@ -1527,7 +1550,16 @@ impl<D: Decide> Encoder<D> {
                     self.bufs = Some(b);
                 }
                 let v = res_ctx(levels, eob);
-                let levels = if eob >= 0 { levels.to_vec() } else { Vec::new() };
+                let levels = match replayed {
+                    _ if eob < 0 => Vec::new(),
+                    Some(kept) => kept,
+                    None => {
+                        let mut v = self.spare.0.pop().unwrap_or_default();
+                        v.clear();
+                        v.extend_from_slice(levels);
+                        v
+                    }
+                };
                 self.lv = Some(lv);
                 let (a, l) = coef_ctx(&mut self.above, &mut self.left, plane);
                 let cw = cmp::min(tw, self.bw - px) as usize;
@@ -1862,7 +1894,9 @@ impl<D: Decide> Encoder<D> {
     /// Searches the superblock and leaves its plan to be coded.
     fn search_sb(&mut self, ti: usize, x: i32, y: i32) {
         self.plan.clear();
-        self.chosen.clear();
+        for txs in std::mem::take(&mut self.chosen) {
+            self.recycle(txs);
+        }
         self.next = 0;
         let s = self.snap(x, y, 16, 16);
         self.dry = true;
@@ -2054,13 +2088,16 @@ impl<D: Decide> Encoder<D> {
         let pre = if rank_rd && inside { self.rank_pre } else { 0 };
         let score = |e: &mut Self, intra: &Intra, estimate: bool| -> f64 {
             if keep == 0 {
-                return luma(e, intra, 0, None).0;
+                let (cost, txs) = luma(e, intra, 0, None);
+                e.recycle(txs);
+                return cost;
             }
             let mut clock = e.timing.then(std::time::Instant::now);
             e.restore_planes(&start, 0..1);
             e.lap(&mut clock, 6);
             e.predict_only = true;
-            e.predict_block(ti, bs, x, y, edge_flags, intra, 0, 0..1);
+            let txs = e.predict_block(ti, bs, x, y, edge_flags, intra, 0, 0..1);
+            e.recycle(txs);
             e.predict_only = false;
             e.lap(&mut clock, 7);
             let bits = mode_bits(e, intra, 0);
@@ -2129,7 +2166,9 @@ impl<D: Decide> Encoder<D> {
         if keep > 0 {
             scored.truncate(keep);
             for s in scored.iter_mut() {
-                s.0 = luma(self, &s.1, 0, None).0;
+                let (cost, txs) = luma(self, &s.1, 0, None);
+                self.recycle(txs);
+                s.0 = cost;
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
@@ -2144,7 +2183,10 @@ impl<D: Decide> Encoder<D> {
                 let (cost, txs) = luma(self, &c, depth, Some(best_luma.0));
                 if cost < best_luma.0 {
                     best_luma = (cost, c, depth);
-                    luma_txs = txs;
+                    let old = std::mem::replace(&mut luma_txs, txs);
+                    self.recycle(old);
+                } else {
+                    self.recycle(txs);
                 }
                 if self.skip_predicted {
                     break;
@@ -2156,12 +2198,17 @@ impl<D: Decide> Encoder<D> {
         let mut chroma_txs = Vec::new();
         if self.late_txtp {
             self.restore(&start);
-            luma_txs = self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
+            let txs = self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
+            let old = std::mem::replace(&mut luma_txs, txs);
+            self.recycle(old);
         } else if limits.chroma {
             self.restore(&start);
-            self.replay = Some(luma_txs.iter().rev().cloned().collect());
-            self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
-            self.replay = None;
+            luma_txs.reverse();
+            self.replay = Some(luma_txs);
+            luma_txs = self.predict_block(ti, bs, x, y, edge_flags, &intra, depth, 0..1);
+            if let Some(r) = self.replay.take() {
+                self.recycle(r);
+            }
         }
         self.lap(&mut clock, 1);
 
@@ -2204,7 +2251,8 @@ impl<D: Decide> Encoder<D> {
                 for m in modes.iter_mut() {
                     self.restore_planes(&luma_done, 1..3);
                     self.predict_only = true;
-                    self.predict_block(ti, bs, x, y, edge_flags, &m.1, depth, 1..3);
+                    let txs = self.predict_block(ti, bs, x, y, edge_flags, &m.1, depth, 1..3);
+                    self.recycle(txs);
                     self.predict_only = false;
                     let mut c = Counter::default();
                     write_chroma_modes(&mut c, &mut self.cost_cdf, &m.1, &limits);
@@ -2218,7 +2266,10 @@ impl<D: Decide> Encoder<D> {
                 let (cost, txs) = chroma(self, &c, best.0);
                 if cost < best.0 {
                     best = (cost, c);
-                    chroma_txs = txs;
+                    let old = std::mem::replace(&mut chroma_txs, txs);
+                    self.recycle(old);
+                } else {
+                    self.recycle(txs);
                 }
             }
             if limits.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&best.1.uv_mode) {
@@ -2228,7 +2279,10 @@ impl<D: Decide> Encoder<D> {
                     let (cost, txs) = chroma(self, &c, best.0);
                     if cost < best.0 {
                         best = (cost, c);
-                        chroma_txs = txs;
+                        let old = std::mem::replace(&mut chroma_txs, txs);
+                        self.recycle(old);
+                    } else {
+                        self.recycle(txs);
                     }
                 }
             }
@@ -2242,7 +2296,10 @@ impl<D: Decide> Encoder<D> {
                     let (cost, txs) = chroma(self, &c, best.0);
                     if cost < best.0 {
                         best = (cost, c);
-                        chroma_txs = txs;
+                        let old = std::mem::replace(&mut chroma_txs, txs);
+                        self.recycle(old);
+                    } else {
+                        self.recycle(txs);
                     }
                 }
             }
@@ -2253,7 +2310,10 @@ impl<D: Decide> Encoder<D> {
                     let (cost, txs) = chroma(self, &c, best.0);
                     if cost < best.0 {
                         best = (cost, c);
-                        chroma_txs = txs;
+                        let old = std::mem::replace(&mut chroma_txs, txs);
+                        self.recycle(old);
+                    } else {
+                        self.recycle(txs);
                     }
                 }
             }
@@ -2264,8 +2324,10 @@ impl<D: Decide> Encoder<D> {
         self.restore(&start);
         self.trial = Some((intra, depth));
         self.stage = 4;
-        luma_txs.extend(chroma_txs);
-        self.replay = Some(luma_txs.into_iter().rev().collect());
+        luma_txs.append(&mut chroma_txs);
+        self.recycle(chroma_txs);
+        luma_txs.reverse();
+        self.replay = Some(luma_txs);
         let txs = self.code_b(ti, bs, x, y, edge_flags);
         self.lap(&mut clock, 4);
         self.stage = 5;
