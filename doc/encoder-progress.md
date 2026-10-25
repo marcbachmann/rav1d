@@ -47,7 +47,11 @@ frame 24 times; now one decode with the filters off keeps the loop filter's leve
 frame-wide (`keep_filter_data`, the multi-thread layout) and an unfiltered copy of the picture,
 and each candidate refilters it (`rav1d_filter_trials`, `rav1d_refilter_sbrow`) (b9f14be4).
 Same bytes; −10.0% photo case q140, −8.7% screen q140, −12.0% q32. Memory: the search holds
-the picture twice, a 1400×1400 frame peaks at 46 MB VmHWM instead of 39–40.
+the picture twice, a 1400×1400 frame peaks at 46 MB VmHWM instead of 39–40. A refuter round
+found no difference over 4250 pictures and 78 corpus encodes; the session now refuses
+segmentation and a trial may not change the CDEF index bits, sharpness or mode deltas. Against
+libaom at effort 4: photos 0.63–1.13× at Q75 (most 0.70–0.90×), 1.08–1.57× at Q40, graphics
+0.70–1.05×, gradient 2.1–2.5×; quality unchanged.
 
 **2026-10-25, the block search's own overhead.** Same bytes at every step, pinned on 13 crops:
 - Trials restore only the planes they write (d05b0004): −3.3% q32, −3.8% q140.
