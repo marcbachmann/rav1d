@@ -21,8 +21,12 @@ pub struct Layout {
     pub scan: Vec<(u16, u8, u8, u16)>,
     /// The furthest level buffer offset up to each scan position.
     reach: Vec<u16>,
+    /// Scan position by coefficient index.
+    pub index: Vec<u16>,
     /// The base context's offset at each level buffer offset.
     offset: Vec<u8>,
+    /// The base-range context's offset at each level buffer offset.
+    br_offset: Vec<u8>,
     pub stride: usize,
     rows: usize,
     two_d: bool,
@@ -75,6 +79,15 @@ pub fn layout(tx: TxfmSize, class: TxClass) -> &'static Layout {
                     *m = cmp::max(*m, s.3);
                     Some(*m)
                 });
+                let mut index = vec![0; n];
+                for (i, &(rc, ..)) in scan.iter().enumerate() {
+                    index[rc as usize] = i as u16;
+                }
+                let mut br_offset = vec![0; BUF];
+                for &(_, x, y, off) in &scan {
+                    let far = if two_d { (x | y) > 1 } else { y > 0 };
+                    br_offset[off as usize] = if far { 14 } else { 7 };
+                }
                 let mut offset = vec![0; BUF];
                 if two_d {
                     let is_rect = tx.is_rect() as usize;
@@ -87,7 +100,7 @@ pub fn layout(tx: TxfmSize, class: TxClass) -> &'static Layout {
                         offset[off as usize] = 26 + if y > 1 { 10 } else { y * 5 };
                     }
                 }
-                Layout { reach: reach.collect(), scan, offset, stride, rows, two_d, transposed: class == TxClass::H }
+                Layout { reach: reach.collect(), scan, index, offset, br_offset, stride, rows, two_d, transposed: class == TxClass::H }
             })
             .collect()
     });
@@ -116,19 +129,18 @@ fn pack(l: u32) -> u8 {
 }
 
 /// The base context and the base-range context's magnitude part of every level buffer offset
-/// up to the end of block's reach.
+/// in the columns the end of block reaches.
 pub fn contexts<'a>(lay: &Layout, coefs: &[i32], eob: usize, s: &'a mut Scratch) -> (&'a [u8], &'a [u8]) {
     contexts_in(Lane::detect(), lay, coefs, eob, s)
 }
 
 pub fn contexts_in<'a>(lane: Lane, lay: &Layout, coefs: &[i32], eob: usize, s: &'a mut Scratch) -> (&'a [u8], &'a [u8]) {
-    let reach = lay.reach[eob] as usize;
-    let filled = cmp::min(BUF, reach + 2 * lay.stride + 32);
-    let done = (reach | 15) + 1;
+    let cols = lay.reach[eob] as usize / lay.stride + 1;
+    let done = ((cols * lay.stride - 1) | 15) + 1;
+    let filled = cmp::min(BUF, done + 2 * lay.stride + 16);
     for l in &mut s.levels[..filled] {
         l.write(0);
     }
-    let cols = reach / lay.stride + 1;
     if lay.transposed {
         for rc in 0..=eob {
             s.levels[rc % lay.rows * lay.stride + rc / lay.rows].write(pack(coefs[rc].unsigned_abs()));
@@ -161,11 +173,11 @@ pub fn contexts_in<'a>(lane: Lane, lay: &Layout, coefs: &[i32], eob: usize, s: &
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         Lane::Simd => {
             // SAFETY: AVX2 is available; reads end below `filled`, writes below `done`.
-            unsafe { x86::contexts(levels, &lay.offset, near, reach, &mut s.base, &mut s.br) }
+            unsafe { x86::contexts(levels, &lay.offset, near, done, &mut s.base, &mut s.br) }
         }
         #[cfg(target_arch = "aarch64")]
         // SAFETY: reads end below `filled`, writes below `done`.
-        Lane::Simd => unsafe { arm::contexts(levels, &lay.offset, near, reach, &mut s.base, &mut s.br) },
+        Lane::Simd => unsafe { arm::contexts(levels, &lay.offset, near, done, &mut s.base, &mut s.br) },
         _ => {
             for off in 0..done {
                 let l = |d: usize| levels[off + d] as u32;
@@ -185,6 +197,83 @@ pub fn contexts_in<'a>(lane: Lane, lay: &Layout, coefs: &[i32], eob: usize, s: &
     }
 }
 
+impl Layout {
+    /// Whether `ac_bits` can count this layout: levels stored by column.
+    pub fn by_column(&self) -> bool {
+        !self.transposed
+    }
+}
+
+/// Counted bits of the AC levels of a block in a layout `by_column`: the base and base-range
+/// tokens of scan positions 1 to the end of block (exclusive), and the signs and Golomb tails
+/// of 1 to the end of block (inclusive), with the sum of those levels. In raster order, the
+/// order the sum does not depend on.
+#[allow(clippy::too_many_arguments)]
+pub fn ac_bits(lay: &Layout, coefs: &[i32], eob: usize, base_ctx: &[u8], br_mag: &[u8], base: &[[u16; 4]; 41], br: &[[u32; 16]; 21]) -> (u32, u32) {
+    ac_bits_in(Lane::detect(), lay, coefs, eob, base_ctx, br_mag, base, br)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ac_bits_in(lane: Lane, lay: &Layout, coefs: &[i32], eob: usize, base_ctx: &[u8], br_mag: &[u8], base: &[[u16; 4]; 41], br: &[[u32; 16]; 21]) -> (u32, u32) {
+    assert!(lay.by_column() && eob < lay.scan.len());
+    let cols = lay.reach[eob] as usize / lay.stride + 1;
+    let ctx = Ctx { lay, coefs: &coefs[..lay.scan.len()], eob, base_ctx, br_mag, base, br, cols };
+    match lane {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Lane::Simd => {
+            assert!(is_x86_feature_detected!("avx2"));
+            // SAFETY: AVX2 is available.
+            unsafe { x86::ac_bits(&ctx) }
+        }
+        _ => ac_bits_scalar(&ctx),
+    }
+}
+
+struct Ctx<'a> {
+    lay: &'a Layout,
+    coefs: &'a [i32],
+    eob: usize,
+    base_ctx: &'a [u8],
+    br_mag: &'a [u8],
+    base: &'a [[u16; 4]; 41],
+    br: &'a [[u32; 16]; 21],
+    cols: usize,
+}
+
+fn tail_bits(lv: u32) -> u32 {
+    if lv == 0 {
+        0
+    } else if lv < 15 {
+        512
+    } else {
+        512 + 512 * (2 * (31 - (lv - 14).leading_zeros()) + 1)
+    }
+}
+
+fn ac_bits_scalar(c: &Ctx) -> (u32, u32) {
+    let (lay, mut bits, mut sum) = (c.lay, 0u32, 0u32);
+    for x in 0..c.cols {
+        for y in 0..lay.rows {
+            let rc = x * lay.rows + y;
+            let i = lay.index[rc] as usize;
+            if i == 0 || i > c.eob {
+                continue;
+            }
+            let lv = c.coefs[rc].unsigned_abs();
+            sum = sum.wrapping_add(lv);
+            bits = bits.wrapping_add(tail_bits(lv));
+            if i < c.eob {
+                let off = x * lay.stride + y;
+                bits = bits.wrapping_add(c.base[c.base_ctx[off] as usize][cmp::min(lv, 3) as usize] as u32);
+                if lv >= 3 {
+                    bits = bits.wrapping_add(c.br[(lay.br_offset[off] + c.br_mag[off]) as usize][cmp::min(lv, 15) as usize]);
+                }
+            }
+        }
+    }
+    (bits, sum)
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86 {
     #![allow(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
@@ -194,6 +283,74 @@ mod x86 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
     use std::mem::MaybeUninit;
+
+    #[inline(always)]
+    fn word(p: &[u8], at: usize) -> i32 {
+        u32::from_le_bytes(p[at..][..4].try_into().unwrap()) as i32
+    }
+
+    /// 8 bytes of `p` from the level buffer offsets of coefficients `rc`..`rc + 8`: one column,
+    /// or two columns of 4 where the second may lie past `cols`.
+    #[inline(always)]
+    unsafe fn at8(p: &[u8], lay: &super::Layout, rc: usize, cols: usize) -> __m256i {
+        let (x, y) = (rc / lay.rows, rc % lay.rows);
+        let off = x * lay.stride + y;
+        let v = if lay.rows >= 8 {
+            _mm_loadl_epi64(p[off..][..8].as_ptr().cast())
+        } else {
+            let hi = if x + 1 < cols { word(p, off + lay.stride) } else { 0 };
+            _mm_set_epi32(0, 0, hi, word(p, off))
+        };
+        _mm256_cvtepu8_epi32(v)
+    }
+
+    #[inline(always)]
+    unsafe fn fold(v: __m256i) -> u32 {
+        let s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
+        _mm_cvtsi128_si32(_mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s))) as u32
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn ac_bits(c: &super::Ctx) -> (u32, u32) {
+        let lay = c.lay;
+        let n = c.cols * lay.rows;
+        let eob = _mm256_set1_epi32(c.eob as i32);
+        let (mut bits, mut sum) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+        let mut golomb = 0u32;
+        for rc in (0..n).step_by(8) {
+            let i = _mm256_cvtepu16_epi32(_mm_loadu_si128(lay.index[rc..][..8].as_ptr().cast()));
+            let tail = _mm256_andnot_si256(_mm256_cmpeq_epi32(i, _mm256_setzero_si256()), _mm256_xor_si256(_mm256_cmpgt_epi32(i, eob), _mm256_set1_epi32(-1)));
+            let tok = _mm256_and_si256(tail, _mm256_cmpgt_epi32(eob, i));
+            let lv = _mm256_and_si256(_mm256_abs_epi32(_mm256_loadu_si256(c.coefs[rc..][..8].as_ptr().cast())), tail);
+            sum = _mm256_add_epi32(sum, lv);
+            let nonzero = _mm256_xor_si256(_mm256_cmpeq_epi32(lv, _mm256_setzero_si256()), _mm256_set1_epi32(-1));
+            bits = _mm256_add_epi32(bits, _mm256_and_si256(nonzero, _mm256_set1_epi32(512)));
+            let big = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_min_epu32(lv, _mm256_set1_epi32(15)), _mm256_set1_epi32(14))));
+            if big != 0 {
+                let mut l = [0u32; 8];
+                _mm256_storeu_si256(l.as_mut_ptr().cast(), lv);
+                for k in 0..8 {
+                    if big >> k & 1 != 0 {
+                        golomb = golomb.wrapping_add(super::tail_bits(l[k]) - 512);
+                    }
+                }
+            }
+            let m3 = _mm256_min_epu32(lv, _mm256_set1_epi32(3));
+            let ctx = at8(c.base_ctx, lay, rc, c.cols);
+            let pair = _mm256_add_epi32(_mm256_slli_epi32::<1>(ctx), _mm256_srli_epi32::<1>(m3));
+            let word = _mm256_mask_i32gather_epi32::<4>(_mm256_setzero_si256(), c.base.as_ptr().cast(), pair, tok);
+            let half = _mm256_slli_epi32::<4>(_mm256_and_si256(m3, _mm256_set1_epi32(1)));
+            bits = _mm256_add_epi32(bits, _mm256_and_si256(_mm256_srlv_epi32(word, half), _mm256_set1_epi32(0xffff)));
+            let wide = _mm256_and_si256(tok, _mm256_cmpgt_epi32(lv, _mm256_set1_epi32(2)));
+            if _mm256_testz_si256(wide, wide) == 0 {
+                let ctx = _mm256_add_epi32(at8(&lay.br_offset, lay, rc, c.cols), at8(c.br_mag, lay, rc, c.cols));
+                let at = _mm256_add_epi32(_mm256_slli_epi32::<4>(ctx), _mm256_min_epu32(lv, _mm256_set1_epi32(15)));
+                bits = _mm256_add_epi32(bits, _mm256_mask_i32gather_epi32::<4>(_mm256_setzero_si256(), c.br.as_ptr().cast(), at, wide));
+            }
+        }
+        (fold(bits).wrapping_add(golomb), fold(sum))
+    }
 
     /// Packed levels of 4 coefficients: min(l, 3) << 6 | min(l, 15).
     #[inline(always)]
@@ -229,8 +386,8 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx2")]
-    pub unsafe fn contexts(levels: &[u8], offset: &[u8], near: [usize; 5], reach: usize, base: &mut [MaybeUninit<u8>], br: &mut [MaybeUninit<u8>]) {
-        for off in (0..=reach).step_by(16) {
+    pub unsafe fn contexts(levels: &[u8], offset: &[u8], near: [usize; 5], done: usize, base: &mut [MaybeUninit<u8>], br: &mut [MaybeUninit<u8>]) {
+        for off in (0..done).step_by(16) {
             let hi = _mm256_add_epi16(_mm256_add_epi16(load(levels, off + near[0]), load(levels, off + near[1])), load(levels, off + near[2]));
             let mag = _mm256_add_epi16(hi, _mm256_add_epi16(load(levels, off + near[3]), load(levels, off + near[4])));
             let step = _mm256_min_epi16(_mm256_srli_epi16::<7>(_mm256_add_epi16(mag, _mm256_set1_epi16(64))), _mm256_set1_epi16(4));
@@ -276,8 +433,8 @@ mod arm {
         (b, vminq_u16(vshrq_n_u16::<1>(vaddq_u16(m, vdupq_n_u16(1))), vdupq_n_u16(6)))
     }
 
-    pub unsafe fn contexts(levels: &[u8], offset: &[u8], near: [usize; 5], reach: usize, base: &mut [MaybeUninit<u8>], br: &mut [MaybeUninit<u8>]) {
-        for off in (0..=reach).step_by(16) {
+    pub unsafe fn contexts(levels: &[u8], offset: &[u8], near: [usize; 5], done: usize, base: &mut [MaybeUninit<u8>], br: &mut [MaybeUninit<u8>]) {
+        for off in (0..done).step_by(16) {
             let (b0, m0) = half(levels, offset, near, off);
             let (b1, m1) = half(levels, offset, near, off + 8);
             vst1q_u8(base[off..][..16].as_mut_ptr().cast(), vcombine_u8(vmovn_u16(b0), vmovn_u16(b1)));
@@ -401,5 +558,67 @@ mod tests {
             }
         }
         assert!(reads > 500_000);
+    }
+
+    /// The counted bits in raster order are those of the scan order, on both lanes.
+    #[test]
+    fn ac_bits_as_scan_order() {
+        let mut rng = Rng(0x0dd_ba11);
+        let mut base = [[0u16; 4]; 41];
+        let mut br = [[0u32; 16]; 21];
+        for b in base.iter_mut().flatten() {
+            *b = rng.below(1 << 13) as u16;
+        }
+        for b in br.iter_mut().flatten() {
+            *b = rng.below(1 << 14);
+        }
+        for k in 0..TxfmSize::COUNT {
+            let tx = TxfmSize::from_repr(k).unwrap();
+            let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
+            for class in [TxClass::TwoD, TxClass::V] {
+                if class != TxClass::TwoD && t_dim.max >= TxfmSize::S32x32 as u8 {
+                    continue;
+                }
+                let lay = layout(tx, class);
+                let n = lay.scan.len();
+                for _ in 0..200 {
+                    let density = 1 + rng.below(8);
+                    let mut coefs: Vec<i32> = (0..n)
+                        .map(|_| match rng.below(64) {
+                            0 => i32::MIN,
+                            k if k < 8 * density => {
+                                let v = if k % 3 == 0 { rng.below(1 << 20) } else { rng.below(20) } as i32;
+                                if rng.below(2) == 0 { -v } else { v }
+                            }
+                            _ => 0,
+                        })
+                        .collect();
+                    let eob = rng.below(n as u32) as usize;
+                    for &(rc, ..) in &lay.scan[eob + 1..] {
+                        coefs[rc as usize] = 0;
+                    }
+                    let mut s = Scratch::new();
+                    let (bc, bm) = contexts(lay, &coefs, eob, &mut s);
+                    let (mut bits, mut sum) = (0u32, 0u32);
+                    for i in 1..=eob {
+                        let (rc, x, y, off) = lay.scan[i];
+                        let off = off as usize;
+                        let lv = coefs[rc as usize].unsigned_abs();
+                        sum = sum.wrapping_add(lv);
+                        bits = bits.wrapping_add(tail_bits(lv));
+                        if i < eob {
+                            bits = bits.wrapping_add(base[bc[off] as usize][cmp::min(lv, 3) as usize] as u32);
+                            if lv >= 3 {
+                                let far = if class == TxClass::TwoD { (x | y) > 1 } else { y > 0 };
+                                bits = bits.wrapping_add(br[(if far { 14 } else { 7 }) + bm[off] as usize][cmp::min(lv, 15) as usize]);
+                            }
+                        }
+                    }
+                    for lane in [Lane::Scalar, Lane::detect()] {
+                        assert_eq!((bits, sum), ac_bits_in(lane, lay, &coefs, eob, bc, bm, &base, &br), "{lane:?} {tx:?} {class:?} eob {eob}");
+                    }
+                }
+            }
+        }
     }
 }

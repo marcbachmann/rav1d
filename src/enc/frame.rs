@@ -2829,11 +2829,15 @@ fn write_coefs<S: Sink>(
             }
         }
     };
+    let raster = costs.filter(|_| lay.by_column());
+    let mut ac = (0, 0);
     let dc_level;
     if eob > 0 {
         let (_, x, y, _) = scan[eob as usize];
         let lv = level_at(eob as usize);
-        tail(lv);
+        if raster.is_none() {
+            tail(lv);
+        }
         let ctx = 1 + (eob > (2 << tx2dszctx)) as usize + (eob > (4 << tx2dszctx)) as usize;
         w.symbol((cmp::min(lv, 3) - 1) as u8, &mut cdf.coef.eob_base_tok[t_dim.ctx as usize][chroma][ctx], 2);
         if lv >= 3 {
@@ -2841,7 +2845,13 @@ fn write_coefs<S: Sink>(
             let ctx = if far { 14 } else { 7 };
             br_tok(w, costs, cdf, hi_ctx, chroma, ctx, cmp::min(lv, 15) as u8);
         }
-        for i in (1..eob as usize).rev() {
+        let mut serial = eob as usize;
+        if let Some(c) = raster {
+            let t = t_dim.ctx as usize;
+            ac = contexts::ac_bits(lay, coefs, eob as usize, base_ctx, br_mag, &c.base[t][chroma], &c.br[hi_ctx][chroma]);
+            serial = 1;
+        }
+        for i in (1..serial).rev() {
             let (rc, x, mut y, off) = scan[i];
             let off = off as usize;
             let lv = coefs[rc as usize].unsigned_abs();
@@ -2885,8 +2895,8 @@ fn write_coefs<S: Sink>(
         cul_level = dc_level;
     }
     if costs.is_some() {
-        w.add(tail_bits);
-        cul_level = cul_level.wrapping_add(tail_sum);
+        w.add(tail_bits.wrapping_add(ac.0));
+        cul_level = cul_level.wrapping_add(tail_sum).wrapping_add(ac.1);
     } else {
         for &(rc, ..) in &scan[1..=eob as usize] {
             let v = coefs[rc as usize];
