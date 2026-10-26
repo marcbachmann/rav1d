@@ -3711,6 +3711,14 @@ pub(crate) mod tests {
                 planes[2][i] = ((32768 * r - 27439 * g - 5329 * b + (128 << 16) + 32768) >> 16).clamp(0, 255) as u8;
             }
             let rows: Vec<&[u8]> = planes.iter().map(|p| p.as_slice()).collect();
+            // `ENC_EFFORT` takes the product's options: effort, tune IQ and `ENC_FAST=1` for the fast search.
+            let options = match std::env::var("ENC_EFFORT") {
+                Ok(effort) => {
+                    let o = crate::enc::Options::effort(qidx, effort.parse().unwrap(), options.screen, (w * h) as u64).tune_iq();
+                    if std::env::var("ENC_FAST").is_ok_and(|v| v == "1") { o.fast() } else { o }
+                }
+                Err(_) => options.clone(),
+            };
             let t = std::time::Instant::now();
             let threads: crate::Spawner = std::sync::Arc::new(|f| {
                 std::thread::spawn(f);
