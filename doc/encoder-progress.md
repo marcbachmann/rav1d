@@ -39,6 +39,20 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-26, block copies and context saves.** Profiled on an M3 with `ENC_EFFORT=4 ENC_FAST=1`
+(the product's options in the corpus bench): a 3000×2000 photo at qindex 189 and a 1864×1620
+screenshot at 144. `memmove` was 9–11% (block rows copied at a runtime width, contexts saved
+and put back unit by unit) and the transform block's context sum 4.5% (a saturating fold that
+does not vectorize; 1024 levels under 2^20 cannot wrap). Copies at a width known per block
+size, 16-unit context saves, the sum without saturation and the levels zeroed once per trial,
+each the same bytes on three configurations: photo q189 fast 3252 → 2786 ms (−14%), q75 full
+search 8951 → ~7900 ms (−12%), screenshot q144 fast 1549 → 1363 ms (−12%). The filter strength
+search is now 23% of the photo (CDEF trials). Not taken: stopping the CDEF strength walk after
+two rises picks other strengths on 3 of 72 searches (6 pictures × 3 qindexes); two tile
+columns for screen content cost +0.2–0.6% bytes on the screenshot and +0.3–1.7% on a diagram.
+On the laptop the WHT round-trip test reaches `unreachable!` at the scalar CPU level: rav1d's
+NEON build has no Rust WHT; `--skip enc::fdct::tests::round_trip_through_rav1d` there.
+
 **2026-10-25, tile columns on threads.** Two tile columns on the full-size corpus (qindex 140
 and 60) cost +0.67% and +0.49% bytes at +0.048 and +0.020 dB; on threads the corpus took
 3311 → 1947 ms, hills 960×512 646 → 395 ms at 17.4 MB peak (16.1 MB on one tile). The fixed cost

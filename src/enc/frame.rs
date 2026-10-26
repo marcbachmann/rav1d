@@ -3748,7 +3748,10 @@ pub(crate) mod tests {
             // `ENC_EFFORT` takes the product's options: effort, tune IQ and `ENC_FAST=1` for the fast search.
             let options = match std::env::var("ENC_EFFORT") {
                 Ok(effort) => {
-                    let o = crate::enc::Options::effort(qidx, effort.parse().unwrap(), options.screen, (w * h) as u64).tune_iq();
+                    let mut o = crate::enc::Options::effort(qidx, effort.parse().unwrap(), options.screen, (w * h) as u64).tune_iq();
+                    if let Ok(t) = std::env::var("ENC_TILES") {
+                        o.tile_cols_log2 = t.parse().unwrap();
+                    }
                     if std::env::var("ENC_FAST").is_ok_and(|v| v == "1") { o.fast() } else { o }
                 }
                 Err(_) => options.clone(),
