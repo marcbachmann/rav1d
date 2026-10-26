@@ -159,17 +159,17 @@ impl Ctx {
     fn save(&self, r: Range<usize>) -> Saved {
         let p = r.start / 2..r.end.div_ceil(2);
         let mut s = Saved { n: r.len(), np: p.len(), ..Saved::default() };
-        let n = s.n;
-        s.mode[..n].copy_from_slice(&self.mode[r.clone()]);
-        s.uvmode[..n].copy_from_slice(&self.uvmode[r.clone()]);
-        s.skip[..n].copy_from_slice(&self.skip[r.clone()]);
-        s.tx_intra[..n].copy_from_slice(&self.tx_intra[r.clone()]);
-        s.lcoef[..n].copy_from_slice(&self.lcoef[r.clone()]);
-        s.ccoef[0][..n].copy_from_slice(&self.ccoef[0][r.clone()]);
-        s.ccoef[1][..n].copy_from_slice(&self.ccoef[1][r.clone()]);
-        s.pal_sz[..n].copy_from_slice(&self.pal_sz[r.clone()]);
-        s.pal_sz_uv[..n].copy_from_slice(&self.pal_sz_uv[r.clone()]);
-        s.pal[..n].copy_from_slice(&self.pal[r]);
+        let a = r.start;
+        s.mode.copy_from_slice(&self.mode[a..][..16]);
+        s.uvmode.copy_from_slice(&self.uvmode[a..][..16]);
+        s.skip.copy_from_slice(&self.skip[a..][..16]);
+        s.tx_intra.copy_from_slice(&self.tx_intra[a..][..16]);
+        s.lcoef.copy_from_slice(&self.lcoef[a..][..16]);
+        s.ccoef[0].copy_from_slice(&self.ccoef[0][a..][..16]);
+        s.ccoef[1].copy_from_slice(&self.ccoef[1][a..][..16]);
+        s.pal_sz.copy_from_slice(&self.pal_sz[a..][..16]);
+        s.pal_sz_uv.copy_from_slice(&self.pal_sz_uv[a..][..16]);
+        s.pal[..s.n].copy_from_slice(&self.pal[r]);
         s.partition[..s.np].copy_from_slice(&self.partition[p]);
         s
     }
@@ -177,20 +177,20 @@ impl Ctx {
     /// The coefficient contexts of the units in `r`, at most 16.
     fn save_coef(&self, r: Range<usize>) -> Saved {
         let mut s = Saved { n: r.len(), ..Saved::default() };
-        s.lcoef[..s.n].copy_from_slice(&self.lcoef[r.clone()]);
-        s.ccoef[0][..s.n].copy_from_slice(&self.ccoef[0][r.clone()]);
-        s.ccoef[1][..s.n].copy_from_slice(&self.ccoef[1][r]);
+        s.lcoef.copy_from_slice(&self.lcoef[r.start..][..16]);
+        s.ccoef[0].copy_from_slice(&self.ccoef[0][r.start..][..16]);
+        s.ccoef[1].copy_from_slice(&self.ccoef[1][r.start..][..16]);
         s
     }
 
     fn restore(&mut self, start: usize, s: &Saved) {
         let n = s.n;
-        self.mode[start..start + n].copy_from_slice(&s.mode[..n]);
-        self.uvmode[start..start + n].copy_from_slice(&s.uvmode[..n]);
-        self.skip[start..start + n].copy_from_slice(&s.skip[..n]);
-        self.tx_intra[start..start + n].copy_from_slice(&s.tx_intra[..n]);
-        self.pal_sz[start..start + n].copy_from_slice(&s.pal_sz[..n]);
-        self.pal_sz_uv[start..start + n].copy_from_slice(&s.pal_sz_uv[..n]);
+        put(&mut self.mode[start..], &s.mode, n);
+        put(&mut self.uvmode[start..], &s.uvmode, n);
+        put(&mut self.skip[start..], &s.skip, n);
+        put(&mut self.tx_intra[start..], &s.tx_intra, n);
+        put(&mut self.pal_sz[start..], &s.pal_sz, n);
+        put(&mut self.pal_sz_uv[start..], &s.pal_sz_uv, n);
         self.pal[start..start + n].copy_from_slice(&s.pal[..n]);
         self.restore_coef(start, s);
         let p = start / 2;
@@ -199,9 +199,22 @@ impl Ctx {
 
     fn restore_coef(&mut self, start: usize, s: &Saved) {
         let n = s.n;
-        self.lcoef[start..start + n].copy_from_slice(&s.lcoef[..n]);
-        self.ccoef[0][start..start + n].copy_from_slice(&s.ccoef[0][..n]);
-        self.ccoef[1][start..start + n].copy_from_slice(&s.ccoef[1][..n]);
+        put(&mut self.lcoef[start..], &s.lcoef, n);
+        put(&mut self.ccoef[0][start..], &s.ccoef[0], n);
+        put(&mut self.ccoef[1][start..], &s.ccoef[1], n);
+    }
+}
+
+/// The first `n` of 16 saved units, as fixed-size copies for the block sides 1 to 16.
+#[inline(always)]
+fn put<T: Copy>(dst: &mut [T], src: &[T; 16], n: usize) {
+    match n {
+        1 => dst[..1].copy_from_slice(&src[..1]),
+        2 => dst[..2].copy_from_slice(&src[..2]),
+        4 => dst[..4].copy_from_slice(&src[..4]),
+        8 => dst[..8].copy_from_slice(&src[..8]),
+        16 => dst[..16].copy_from_slice(src),
+        _ => dst[..n].copy_from_slice(&src[..n]),
     }
 }
 
