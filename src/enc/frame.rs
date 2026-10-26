@@ -1531,7 +1531,6 @@ impl<D: Decide> Encoder<D> {
                 let n = cmp::min(pw, 32) * cmp::min(ph, 32);
                 let mut lv = self.lv.take().unwrap();
                 let levels = &mut lv[..n];
-                levels.fill(0);
                 self.recon_ready = false;
                 self.residual_bits = None;
                 self.residual_dist = 0;
@@ -1554,6 +1553,7 @@ impl<D: Decide> Encoder<D> {
                 } else if self.dry || self.decide.searches() {
                     None
                 } else {
+                    levels.fill(0);
                     self.decide.residual(plane, tx, set, levels)
                 };
                 let txtp = match decided {
