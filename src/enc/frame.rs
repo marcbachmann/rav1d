@@ -99,17 +99,15 @@ impl Plane {
     }
 
     fn read(&self, x: usize, y: usize, w: usize, h: usize, out: &mut Vec<u8>) {
-        for r in 0..h {
-            out.extend_from_slice(&self.comp.slice::<BD, _>(((y + r) * self.stride + x.., ..w)));
-        }
+        let at = out.len();
+        out.resize(at + w * h, 0);
+        let len = (h - 1) * self.stride + w;
+        copy_rect(&mut out[at..], w, &self.comp.slice::<BD, _>((y * self.stride + x.., ..len)), self.stride, w, h);
     }
 
     fn write(&self, x: usize, y: usize, w: usize, h: usize, data: &[u8]) {
-        for r in 0..h {
-            self.comp
-                .slice_mut::<BD, _>(((y + r) * self.stride + x.., ..w))
-                .copy_from_slice(&data[r * w..][..w]);
-        }
+        let len = (h - 1) * self.stride + w;
+        copy_rect(&mut self.comp.slice_mut::<BD, _>((y * self.stride + x.., ..len)), self.stride, data, w, w, h);
     }
 }
 
@@ -1683,11 +1681,10 @@ impl<D: Decide> Encoder<D> {
         self.stats[self.stage][1] += (n * cands.len()) as u64;
         let mut b = self.bufs.take().unwrap();
         let Bufs { src, pred, residual, coefs, trial, cf } = &mut *b;
-        for r in 0..ph {
-            let at = (wy + r) * self.src[plane].stride + x0;
-            src[r * pw..][..pw].copy_from_slice(&self.src[plane].comp.slice::<BD, _>((at.., ..pw)));
-            pred[r * pw..][..pw].copy_from_slice(&self.rec[plane].comp.slice::<BD, _>((at.., ..pw)));
-        }
+        let stride = self.src[plane].stride;
+        let (at, len) = (wy * stride + x0, (ph - 1) * stride + pw);
+        copy_rect(src, pw, &self.src[plane].comp.slice::<BD, _>((at.., ..len)), stride, pw, ph);
+        copy_rect(pred, pw, &self.rec[plane].comp.slice::<BD, _>((at.., ..len)), stride, pw, ph);
         for i in 0..pw * ph {
             residual[i] = src[i] as i16 - pred[i] as i16;
         }
@@ -2525,13 +2522,37 @@ fn predicts_skip(residual: &[i16], pw: usize, ph: usize, vw: usize, vh: usize, d
     true
 }
 
+/// A `w`×`h` rectangle copied between strided buffers, with the width known to the compiler for
+/// each block width so that a row is a few vector moves, not a `memmove` call.
+fn copy_rect(dst: &mut [u8], dst_stride: usize, src: &[u8], src_stride: usize, w: usize, h: usize) {
+    #[inline(always)]
+    fn rows<const W: usize>(dst: &mut [u8], ds: usize, src: &[u8], ss: usize, h: usize) {
+        for r in 0..h {
+            dst[r * ds..][..W].copy_from_slice(&src[r * ss..][..W]);
+        }
+    }
+    match w {
+        4 => rows::<4>(dst, dst_stride, src, src_stride, h),
+        8 => rows::<8>(dst, dst_stride, src, src_stride, h),
+        16 => rows::<16>(dst, dst_stride, src, src_stride, h),
+        32 => rows::<32>(dst, dst_stride, src, src_stride, h),
+        64 => rows::<64>(dst, dst_stride, src, src_stride, h),
+        _ => {
+            for r in 0..h {
+                dst[r * dst_stride..][..w].copy_from_slice(&src[r * src_stride..][..w]);
+            }
+        }
+    }
+}
+
 /// The context a transform block leaves for its neighbours: the sum of its levels, capped, and
 /// the sign of its DC.
 fn res_ctx(levels: &[i32], eob: i32) -> u8 {
     if eob < 0 {
         return 0x40;
     }
-    let cul = levels.iter().fold(0u32, |a, l| a.saturating_add(l.unsigned_abs() & 0xfffff));
+    // At most 1024 levels under 2^20: the sum cannot wrap, and a plain sum vectorizes.
+    let cul = levels.iter().fold(0u32, |a, l| a.wrapping_add(l.unsigned_abs() & 0xfffff));
     let sign = match levels[0] {
         0 => 0x40,
         d if d < 0 => 0,
