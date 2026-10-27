@@ -499,6 +499,10 @@ pub struct Encoder<D: Decide> {
     pub skip_prediction: bool,
     /// Whether the last luma residual searched was predicted to skip.
     skip_predicted: bool,
+    /// See `Options::uv_outward`.
+    pub uv_outward: bool,
+    /// See `Options::fast_filters`.
+    pub fast_filters: bool,
     /// The superblock's 16×16 blocks' factors over `ssim_reference`, and its λ before them.
     ssim: [f64; 16],
     sb_lambda: f64,
@@ -645,6 +649,8 @@ impl<D: Decide> Encoder<D> {
             ssim_reference: None,
             skip_prediction: false,
             skip_predicted: false,
+            uv_outward: false,
+            fast_filters: false,
             ssim: [1.0; 16],
             sb_lambda: 1.0,
 
@@ -1377,9 +1383,19 @@ impl<D: Decide> Encoder<D> {
 
     #[allow(clippy::too_many_arguments)]
     fn predict_cfl(&mut self, ti: usize, x: i32, y: i32, w4: i32, h4: i32, bw4: i32, bh4: i32, tx: TxfmSize, uvtx: TxfmSize, intra: &Intra) {
+        let ac = self.cfl_ac(x, y, w4, h4, bw4, bh4, tx);
+        for pl in 0..2 {
+            if intra.cfl[pl] == 0 {
+                continue;
+            }
+            self.predict_cfl_plane(ti, x, y, uvtx, &ac, pl, intra.cfl[pl]);
+        }
+    }
+
+    /// The luma AC a block's CfL predictions scale.
+    #[allow(clippy::too_many_arguments)]
+    fn cfl_ac(&self, x: i32, y: i32, w4: i32, h4: i32, bw4: i32, bh4: i32, tx: TxfmSize) -> Ac {
         let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
-        let uv_dim = &DAV1D_TXFM_DIMENSIONS[uvtx as usize];
-        let tile = &self.tiles[ti];
         let wy = (y as usize * 4) % SB;
         let luma = &self.rec[0];
         let y_src = luma.comp.with_offset::<BD>() + (wy * luma.stride + x as usize * 4);
@@ -1394,44 +1410,48 @@ impl<D: Decide> Encoder<D> {
             bw4 * 4,
             bh4 * 4,
         );
-        for pl in 0..2 {
-            if intra.cfl[pl] == 0 {
-                continue;
-            }
-            let rec = &self.rec[1 + pl];
-            let dst = rec.comp.with_offset::<BD>() + (wy * rec.stride + x as usize * 4);
-            let mut topleft = EdgePx([0; EDGE_LEN]);
-            let mut angle = 0;
-            let m = rav1d_prepare_intra_edges(
-                x,
-                x > tile.col_start,
-                y,
-                y > tile.row_start,
-                tile.col_end,
-                tile.row_end,
-                EdgeFlags::empty(),
-                dst,
-                self.top_edge(1 + pl, y),
-                DC_PRED,
-                &mut angle,
-                uv_dim.w as i32,
-                uv_dim.h as i32,
-                0,
-                &mut topleft.0,
-                128,
-                BD::new(()),
-            );
-            self.dsp.ipred.cfl_pred[m as usize].call::<BD>(
-                dst,
-                &topleft.0,
-                128,
-                uv_dim.w as i32 * 4,
-                uv_dim.h as i32 * 4,
-                &ac.0,
-                intra.cfl[pl] as i32,
-                BD::new(()),
-            );
-        }
+        ac
+    }
+
+    /// One chroma plane predicted from its DC and `alpha` times `ac`; 0 is the DC prediction.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_cfl_plane(&mut self, ti: usize, x: i32, y: i32, uvtx: TxfmSize, ac: &Ac, pl: usize, alpha: i8) {
+        let uv_dim = &DAV1D_TXFM_DIMENSIONS[uvtx as usize];
+        let tile = &self.tiles[ti];
+        let wy = (y as usize * 4) % SB;
+        let rec = &self.rec[1 + pl];
+        let dst = rec.comp.with_offset::<BD>() + (wy * rec.stride + x as usize * 4);
+        let mut topleft = EdgePx([0; EDGE_LEN]);
+        let mut angle = 0;
+        let m = rav1d_prepare_intra_edges(
+            x,
+            x > tile.col_start,
+            y,
+            y > tile.row_start,
+            tile.col_end,
+            tile.row_end,
+            EdgeFlags::empty(),
+            dst,
+            self.top_edge(1 + pl, y),
+            DC_PRED,
+            &mut angle,
+            uv_dim.w as i32,
+            uv_dim.h as i32,
+            0,
+            &mut topleft.0,
+            128,
+            BD::new(()),
+        );
+        self.dsp.ipred.cfl_pred[m as usize].call::<BD>(
+            dst,
+            &topleft.0,
+            128,
+            uv_dim.w as i32 * 4,
+            uv_dim.h as i32 * 4,
+            &ac.0,
+            alpha as i32,
+            BD::new(()),
+        );
     }
 
     /// Predicts every transform block of one plane, chooses its residual and reconstructs it,
@@ -2337,15 +2357,23 @@ impl<D: Decide> Encoder<D> {
             }
             if limits.angles && (VERT_PRED..=VERT_LEFT_PRED).contains(&best.1.uv_mode) {
                 let d = best.1;
-                for a in [-3, -2, -1, 1, 2, 3] {
-                    let c = Intra { uv_angle: a, ..d };
-                    let (cost, txs) = chroma(self, &c, best.0);
-                    if cost < best.0 {
-                        best = (cost, c);
-                        let old = std::mem::replace(&mut chroma_txs, txs);
-                        self.recycle(old);
-                    } else {
-                        self.recycle(txs);
+                let outward = self.uv_outward;
+                let deltas: &[[i8; 3]] = if outward { &[[-1, -2, -3], [1, 2, 3]] } else { &[[-3, -2, -1], [1, 2, 3]] };
+                for run in deltas {
+                    for &a in run {
+                        let c = Intra { uv_angle: a, ..d };
+                        let (cost, txs) = chroma(self, &c, best.0);
+                        let better = cost < best.0;
+                        if better {
+                            best = (cost, c);
+                            let old = std::mem::replace(&mut chroma_txs, txs);
+                            self.recycle(old);
+                        } else {
+                            self.recycle(txs);
+                        }
+                        if outward && !better {
+                            break;
+                        }
                     }
                 }
             }
@@ -2408,6 +2436,29 @@ impl<D: Decide> Encoder<D> {
         let ch4 = cmp::min(bh4, self.bh - y);
         let (tx, uvtx) = self.tx_sizes(bs, depth);
         let mut best = [(u64::MAX, 0i8); 2];
+        if self.uv_outward {
+            self.restore_contexts(luma_done);
+            let ac = self.cfl_ac(x, y, cw4, ch4, bw4, bh4, tx);
+            for p in 0..2 {
+                let err = |e: &mut Self, a: i8| {
+                    e.predict_cfl_plane(ti, x, y, uvtx, &ac, p, a);
+                    e.sse(x, y, w4, h4, 1 + p..2 + p)
+                };
+                best[p] = (err(self, 0), 0);
+                for dir in [1i8, -1] {
+                    for i in 1..=16 {
+                        let a = dir * i;
+                        let d = err(self, a);
+                        if d >= best[p].0 {
+                            break;
+                        }
+                        best[p] = (d, a);
+                    }
+                }
+            }
+            self.restore(luma_done);
+            return [best[0].1, best[1].1];
+        }
         for a in -16i8..=16 {
             if a == 0 {
                 continue;
@@ -3727,6 +3778,8 @@ pub(crate) mod tests {
             skip_prediction: std::env::var("ENC_SKIP_PRED").map_or(true, |v| v != "0"),
             iq_filters: std::env::var("ENC_IQ_FILTERS").is_ok_and(|v| v == "1"),
             filter_search: std::env::var("ENC_FILTER_SEARCH").is_ok_and(|v| v == "1"),
+            uv_outward: std::env::var("ENC_UV_OUTWARD").is_ok_and(|v| v == "1"),
+            fast_filters: std::env::var("ENC_FAST_FILTERS").is_ok_and(|v| v == "1"),
             tile_cols_log2: std::env::var("ENC_TILES").map_or(1, |v| v.parse().unwrap()),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();

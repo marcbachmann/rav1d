@@ -122,6 +122,14 @@ pub struct Options {
     pub iq_rdmult: bool,
     /// See `Encoder::skip_prediction`; libaom predicts skips at every speed.
     pub skip_prediction: bool,
+    /// libaom's `cfl_search_range` 3 and its chroma angle search: each chroma plane's CfL alpha
+    /// and the chroma angle delta are searched outward from 0 while the cost falls, instead of
+    /// over every value.
+    pub uv_outward: bool,
+    /// libaom's `LPF_PICK_FROM_Q` and `CDEF_FAST_SEARCH_LVL3`, its filter picks from cpu-used 6
+    /// and 5: deblocking levels from the qindex, CDEF primaries of 0, 2, 4, 8, 14 and
+    /// secondaries of 0, 2 (7 trials instead of 23).
+    pub fast_filters: bool,
     /// libaom's tune-IQ filters: no CDEF up to qindex 32 (`CDEF_ADAPTIVE`), deblocking sharpness
     /// 7 up to qindex 112 and 1 up to 160 (adaptive sharpness).
     pub iq_filters: bool,
@@ -155,7 +163,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: false, fast_filters: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
     }
 }
 
@@ -167,10 +175,10 @@ impl Options {
 
     /// libaom's shortcuts from cpu-used 5 that cost AVIF gates at effort 4, for speed: partitions
     /// pruned by its intra CNN, no 8×8 blocks above qindex 100, and luma modes pre-ranked by SATD
-    /// at every qindex.
+    /// at every qindex, CfL alphas searched outward and the filter picks of cpu-used 5 and 6.
     pub fn fast(self) -> Self {
         let levels = if self.qidx > 100 { self.levels.start..self.levels.end.min(3) } else { self.levels.clone() };
-        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre: 6, ..self }
+        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre: 6, uv_outward: true, fast_filters: true, ..self }
     }
 }
 
@@ -338,6 +346,8 @@ pub(crate) fn encoder(width: u32, height: u32, planes: &[&[u8]], options: &Optio
     e.timing = timing;
     e.iq = options.iq_rdmult;
     e.skip_prediction = options.skip_prediction;
+    e.uv_outward = options.uv_outward;
+    e.fast_filters = options.fast_filters;
     e.keep_modes = options.keep_modes;
     e.keep_chroma = options.keep_chroma;
     e.rect = options.rect;

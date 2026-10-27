@@ -92,7 +92,8 @@ pub fn search(e: &mut Encoder<Rd>, src: &[&[u8]]) {
 /// plane is filtered on its own, so one decode tries a level for every plane.
 fn run(e: &mut Encoder<Rd>, planes: usize, errors: &mut dyn FnMut(&Encoder<Rd>) -> [u64; 3]) {
     let mut best = errors(e);
-    for step in [8, 4, 2, 1] {
+    let steps: &[i32] = if e.fast_filters { &[] } else { &[8, 4, 2, 1] };
+    for &step in steps {
         for dir in [-1, 1] {
             let lf = e.frame.lf;
             let level = |l: u8| (l as i32 + dir * step).clamp(1, 63) as u8;
@@ -108,20 +109,27 @@ fn run(e: &mut Encoder<Rd>, planes: usize, errors: &mut dyn FnMut(&Encoder<Rd>) 
             }
         }
     }
-    let lf = e.frame.lf;
-    e.frame.lf = [0; 4];
-    let off = errors(e);
-    if off.iter().sum::<u64>() < best.iter().sum::<u64>() {
-        best = off;
-    } else {
-        e.frame.lf = lf;
+    if !e.fast_filters {
+        let lf = e.frame.lf;
+        e.frame.lf = [0; 4];
+        let off = errors(e);
+        if off.iter().sum::<u64>() < best.iter().sum::<u64>() {
+            best = off;
+        } else {
+            e.frame.lf = lf;
+        }
     }
     if !e.seq.cdef {
         return;
     }
     let mut cdef = e.frame.cdef.unwrap_or(Cdef { damping: 3, ..Default::default() });
     for primary in [true, false] {
-        let values: &[u8] = if primary { &[0, 1, 2, 3, 4, 6, 8, 10, 12, 15] } else { &[0, 1, 2, 3] };
+        let values: &[u8] = match (primary, e.fast_filters) {
+            (true, false) => &[0, 1, 2, 3, 4, 6, 8, 10, 12, 15],
+            (true, true) => &[0, 2, 4, 8, 14],
+            (false, false) => &[0, 1, 2, 3],
+            (false, true) => &[0, 2],
+        };
         let set = |s: u8, v: u8| if primary { v << 2 | s & 3 } else { s & !3 | v };
         for &v in values {
             let cand = Cdef { y: [set(cdef.y[0], v); 8], uv: [set(cdef.uv[0], v); 8], ..cdef };
