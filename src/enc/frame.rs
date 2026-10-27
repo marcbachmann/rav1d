@@ -1617,7 +1617,7 @@ impl<D: Decide> Encoder<D> {
                     }
                 } else if eob >= 0 {
                     let mut b = self.bufs.take().unwrap();
-                    self.dequant(plane, tx, txtp, levels, &mut b.cf.0[..n]);
+                    self.dequant(plane, tx, txtp, levels, &mut b.cf.0[..n], n);
                     let rec = &self.rec[plane];
                     let dst = rec.comp.with_offset::<BD>() + (wy * rec.stride + px as usize * 4);
                     self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut b.cf.0[..n], eob, BD::new(()));
@@ -1677,7 +1677,7 @@ impl<D: Decide> Encoder<D> {
         fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, DCT_DCT);
         let qm = self.qm[tx as usize][0];
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
-        let (eob, err) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[0], qm, shift, 48, scan_index(tx, TxClass::TwoD));
+        let (eob, err, _) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[0], qm, shift, 48, scan_index(tx, TxClass::TwoD));
         let (ax, ly) = (x as usize, (y & 15) as usize);
         let (mut a, mut l) = ([0x40u8; 48], [0x40u8; 48]);
         a[..16].copy_from_slice(&self.above.lcoef[ax..][..16]);
@@ -1757,23 +1757,23 @@ impl<D: Decide> Encoder<D> {
         levels.fill(0);
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
         if self.tx_domain_dist && cands.len() > 1 && self.rdoq == 0 && !lossless && (vw, vh) == (pw, ph) {
-            let mut winner: Option<(f64, TxfmType, i32, u32)> = None;
+            let mut winner: Option<(f64, TxfmType, i32, u32, usize)> = None;
             for &txtp in cands {
                 fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
                 let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
-                let (eob, err) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, 48, scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]));
+                let (eob, err, last) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, 48, scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]));
                 if eob < 0 {
                     continue;
                 }
                 let bits = rate(self, txtp, &trial[..n], eob);
                 let cost = err as f64 / 64.0 + self.lambda * bits as f64 / 512.0;
                 if winner.is_none_or(|w| cost < w.0) {
-                    winner = Some((cost, txtp, eob, bits));
+                    winner = Some((cost, txtp, eob, bits, last));
                     levels.copy_from_slice(&trial[..n]);
                 }
             }
-            if let Some((_, txtp, eob, bits)) = winner {
-                self.dequant(plane, tx, txtp, levels, &mut cf.0[..n]);
+            if let Some((_, txtp, eob, bits, last)) = winner {
+                self.dequant(plane, tx, txtp, levels, &mut cf.0[..n], last);
                 self.scratch.write(0, 0, pw, ph, &pred[..pw * ph]);
                 let dst = self.scratch.comp.with_offset::<BD>();
                 self.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
@@ -1795,14 +1795,14 @@ impl<D: Decide> Encoder<D> {
             fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
             let index = scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]);
-            let (eob, _) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 }, index);
+            let (eob, _, used) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 }, index);
             if eob < 0 {
                 continue;
             }
             let mut eob = eob;
             let mut bits = rate(self, txtp, &trial[..n], eob);
             let reconstruct = |e: &mut Self, lv: &[i32], eob: i32, cf: &mut Coef| -> u64 {
-                e.dequant(plane, tx, txtp, lv, &mut cf.0[..n]);
+                e.dequant(plane, tx, txtp, lv, &mut cf.0[..n], used);
                 e.scratch.write(0, 0, pw, ph, &pred[..pw * ph]);
                 let dst = e.scratch.comp.with_offset::<BD>();
                 e.dsp.itx.itxfm_add[tx as usize][txtp as usize].call::<BD>(dst, &mut cf.0[..n], eob, BD::new(()));
@@ -1867,11 +1867,14 @@ impl<D: Decide> Encoder<D> {
         (best.1, best.2)
     }
 
-    fn dequant(&self, plane: usize, tx: TxfmSize, txtp: TxfmType, levels: &[i32], cf: &mut [i16]) {
+    /// `levels` beyond the `last` in raster order are 0 and leave 0 in `cf`.
+    fn dequant(&self, plane: usize, tx: TxfmSize, txtp: TxfmType, levels: &[i32], cf: &mut [i16], last: usize) {
         let t_dim = &DAV1D_TXFM_DIMENSIONS[tx as usize];
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
         let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
-        quant::dequantize(levels, cf, self.dq[plane], qm, shift);
+        let m = last.next_multiple_of(8).min(levels.len());
+        quant::dequantize(&levels[..m], &mut cf[..m], self.dq[plane], qm, shift);
+        cf[m..].fill(0);
     }
 
     /// The squared error of the reconstruction in a block's visible area, in the given planes.

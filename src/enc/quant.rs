@@ -7,9 +7,10 @@ use super::fdct_fast::Lane;
 
 /// The level of each coefficient with `rounding` in 1/128 of a step, and the end of block: the
 /// last nonzero level's position in `index` (the scan), or -1. Also the squared error of the
-/// levels in the coefficients' scale.
+/// levels in the coefficients' scale, and the count of levels up to the last nonzero one in
+/// raster order, 0 for none, which is all a dequantization needs to read.
 #[allow(clippy::too_many_arguments)]
-pub fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64) {
+pub fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64, usize) {
     quantize_in(Lane::detect(), coefs, levels, dq, qm, shift, rounding, index)
 }
 
@@ -23,7 +24,7 @@ pub fn quantize_in(
     shift: u32,
     rounding: u32,
     index: &[u16],
-) -> (i32, u64) {
+) -> (i32, u64, usize) {
     let n = coefs.len();
     assert!(n % 8 == 0 && levels.len() == n && index.len() >= n && qm.is_none_or(|m| m.len() >= n));
     match lane {
@@ -42,9 +43,10 @@ pub fn quantize_in(
     }
 }
 
-fn quantize_scalar(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64) {
+fn quantize_scalar(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64, usize) {
     let mut eob = -1;
     let mut err = 0u64;
+    let mut last = 0;
     for (rc, ((&c, l), &i)) in coefs.iter().zip(levels.iter_mut()).zip(index).enumerate() {
         let mut q = dq[(rc != 0) as usize];
         if let Some(qm) = qm {
@@ -55,11 +57,12 @@ fn quantize_scalar(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&
         *l = if c < 0 { -v } else { v };
         if v != 0 {
             eob = cmp::max(eob, i as i32);
+            last = rc + 1;
         }
         let d = a as i64 - q as i64 * v as i64;
         err += (d * d) as u64;
     }
-    (eob, err)
+    (eob, err, last)
 }
 
 /// The coefficients `levels` stand for, as rav1d's `decode_coefs` dequantizes them.
@@ -137,8 +140,9 @@ mod x86 {
 
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64) {
+    pub unsafe fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64, usize) {
         let count = _mm_cvtsi32_si128(shift as i32);
+        let mut last = 0;
         let round = _mm256_set1_pd(rounding as f64);
         let dead = _mm256_set1_epi32(128 - rounding as i32);
         let mut eob = _mm256_set1_epi32(-1);
@@ -163,6 +167,10 @@ mod x86 {
             let zero = _mm256_cmpeq_epi32(v, _mm256_setzero_si256());
             let i = _mm256_cvtepu16_epi32(_mm_loadu_si128(index[rc..][..8].as_ptr().cast()));
             eob = _mm256_max_epi32(eob, _mm256_or_si256(i, zero));
+            let nonzero = !_mm256_movemask_ps(_mm256_castsi256_ps(zero)) & 0xff;
+            if nonzero != 0 {
+                last = rc + 32 - nonzero.leading_zeros() as usize;
+            }
             let d = _mm256_sub_epi32(a, _mm256_mullo_epi32(q, v));
             err = _mm256_add_epi64(err, _mm256_mul_epi32(d, d));
             let odd = _mm256_srli_epi64::<32>(d);
@@ -174,7 +182,7 @@ mod x86 {
         let e = _mm_add_epi64(_mm256_castsi256_si128(err), _mm256_extracti128_si256::<1>(err));
         let mut e2 = [0u64; 2];
         _mm_storeu_si128(e2.as_mut_ptr().cast(), e);
-        (_mm_cvtsi128_si32(m), e2[0] + e2[1])
+        (_mm_cvtsi128_si32(m), e2[0] + e2[1], last)
     }
 
     #[target_feature(enable = "avx2")]
@@ -223,8 +231,9 @@ mod arm {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64) {
+    pub unsafe fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64, usize) {
         let count = vdupq_n_s32(shift as i32);
+        let mut last = 0;
         let round = vdupq_n_f64(rounding as f64);
         let dead = vdupq_n_s32(128 - rounding as i32);
         let mut eob = vdupq_n_s32(-1);
@@ -244,12 +253,18 @@ mod arm {
             let v = vcombine_s32(divide(vget_low_s32(a), vget_low_s32(q), round), divide(vget_high_s32(a), vget_high_s32(q), round));
             vst1q_s32(levels[rc..][..4].as_mut_ptr(), vbslq_s32(vcltzq_s32(c), vnegq_s32(v), v));
             let i = vreinterpretq_s32_u32(vmovl_u16(vld1_u16(index[rc..][..4].as_ptr())));
-            eob = vmaxq_s32(eob, vbslq_s32(vceqzq_s32(v), vdupq_n_s32(-1), i));
+            let zero = vceqzq_s32(v);
+            eob = vmaxq_s32(eob, vbslq_s32(zero, vdupq_n_s32(-1), i));
+            // Lane k's bit k, for the lanes of nonzero levels.
+            let nonzero = vaddvq_u32(vandq_u32(vmvnq_u32(zero), vld1q_u32([1, 2, 4, 8].as_ptr())));
+            if nonzero != 0 {
+                last = rc + 32 - nonzero.leading_zeros() as usize;
+            }
             let d = vmlsq_s32(a, q, v);
             err = vmlal_s32(err, vget_low_s32(d), vget_low_s32(d));
             err = vmlal_high_s32(err, d, d);
         }
-        (vmaxvq_s32(eob), vaddvq_s64(err) as u64)
+        (vmaxvq_s32(eob), vaddvq_s64(err) as u64, last)
     }
 
     pub unsafe fn dequantize(levels: &[i32], cf: &mut [i16], dq: [u32; 2], qm: Option<&[u8]>, shift: u32) {
