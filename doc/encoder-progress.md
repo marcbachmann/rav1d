@@ -39,6 +39,16 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-27, column cache, CDEF repeats, lazy partition snaps.** Three more exact steps,
+pinned on x86 (effort 4): `fdct_fast::Columns` keeps a residual's column pass between transform
+types with the same vertical transform (DCT_DCT/DCT_ADST, ADST_DCT/ADST_ADST share one); a
+CDEF trial of the header's own strengths is skipped; `pick_partition` restores its start only
+once a candidate has changed it and snaps the best only before a later candidate overwrites
+it. Photo q189 fast 1621 → 1587 ms, default q75 6571 → 6490, screenshot q144 fast 1014 → 996.
+`predict_plane`'s own 9% has no line over 1.6% (residual subtraction 0.7%, the transform
+block's push 0.5%); a further cut there is a search change (fewer trials, or trials without
+reconstruction), not an exact one.
+
 **2026-10-27, fast-search filters and chroma, quantizer skips.** Profiled with `perf` on
 `worker` (x86, `ENC_EFFORT=4 ENC_FAST=1`): the photo spent 23% in the filter search (CDEF
 trials), 11% in the quantizer's f64 divisions, 5% in the CfL alpha scan (32 predictions of
