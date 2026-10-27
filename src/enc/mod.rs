@@ -77,7 +77,8 @@ pub struct Options {
     /// direction of None's luma mode where None did (libaom's `prune_rect_part_using_none_pred_mode`).
     pub rect: u8,
     /// Transform types are searched for the chosen depth only. To effort 5 also in the fine
-    /// search of photos over 512×512.
+    /// search of photos over 512×512: at Q70-Q90 they lost 0.04 dB at libaom's bytes (at most 0.18)
+    /// for 2-13% less time.
     pub late_txtp: bool,
     /// libaom's `use_reduced_intra_txset`: under 16×16 the four DCT and ADST types and the one
     /// of IDTX, V_DCT, H_DCT the luma mode suits; to effort 7 where the search is not full.
