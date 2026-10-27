@@ -39,6 +39,30 @@ An incremental build takes about 17 s.
 
 ## Log
 
+**2026-10-27, fast-search filters and chroma, quantizer skips.** Profiled with `perf` on
+`worker` (x86, `ENC_EFFORT=4 ENC_FAST=1`): the photo spent 23% in the filter search (CDEF
+trials), 11% in the quantizer's f64 divisions, 5% in the CfL alpha scan (32 predictions of
+both planes), 3% in the partition CNN. `Options::fast` now picks filters as libaom at
+cpu-used 6 and 5 (`LPF_PICK_FROM_Q`, `CDEF_FAST_SEARCH_LVL3`: primaries 0, 2, 4, 8, 14 and
+secondaries 0, 2, 7 trials instead of 23) and searches each chroma plane's CfL alpha and
+the chroma angle delta outward from 0 while the cost falls (`uv_outward`, libaom's
+`cfl_search_range` 3 and angle search): screenshot q144 1268 → 1118 ms at −0.5% bytes and
++0.07 dB, photo q189 2388 → 1903 ms at −0.02 dB, q75 3697 → 3118 ms at −0.03 dB. Three steps
+with the same bytes for every search: a group of 8 (AVX2) or 4 (NEON) coefficients that all
+quantize to 0 (128a < q(128 − rounding)) skips the division (photo fast −5%, default q75
+−1.2%); the dequantizer reads up to the last nonzero level in raster order, which the
+quantizer returns (−1.6%); the CNN's convolutions compiled for AVX2 (−3%). Together, pinned
+on x86: photo q189 fast 2388 → 1625 ms, screenshot q144 fast 1268 → 1010 ms. On the 13-picture
+keep corpus (`own::compare::efforts`, effort 4, 8 at a time) the new fast search against the
+old at libaom's bytes: photos −0.01 dB at Q40 and −0.04 at Q75, graphics −0.07 and +0.20,
+time ×0.73–0.84; the one loss is a logo at Q40, −0.71 dB at its qindex for −2% bytes (−0.16
+at equal bytes). Pinned to
+image-processing branch `avif-fast-speed` (Rust avif 44/0, engine-avif and formats JS
+1771/0). Trap: a job cannot create files in a shipped tree on `worker` (`Permission denied`
+for the job user; only the container as root can), and a `[patch."<git url>"]` section
+appended there did nothing, so two harness runs compared a tree with itself; replace the
+dependency line inside the container instead.
+
 **2026-10-26, block copies and context saves.** Profiled on an M3 with `ENC_EFFORT=4 ENC_FAST=1`
 (the product's options in the corpus bench): a 3000×2000 photo at qindex 189 and a 1864×1620
 screenshot at 144. `memmove` was 9–11% (block rows copied at a runtime width, contexts saved
