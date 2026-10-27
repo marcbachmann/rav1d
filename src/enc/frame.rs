@@ -2038,7 +2038,10 @@ impl<D: Decide> Encoder<D> {
             }
             _ => Prune::default(),
         };
-        let mut best: Option<(f64, u32, Snap, Vec<Node>)> = Option::None;
+        // The best candidate's pixels and contexts are snapped only when a later candidate is
+        // about to overwrite them; a best left in place needs neither the snap nor the restore.
+        let mut best: Option<(f64, u32, Option<Snap>, Vec<Node>)> = Option::None;
+        let mut dirty = false;
         for &bp in cands {
             if halves == Halves::Both && cands.len() > 1 {
                 let skip = match bp {
@@ -2064,7 +2067,13 @@ impl<D: Decide> Encoder<D> {
             if bp != None && self.prune > 0.0 && best.as_ref().is_some_and(|b| b.0 < self.prune * self.lambda * (n4 * n4) as f64) {
                 break;
             }
-            self.restore(&start);
+            if dirty {
+                if let Some(b) = best.as_mut().filter(|b| b.2.is_none()) {
+                    b.2 = Some(self.snap(x, y, n4, n4));
+                }
+                self.restore(&start);
+            }
+            dirty = true;
             self.plan.truncate(plan_len);
             self.counter.bits = base;
             self.plan.push(Node::Part(bp));
@@ -2109,11 +2118,13 @@ impl<D: Decide> Encoder<D> {
             self.block_lambda(x, y, n4, n4);
             let cost = self.rd_cost(self.sse(x, y, n4, n4, 0..self.planes), bits);
             if best.as_ref().is_none_or(|b| cost < b.0) {
-                best = Some((cost, bits, self.snap(x, y, n4, n4), self.plan[plan_len..].to_vec()));
+                best = Some((cost, bits, Option::None, self.plan[plan_len..].to_vec()));
             }
         }
         let (_, bits, snap, nodes) = best.unwrap();
-        self.restore(&snap);
+        if let Some(snap) = snap {
+            self.restore(&snap);
+        }
         self.counter.bits = base + bits;
         self.plan.truncate(plan_len);
         self.plan.extend(nodes);
