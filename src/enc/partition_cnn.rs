@@ -42,6 +42,23 @@ fn relu(x: f32) -> f32 {
 /// `av1_cnn_convolve_no_maxpool_padding_valid_c` with ReLU, a square input of `side` channel by
 /// channel; the output channels run side by side, each summed in libaom's order.
 fn conv<const OUT: usize>(input: &[f32], side: usize, k: usize, stride: usize, kernel: &[f32], bias: &[f32; OUT], out: &mut [f32]) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if crate::enc::fdct_fast::Lane::detect() == crate::enc::fdct_fast::Lane::Simd {
+        // SAFETY: AVX2 was detected.
+        return unsafe { conv_avx2::<OUT>(input, side, k, stride, kernel, bias, out) };
+    }
+    conv_in::<OUT>(input, side, k, stride, kernel, bias, out)
+}
+
+/// `conv_in` compiled for AVX2: the same products and sums per output channel, eight at a time.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn conv_avx2<const OUT: usize>(input: &[f32], side: usize, k: usize, stride: usize, kernel: &[f32], bias: &[f32; OUT], out: &mut [f32]) {
+    conv_in::<OUT>(input, side, k, stride, kernel, bias, out)
+}
+
+#[inline(always)]
+fn conv_in<const OUT: usize>(input: &[f32], side: usize, k: usize, stride: usize, kernel: &[f32], bias: &[f32; OUT], out: &mut [f32]) {
     let in_ch = input.len() / (side * side);
     let out_side = (side - k + stride) / stride;
     for u in 0..out_side {
