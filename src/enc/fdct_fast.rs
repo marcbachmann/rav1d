@@ -150,6 +150,63 @@ pub fn forward(residual: &[i16], stride: usize, coefs: &mut [i32], size: TxfmSiz
     forward_in(Lane::detect(), residual, stride, coefs, size, ty)
 }
 
+/// One residual's column pass, kept between transform types with the same vertical
+/// transform: of the reduced intra set's five, DCT_DCT and DCT_ADST share it, as do
+/// ADST_DCT and ADST_ADST.
+pub struct Columns {
+    key: Option<(Txfm1d, bool)>,
+    buf: ColumnBuf,
+}
+
+/// Room for a 64×32 column pass in vectors of 8, aligned for either lane's loads.
+#[repr(C, align(32))]
+struct ColumnBuf(MaybeUninit<[[i32; 8]; 64 * 32 / 8]>);
+
+impl ColumnBuf {
+    fn new() -> Self {
+        Self(MaybeUninit::uninit())
+    }
+}
+
+impl Columns {
+    pub fn new() -> Self {
+        Self { key: None, buf: ColumnBuf::new() }
+    }
+
+    /// `forward` of `residual`, the same slice for every call on this cache.
+    pub fn forward(&mut self, residual: &[i16], stride: usize, coefs: &mut [i32], size: TxfmSize, ty: TxfmType) {
+        if ty == WHT_WHT {
+            return fdct::forward(residual, stride, coefs, size, ty);
+        }
+        let cfg = Config::new(size, ty);
+        let key = Some((cfg.col, cfg.ud_flip));
+        let have = self.key == key;
+        self.key = key;
+        let coefs = &mut coefs[..cfg.w.min(32) * cfg.h.min(32)];
+        assert!(stride >= cfg.w && residual.len() >= (cfg.h - 1) * stride + cfg.w);
+        match Lane::detect() {
+            Lane::Scalar => scalar::forward(residual, stride, coefs, &cfg),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Lane::Simd => {
+                assert!(is_x86_feature_detected!("avx2"));
+                // SAFETY: AVX2 is available; the buffer holds a column pass of this residual when `have`.
+                unsafe { x86::forward_rows(residual, stride, coefs, &cfg, &mut self.buf, have) }
+            }
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is part of aarch64; the buffer holds a column pass of this residual when `have`.
+            Lane::Simd => unsafe { arm::forward_rows(residual, stride, coefs, &cfg, &mut self.buf, have) },
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+            Lane::Simd => scalar::forward(residual, stride, coefs, &cfg),
+        }
+    }
+}
+
+impl Default for Columns {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn forward_in(
     lane: Lane,
     residual: &[i16],
@@ -269,6 +326,28 @@ mod tests {
             let seed = 0x6a09_e667_f3bc_c908 ^ ((size as u64) << 8 | ty as u64);
             for block in blocks(size, seed, 32, 255) {
                 assert_lanes_agree(size, ty, &block);
+            }
+        }
+    }
+
+    /// A cache's second transform of a residual, with the same or another vertical transform,
+    /// is `forward`'s.
+    #[test]
+    fn columns_cached() {
+        for size in sizes() {
+            let types: Vec<TxfmType> = (0..WHT_WHT).filter(|&ty| decodable(size, ty)).collect();
+            let seed = 0x3c6e_f372_fe94_f82b ^ (size as u64);
+            for block in blocks(size, seed, 4, 255).into_iter().take(4) {
+                let n = cw_ch(size);
+                let mut columns = Columns::new();
+                for &ty in types.iter().chain(types.iter().rev()).chain(types.iter().step_by(2)) {
+                    let (w, _) = dimensions(size);
+                    let mut want = vec![i32::MIN; n];
+                    let mut got = vec![i32::MAX; n];
+                    forward(&block, w, &mut want, size, ty);
+                    columns.forward(&block, w, &mut got, size, ty);
+                    assert!(want == got, "{size:?} {ty}: the cached columns differ");
+                }
             }
         }
     }

@@ -1758,8 +1758,9 @@ impl<D: Decide> Encoder<D> {
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
         if self.tx_domain_dist && cands.len() > 1 && self.rdoq == 0 && !lossless && (vw, vh) == (pw, ph) {
             let mut winner: Option<(f64, TxfmType, i32, u32, usize)> = None;
+            let mut columns = fdct_fast::Columns::new();
             for &txtp in cands {
-                fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
+                columns.forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
                 let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
                 let (eob, err, last) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, 48, scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]));
                 if eob < 0 {
@@ -1791,8 +1792,9 @@ impl<D: Decide> Encoder<D> {
             return (cands[0], -1);
         }
         let mut last = None;
+        let mut columns = fdct_fast::Columns::new();
         for &txtp in cands {
-            fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
+            columns.forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, txtp);
             let qm = if txtp < IDTX { self.qm[tx as usize][plane] } else { None };
             let index = scan_index(tx, DAV1D_TX_TYPE_CLASS[txtp as usize]);
             let (eob, _, used) = quant::quantize(&coefs[..n], &mut trial[..n], self.dq[plane], qm, shift, if lossless { 64 } else { 48 }, index);
@@ -2550,9 +2552,8 @@ fn delta_steps(res: i32, last: u8, want: u8) -> i32 {
 fn predicts_skip(residual: &[i16], pw: usize, ph: usize, vw: usize, vh: usize, dq: [u32; 2]) -> bool {
     let mut se = 0u64;
     for r in 0..vh {
-        for &d in &residual[r * pw..][..vw] {
-            se += (d as i64 * d as i64) as u64;
-        }
+        // A row's squares of differences under 256 fit u32, which vectorizes.
+        se += residual[r * pw..][..vw].iter().map(|&d| (d as i32 * d as i32) as u32).sum::<u32>() as u64;
     }
     let n = (dq[0] >> 3) as u64;
     if se / (pw * ph) as u64 > n * n / 8 {

@@ -15,7 +15,7 @@
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
 
-use super::{array, array_mut, assume_init_mut, Config, Txfm1d};
+use super::{array, array_mut, assume_init_mut, ColumnBuf, Config, Txfm1d};
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
@@ -202,45 +202,61 @@ unsafe fn round_shift(arr: &mut [I32X8], bit: i8) {
 ///
 /// NEON is available.
 pub(super) unsafe fn forward(residual: &[i16], stride: usize, coefs: &mut [i32], cfg: &Config) {
+    let mut buf = ColumnBuf::new();
+    forward_rows(residual, stride, coefs, cfg, &mut buf, false)
+}
+
+/// `forward` with the column pass in `buf`, computed unless `have` says the caller's last call
+/// on the same residual left it there with the same vertical transform.
+///
+/// # Safety
+///
+/// NEON is available, and `buf` holds this residual's column pass when `have`.
+pub(super) unsafe fn forward_rows(residual: &[i16], stride: usize, coefs: &mut [i32], cfg: &Config, buf: &mut ColumnBuf, have: bool) {
     let &Config { w, h, .. } = cfg;
     let (cw, ch) = (w.min(32), h.min(32));
-    let col_fn = get_func(cfg.col);
-    let row_fn = get_func(cfg.row);
-    let shift = vdupq_n_s32(cfg.shift[0] as i32);
-    let mut buf = [MaybeUninit::<I32X8>::uninit(); 64 * 32 / 8];
-    for cg in (0..w).step_by(8) {
-        let mut col = [MaybeUninit::<I32X8>::uninit(); 64];
-        for r in 0..h {
-            let y = if cfg.ud_flip { h - 1 - r } else { r };
-            let src = &residual[y * stride + cg..];
-            let (lo, hi) = if w == 4 {
-                (vmovl_s16(vld1_s16(src[..4].as_ptr())), vdupq_n_s32(0))
-            } else {
-                let v = vld1q_s16(src[..8].as_ptr());
-                (vmovl_s16(vget_low_s16(v)), vmovl_high_s16(v))
-            };
-            col[r].write(I32X8::new(vshlq_s32(lo, shift), vshlq_s32(hi, shift)));
-        }
-        let col = assume_init_mut(&mut col[..h]);
-        col_fn(col);
-        round_shift(col, -cfg.shift[1]);
-        match (h == 4, w == 4) {
-            (false, false) => {
-                for rg in (0..ch).step_by(8) {
-                    transpose_8x8(array(&col[rg..]), array_mut(&mut buf[rg / 8 * w + cg..]));
-                }
+    // SAFETY: `I32X8` is 8 `i32`s, 32 bytes aligned to 16, and the buffer is aligned to 32.
+    let buf = &mut *(&mut buf.0 as *mut MaybeUninit<[[i32; 8]; 64 * 32 / 8]> as *mut [MaybeUninit<I32X8>; 64 * 32 / 8]);
+    if !have {
+        let col_fn = get_func(cfg.col);
+        let shift = vdupq_n_s32(cfg.shift[0] as i32);
+        for cg in (0..w).step_by(8) {
+            let mut col = [MaybeUninit::<I32X8>::uninit(); 64];
+            for r in 0..h {
+                let y = if cfg.ud_flip { h - 1 - r } else { r };
+                let src = &residual[y * stride + cg..];
+                let (lo, hi) = if w == 4 {
+                    (vmovl_s16(vld1_s16(src[..4].as_ptr())), vdupq_n_s32(0))
+                } else {
+                    let v = vld1q_s16(src[..8].as_ptr());
+                    (vmovl_s16(vget_low_s16(v)), vmovl_high_s16(v))
+                };
+                col[r].write(I32X8::new(vshlq_s32(lo, shift), vshlq_s32(hi, shift)));
             }
-            (false, true) => {
-                for rg in (0..ch).step_by(8) {
-                    transpose_8x4(array(&col[rg..]), array_mut(&mut buf[rg / 8 * w..]));
+            let col = assume_init_mut(&mut col[..h]);
+            col_fn(col);
+            round_shift(col, -cfg.shift[1]);
+            match (h == 4, w == 4) {
+                (false, false) => {
+                    for rg in (0..ch).step_by(8) {
+                        transpose_8x8(array(&col[rg..]), array_mut(&mut buf[rg / 8 * w + cg..]));
+                    }
                 }
+                (false, true) => {
+                    for rg in (0..ch).step_by(8) {
+                        transpose_8x4(array(&col[rg..]), array_mut(&mut buf[rg / 8 * w..]));
+                    }
+                }
+                (true, false) => transpose_4x8(array(col), array_mut(&mut buf[cg..])),
+                (true, true) => transpose_4x4(array(col), array_mut(&mut buf[..])),
             }
-            (true, false) => transpose_4x8(array(col), array_mut(&mut buf[cg..])),
-            (true, true) => transpose_4x4(array(col), array_mut(&mut buf[..])),
         }
     }
+    let row_fn = get_func(cfg.row);
     for rg in (0..ch).step_by(8) {
-        let row = assume_init_mut(&mut buf[rg / 8 * w..][..w]);
+        let mut row = [MaybeUninit::<I32X8>::uninit(); 64];
+        row[..w].copy_from_slice(&buf[rg / 8 * w..][..w]);
+        let row = assume_init_mut(&mut row[..w]);
         if cfg.lr_flip {
             row.reverse();
         }
