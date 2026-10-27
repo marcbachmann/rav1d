@@ -88,7 +88,9 @@ pub struct Options {
     /// winner's mode.
     pub uv_from_luma: bool,
     /// libaom's `disable_smooth_intra` and `prune_filter_intra_level` 1: no SMOOTH_V or SMOOTH_H,
-    /// and filter intra only as DC or the filter mode of the best mode so far.
+    /// and filter intra only as DC or the filter mode of the best mode so far. To effort 5 also
+    /// in the fine search: photos over 512×512 at Q70-Q90 kept their dB at libaom's bytes for
+    /// 5-10% less time.
     pub prune_intra: bool,
     /// Luma modes are ranked by their DCT's quantization error and rate instead of SATD.
     pub rank_rd: bool,
@@ -163,7 +165,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: false, fast_filters: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && !fine, reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: false, fast_filters: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
     }
 }
 
