@@ -140,12 +140,22 @@ mod x86 {
     pub unsafe fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64) {
         let count = _mm_cvtsi32_si128(shift as i32);
         let round = _mm256_set1_pd(rounding as f64);
+        let dead = _mm256_set1_epi32(128 - rounding as i32);
         let mut eob = _mm256_set1_epi32(-1);
         let mut err = _mm256_setzero_si256();
         for rc in (0..coefs.len()).step_by(8) {
             let c = _mm256_loadu_si256(coefs[rc..][..8].as_ptr().cast());
             let q = steps(dq, qm, rc);
             let a = _mm256_sll_epi32(_mm256_abs_epi32(c), count);
+            // A level is 0 where 128a < q(128 - rounding): eight such coefficients skip the division.
+            let live = _mm256_cmpgt_epi32(_mm256_slli_epi32::<7>(a), _mm256_sub_epi32(_mm256_mullo_epi32(q, dead), _mm256_set1_epi32(1)));
+            if _mm256_testz_si256(live, live) != 0 {
+                _mm256_storeu_si256(levels[rc..][..8].as_mut_ptr().cast(), _mm256_setzero_si256());
+                err = _mm256_add_epi64(err, _mm256_mul_epi32(a, a));
+                let odd = _mm256_srli_epi64::<32>(a);
+                err = _mm256_add_epi64(err, _mm256_mul_epi32(odd, odd));
+                continue;
+            }
             let lo = divide(_mm256_castsi256_si128(a), _mm256_castsi256_si128(q), round);
             let hi = divide(_mm256_extracti128_si256::<1>(a), _mm256_extracti128_si256::<1>(q), round);
             let v = _mm256_set_m128i(hi, lo);
@@ -216,12 +226,21 @@ mod arm {
     pub unsafe fn quantize(coefs: &[i32], levels: &mut [i32], dq: [u32; 2], qm: Option<&[u8]>, shift: u32, rounding: u32, index: &[u16]) -> (i32, u64) {
         let count = vdupq_n_s32(shift as i32);
         let round = vdupq_n_f64(rounding as f64);
+        let dead = vdupq_n_s32(128 - rounding as i32);
         let mut eob = vdupq_n_s32(-1);
         let mut err = vdupq_n_s64(0);
         for rc in (0..coefs.len()).step_by(4) {
             let c = vld1q_s32(coefs[rc..][..4].as_ptr());
             let q = steps(dq, qm, rc);
             let a = vshlq_s32(vabsq_s32(c), count);
+            // A level is 0 where 128a < q(128 - rounding): four such coefficients skip the division.
+            let live = vcgeq_s32(vshlq_n_s32::<7>(a), vmulq_s32(q, dead));
+            if vmaxvq_u32(live) == 0 {
+                vst1q_s32(levels[rc..][..4].as_mut_ptr(), vdupq_n_s32(0));
+                err = vmlal_s32(err, vget_low_s32(a), vget_low_s32(a));
+                err = vmlal_high_s32(err, a, a);
+                continue;
+            }
             let v = vcombine_s32(divide(vget_low_s32(a), vget_low_s32(q), round), divide(vget_high_s32(a), vget_high_s32(q), round));
             vst1q_s32(levels[rc..][..4].as_mut_ptr(), vbslq_s32(vcltzq_s32(c), vnegq_s32(v), v));
             let i = vreinterpretq_s32_u32(vmovl_u16(vld1_u16(index[rc..][..4].as_ptr())));
@@ -281,7 +300,10 @@ mod tests {
             let qm: Option<Vec<u8>> = (rng.below(2) == 0).then(|| (0..n).map(|_| 32 + rng.below(224) as u8).collect());
             let shift = rng.below(3);
             let rounding = [48, 64, rng.below(128)][rng.below(3) as usize];
-            let c = coefs(&mut rng, n, dq[1]);
+            let mut c = coefs(&mut rng, n, dq[1]);
+            // Dead stretches, whole groups of 8 that quantize to 0.
+            let at = rng.below(n as u32) as usize;
+            c[at..(at + rng.below(64) as usize).min(n)].fill(0);
             let mut index: Vec<u16> = (0..n as u16).collect();
             for i in (1..n).rev() {
                 index.swap(i, rng.below(i as u32 + 1) as usize);
