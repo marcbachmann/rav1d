@@ -133,6 +133,9 @@ fn run(e: &mut Encoder<Rd>, planes: usize, errors: &mut dyn FnMut(&Encoder<Rd>) 
         let set = |s: u8, v: u8| if primary { v << 2 | s & 3 } else { s & !3 | v };
         for &v in values {
             let cand = Cdef { y: [set(cdef.y[0], v); 8], uv: [set(cdef.uv[0], v); 8], ..cdef };
+            if e.frame.cdef == Some(cand) {
+                continue;
+            }
             e.frame.cdef = Some(cand);
             let err = errors(e);
             if err[0] < best[0] {
