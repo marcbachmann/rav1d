@@ -501,8 +501,8 @@ pub struct Encoder<D: Decide> {
     skip_predicted: bool,
     /// See `Options::uv_outward`.
     pub uv_outward: bool,
-    /// See `Options::fast_filters`.
-    pub fast_filters: bool,
+    /// See `Options::fast_cdef`.
+    pub fast_cdef: bool,
     /// The superblock's 16×16 blocks' factors over `ssim_reference`, and its λ before them.
     ssim: [f64; 16],
     sb_lambda: f64,
@@ -650,7 +650,7 @@ impl<D: Decide> Encoder<D> {
             skip_prediction: false,
             skip_predicted: false,
             uv_outward: false,
-            fast_filters: false,
+            fast_cdef: false,
             ssim: [1.0; 16],
             sb_lambda: 1.0,
 
@@ -3794,7 +3794,7 @@ pub(crate) mod tests {
             iq_filters: std::env::var("ENC_IQ_FILTERS").is_ok_and(|v| v == "1"),
             filter_search: std::env::var("ENC_FILTER_SEARCH").is_ok_and(|v| v == "1"),
             uv_outward: std::env::var("ENC_UV_OUTWARD").is_ok_and(|v| v == "1"),
-            fast_filters: std::env::var("ENC_FAST_FILTERS").is_ok_and(|v| v == "1"),
+            fast_cdef: std::env::var("ENC_FAST_CDEF").is_ok_and(|v| v == "1"),
             tile_cols_log2: std::env::var("ENC_TILES").map_or(1, |v| v.parse().unwrap()),
         };
         let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
