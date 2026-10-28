@@ -131,8 +131,10 @@ pub struct Options {
     /// over every value.
     pub uv_outward: bool,
     /// Horizontal and vertical partitions are skipped where Split's cost is under this share of
-    /// None's: they win where the two are close (a photo at Q90: 47 of 89 wins at 0.85 and over,
-    /// 69% of the trials under it, 44% of the search time). 0 tries them whenever Split wins.
+    /// None's: they win where the two are close. A native-size photo at Q90 spent 44% of its
+    /// search on them for 89 wins in 14499 trials, 78 of them at 0.85 and over; at 0.95 it codes
+    /// in 57% of the time at Q90 and 69% at Q80 within 0.02 dB at equal bytes, graphics unchanged.
+    /// 0 tries them whenever Split wins.
     pub rect_ratio: f64,
     /// libaom's `CDEF_FAST_SEARCH_LVL3` of cpu-used 5: CDEF primaries of 0, 2, 4, 8, 14 and
     /// secondaries of 0, 2. Deblocking levels stay searched: taken from the qindex as libaom's
@@ -183,13 +185,13 @@ impl Options {
 
     /// libaom's shortcuts from cpu-used 5 that cost AVIF gates at effort 4, for speed: partitions
     /// pruned by its intra CNN, no 8×8 blocks above qindex 100, luma modes pre-ranked by SATD
-    /// above qindex 64, CfL alphas searched outward and the CDEF picks of cpu-used 5. At qindex 64
-    /// and below the pre-ranking cost a native-size photo crop 1.1 dB at Q90.
+    /// above qindex 64, CfL alphas searched outward and the CDEF picks of cpu-used 5; and H and V
+    /// partitions only where Split beat None by under 5%. At qindex 64 and below the pre-ranking
+    /// cost a native-size photo crop 1.1 dB at Q90.
     pub fn fast(self) -> Self {
         let levels = if self.qidx > 100 { self.levels.start..self.levels.end.min(3) } else { self.levels.clone() };
         let rank_pre = if self.qidx > 64 { 6 } else { self.rank_pre };
-        let rect_ratio = std::env::var("ENC_RECT_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(0.85);
-        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre, uv_outward: true, rect_ratio, fast_cdef: true, ..self }
+        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre, uv_outward: true, rect_ratio: 0.95, fast_cdef: true, ..self }
     }
 }
 
