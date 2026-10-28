@@ -501,6 +501,8 @@ pub struct Encoder<D: Decide> {
     skip_predicted: bool,
     /// See `Options::uv_outward`.
     pub uv_outward: bool,
+    /// See `Options::rect_ratio`.
+    pub rect_ratio: f64,
     /// See `Options::fast_cdef`.
     pub fast_cdef: bool,
     /// The superblock's 16×16 blocks' factors over `ssim_reference`, and its λ before them.
@@ -650,6 +652,7 @@ impl<D: Decide> Encoder<D> {
             skip_prediction: false,
             skip_predicted: false,
             uv_outward: false,
+            rect_ratio: 0.0,
             fast_cdef: false,
             ssim: [1.0; 16],
             sb_lambda: 1.0,
@@ -2034,6 +2037,7 @@ impl<D: Decide> Encoder<D> {
         // about to overwrite them; a best left in place needs neither the snap nor the restore.
         let mut best: Option<(f64, u32, Option<Snap>, Vec<Node>)> = Option::None;
         let mut dirty = false;
+        let (mut none_cost, mut split_cost) = (f64::INFINITY, f64::INFINITY);
         for &bp in cands {
             if halves == Halves::Both && cands.len() > 1 {
                 let skip = match bp {
@@ -2054,6 +2058,9 @@ impl<D: Decide> Encoder<D> {
                     if !(self.rect == 3 && along) {
                         continue;
                     }
+                }
+                if split_cost < self.rect_ratio * none_cost {
+                    continue;
                 }
             }
             if bp != None && self.prune > 0.0 && best.as_ref().is_some_and(|b| b.0 < self.prune * self.lambda * (n4 * n4) as f64) {
@@ -2109,6 +2116,11 @@ impl<D: Decide> Encoder<D> {
             let bits = self.counter.bits - base;
             self.block_lambda(x, y, n4, n4);
             let cost = self.rd_cost(self.sse(x, y, n4, n4, 0..self.planes), bits);
+            match bp {
+                None => none_cost = cost,
+                Split => split_cost = cost,
+                _ => {}
+            }
             if best.as_ref().is_none_or(|b| cost < b.0) {
                 best = Some((cost, bits, Option::None, self.plan[plan_len..].to_vec()));
             }
@@ -3803,6 +3815,7 @@ pub(crate) mod tests {
             iq_filters: std::env::var("ENC_IQ_FILTERS").is_ok_and(|v| v == "1"),
             filter_search: std::env::var("ENC_FILTER_SEARCH").is_ok_and(|v| v == "1"),
             uv_outward: std::env::var("ENC_UV_OUTWARD").is_ok_and(|v| v == "1"),
+            rect_ratio: std::env::var("ENC_RECT_RATIO").map_or(0.0, |v| v.parse().unwrap()),
             fast_cdef: std::env::var("ENC_FAST_CDEF").is_ok_and(|v| v == "1"),
             tile_cols_log2: std::env::var("ENC_TILES").map_or(1, |v| v.parse().unwrap()),
         };

@@ -130,6 +130,10 @@ pub struct Options {
     /// and the chroma angle delta are searched outward from 0 while the cost falls, instead of
     /// over every value.
     pub uv_outward: bool,
+    /// Horizontal and vertical partitions are skipped where Split's cost is under this share of
+    /// None's: they win where the two are close (a photo at Q90: 47 of 89 wins at 0.85 and over,
+    /// 69% of the trials under it, 44% of the search time). 0 tries them whenever Split wins.
+    pub rect_ratio: f64,
     /// libaom's `CDEF_FAST_SEARCH_LVL3` of cpu-used 5: CDEF primaries of 0, 2, 4, 8, 14 and
     /// secondaries of 0, 2. Deblocking levels stay searched: taken from the qindex as libaom's
     /// `LPF_PICK_FROM_Q` they cost a native-size photo crop 0.86 dB at Q90 for 1% of the time.
@@ -167,7 +171,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && (!fine || !screen && pixels > 512 * 512), reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: false, fast_cdef: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && (!fine || !screen && pixels > 512 * 512), reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: false, rect_ratio: 0.0, fast_cdef: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
     }
 }
 
@@ -184,7 +188,8 @@ impl Options {
     pub fn fast(self) -> Self {
         let levels = if self.qidx > 100 { self.levels.start..self.levels.end.min(3) } else { self.levels.clone() };
         let rank_pre = if self.qidx > 64 { 6 } else { self.rank_pre };
-        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre, uv_outward: true, fast_cdef: true, ..self }
+        let rect_ratio = std::env::var("ENC_RECT_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(0.85);
+        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre, uv_outward: true, rect_ratio, fast_cdef: true, ..self }
     }
 }
 
@@ -354,6 +359,7 @@ pub(crate) fn encoder(width: u32, height: u32, planes: &[&[u8]], options: &Optio
     e.skip_prediction = options.skip_prediction;
     e.uv_outward = options.uv_outward;
     e.fast_cdef = options.fast_cdef;
+    e.rect_ratio = options.rect_ratio;
     e.keep_modes = options.keep_modes;
     e.keep_chroma = options.keep_chroma;
     e.rect = options.rect;
