@@ -94,6 +94,41 @@ fn sse_scalar(a: &[u8], sa: usize, b: &[u8], sb: usize, w: usize, h: usize) -> u
     s
 }
 
+/// `out[r * w + c] = src[r * ss + c] - pred[r * ps + c]` for a block of `w` (4 to 64) by `h`.
+pub fn residual(out: &mut [i16], src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) {
+    residual_in(Lane::detect(), out, src, ss, pred, ps, w, h)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn residual_in(lane: Lane, out: &mut [i16], src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) {
+    assert!(w <= ss && w <= ps && w <= 64 && w % 4 == 0);
+    if h == 0 || w == 0 {
+        return;
+    }
+    let (out, src, pred) = (&mut out[..w * h], &src[..(h - 1) * ss + w], &pred[..(h - 1) * ps + w]);
+    match lane {
+        Lane::Scalar => residual_scalar(out, src, ss, pred, ps, w, h),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        Lane::Simd => {
+            assert!(is_x86_feature_detected!("avx2"));
+            // SAFETY: AVX2 is available and the slices hold every row.
+            unsafe { x86::residual(out, src, ss, pred, ps, w, h) }
+        }
+        #[cfg(target_arch = "aarch64")]
+        Lane::Simd => arm::residual(out, src, ss, pred, ps, w, h),
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+        Lane::Simd => residual_scalar(out, src, ss, pred, ps, w, h),
+    }
+}
+
+fn residual_scalar(out: &mut [i16], src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) {
+    for r in 0..h {
+        for ((o, &s), &p) in out[r * w..][..w].iter_mut().zip(&src[r * ss..][..w]).zip(&pred[r * ps..][..w]) {
+            *o = s as i16 - p as i16;
+        }
+    }
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86 {
     #![allow(unsafe_op_in_unsafe_fn, clippy::undocumented_unsafe_blocks)]
@@ -102,6 +137,33 @@ mod x86 {
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
+
+    /// Rows of 16 pixels widened to i16 lanes and subtracted; 8 and 4 wide rows by half a vector.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn residual(out: &mut [i16], src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) {
+        for r in 0..h {
+            let (o, s, p) = (out.as_mut_ptr().add(r * w), src.as_ptr().add(r * ss), pred.as_ptr().add(r * ps));
+            match w {
+                4 => {
+                    let d = _mm_sub_epi16(_mm_cvtepu8_epi16(_mm_cvtsi32_si128((s as *const i32).read_unaligned())), _mm_cvtepu8_epi16(_mm_cvtsi32_si128((p as *const i32).read_unaligned())));
+                    (o as *mut i64).write_unaligned(_mm_cvtsi128_si64(d));
+                }
+                8 => {
+                    let d = _mm_sub_epi16(_mm_cvtepu8_epi16(_mm_loadl_epi64(s as *const __m128i)), _mm_cvtepu8_epi16(_mm_loadl_epi64(p as *const __m128i)));
+                    _mm_storeu_si128(o as *mut __m128i, d);
+                }
+                _ => {
+                    let mut c = 0;
+                    while c < w {
+                        let a = _mm256_cvtepu8_epi16(_mm_loadu_si128(s.add(c) as *const __m128i));
+                        let b = _mm256_cvtepu8_epi16(_mm_loadu_si128(p.add(c) as *const __m128i));
+                        _mm256_storeu_si256(o.add(c) as *mut __m256i, _mm256_sub_epi16(a, b));
+                        c += 16;
+                    }
+                }
+            }
+        }
+    }
 
     /// The 4×4 Hadamards of rows `d` side by side, as absolute sums in i32 lanes: the columns
     /// between the rows, then the rows by pairwise sums and differences.
@@ -237,6 +299,39 @@ mod arm {
 
     use std::arch::aarch64::*;
 
+    /// `x86::residual`'s twin: 16 pixels widened by `vmovl` and subtracted; 8 and 4 wide rows by half.
+    pub fn residual(out: &mut [i16], src: &[u8], ss: usize, pred: &[u8], ps: usize, w: usize, h: usize) {
+        for r in 0..h {
+            let (o, s, p) = (&mut out[r * w..][..w], &src[r * ss..][..w], &pred[r * ps..][..w]);
+            match w {
+                4 => {
+                    for c in 0..4 {
+                        o[c] = s[c] as i16 - p[c] as i16;
+                    }
+                }
+                8 => {
+                    // SAFETY: the slices are 8 bytes and 8 lanes long.
+                    unsafe {
+                        let d = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vld1_u8(s.as_ptr()))), vreinterpretq_s16_u16(vmovl_u8(vld1_u8(p.as_ptr()))));
+                        vst1q_s16(o.as_mut_ptr(), d);
+                    }
+                }
+                _ => {
+                    for c in (0..w).step_by(16) {
+                        // SAFETY: w is a multiple of 16 here and the slices hold the row.
+                        unsafe {
+                            let (a, b) = (vld1q_u8(s.as_ptr().add(c)), vld1q_u8(p.as_ptr().add(c)));
+                            let lo = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(a))), vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(b))));
+                            let hi = vsubq_s16(vreinterpretq_s16_u16(vmovl_high_u8(a)), vreinterpretq_s16_u16(vmovl_high_u8(b)));
+                            vst1q_s16(o.as_mut_ptr().add(c), lo);
+                            vst1q_s16(o.as_mut_ptr().add(c + 8), hi);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[inline(always)]
     unsafe fn hsub(x: int16x8_t, y: int16x8_t) -> int16x8_t {
         vsubq_s16(vuzp1q_s16(x, y), vuzp2q_s16(x, y))
@@ -327,6 +422,23 @@ mod arm {
 mod tests {
     use super::*;
     use crate::enc::frame::tests::Rng;
+
+    #[test]
+    fn residual_lanes_agree() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let lanes = Lane::testable();
+        for round in 0..4000 {
+            let w = [4, 8, 16, 32, 64][round % 5];
+            let h = 4 * (1 + rng.below(16) as usize);
+            let (ss, ps) = (w + rng.below(3) as usize * 8, w + rng.below(2) as usize * 16);
+            let src: Vec<u8> = (0..(h - 1) * ss + w).map(|_| rng.below(256) as u8).collect();
+            let pred: Vec<u8> = (0..(h - 1) * ps + w).map(|_| rng.below(256) as u8).collect();
+            let (mut want, mut got) = (vec![0i16; w * h], vec![0i16; w * h]);
+            residual_in(lanes[0], &mut want, &src, ss, &pred, ps, w, h);
+            residual_in(*lanes.last().unwrap(), &mut got, &src, ss, &pred, ps, w, h);
+            assert_eq!(want, got, "{w}x{h}");
+        }
+    }
 
     #[test]
     fn lanes_agree() {

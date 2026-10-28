@@ -1666,14 +1666,8 @@ impl<D: Decide> Encoder<D> {
         let mut b = self.bufs.take().unwrap();
         let Bufs { residual, coefs, trial, .. } = &mut *b;
         let (src, rec) = (&self.src[0], &self.rec[0]);
-        for r in 0..ph {
-            let at = (wy + r) * src.stride + x0;
-            let s = src.comp.slice::<BD, _>((at.., ..pw));
-            let p = rec.comp.slice::<BD, _>((at.., ..pw));
-            for c in 0..pw {
-                residual[r * pw + c] = s[c] as i16 - p[c] as i16;
-            }
-        }
+        let (at, len) = (wy * src.stride + x0, (ph - 1) * src.stride + pw);
+        dist::residual(residual, &src.comp.slice::<BD, _>((at.., ..len)), src.stride, &rec.comp.slice::<BD, _>((at.., ..len)), rec.stride, pw, ph);
         fdct_fast::forward(&residual[..pw * ph], pw, &mut coefs[..n], tx, DCT_DCT);
         let qm = self.qm[tx as usize][0];
         let shift = cmp::max(0, t_dim.ctx as i32 - 2) as u32;
@@ -1718,9 +1712,7 @@ impl<D: Decide> Encoder<D> {
         let (at, len) = (wy * stride + x0, (ph - 1) * stride + pw);
         copy_rect(src, pw, &self.src[plane].comp.slice::<BD, _>((at.., ..len)), stride, pw, ph);
         copy_rect(pred, pw, &self.rec[plane].comp.slice::<BD, _>((at.., ..len)), stride, pw, ph);
-        for i in 0..pw * ph {
-            residual[i] = src[i] as i16 - pred[i] as i16;
-        }
+        dist::residual(residual, src, pw, pred, pw, pw, ph);
         let block = bs.dimensions();
         self.skip_predicted = plane == 0
             && self.skip_prediction
