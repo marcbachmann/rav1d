@@ -2262,12 +2262,18 @@ impl<D: Decide> Encoder<D> {
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
         self.lap(&mut clock, 0);
+        // The kept modes' depth-0 codes are the depth search's where that too is DCT-only.
+        let mut coded: Vec<(Intra, f64, Vec<TxDone>, bool)> = Vec::new();
         if keep > 0 {
             scored.truncate(keep);
             for s in scored.iter_mut() {
                 let (cost, txs) = luma(self, &s.1, 0, None);
-                self.recycle(txs);
                 s.0 = cost;
+                if self.late_txtp {
+                    coded.push((s.1, cost, txs, self.skip_predicted));
+                } else {
+                    self.recycle(txs);
+                }
             }
             scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
@@ -2279,7 +2285,15 @@ impl<D: Decide> Encoder<D> {
         let mut luma_txs = Vec::new();
         for &(_, c) in scored.iter().take(2) {
             for depth in 0..=cmp::min(limits.max_depth, depths) {
-                let (cost, txs) = luma(self, &c, depth, Some(best_luma.0));
+                let done = (depth == 0).then(|| coded.iter().position(|d| d.0 == c)).flatten();
+                let (cost, txs) = match done {
+                    Some(i) => {
+                        let (_, cost, txs, skip) = coded.swap_remove(i);
+                        self.skip_predicted = skip;
+                        (cost, txs)
+                    }
+                    None => luma(self, &c, depth, Some(best_luma.0)),
+                };
                 if cost < best_luma.0 {
                     best_luma = (cost, c, depth);
                     let old = std::mem::replace(&mut luma_txs, txs);
@@ -2291,6 +2305,9 @@ impl<D: Decide> Encoder<D> {
                     break;
                 }
             }
+        }
+        for (_, _, txs, _) in coded {
+            self.recycle(txs);
         }
         self.dct_only = false;
         let (_, mut intra, depth) = best_luma;
