@@ -966,22 +966,14 @@ mod rust_simd {
         }
     }
 
-    /// Z3 is Z1 along the left edge read upwards, its columns the rows of `t`, which 8x8
-    /// transposes turn into the block.
+    /// The length of a scratch column, a block side and the 8 lanes a step may write past it.
+    const TS: usize = 64 + 8;
+
+    /// The `W` columns of `t`, `H` pixels each, as the rows of `out`, `os` apart.
     #[inline(always)]
-    fn z3<BD: BitDepth, const W: usize, const H: usize, const STEP: usize>(
-        dst: Rav1dPictureDataComponentOffset,
-        e: &mut [u8; EXT],
-        dy: usize,
-        max: usize,
-    ) {
-        let mut t = [[0u8; H]; W];
-        dir_rows::<H, STEP>(t.as_flattened_mut(), H, W, e, max, dy);
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
-        let block = block.as_bytes_mut();
+    fn transpose_cols<const W: usize, const H: usize>(t: &[[u8; TS]; W], out: &mut [u8], os: usize) {
         if W % 8 != 0 || H % 8 != 0 {
-            for (y, row) in block.chunks_mut(stride).enumerate() {
+            for (y, row) in out.chunks_mut(os).take(H).enumerate() {
                 for x in 0..W {
                     row[x] = t[x][y];
                 }
@@ -993,10 +985,144 @@ mod rust_simd {
                 let mut v: [I16x8; 8] = std::array::from_fn(|i| I16x8::from_u8x8(&t[x + i][y..]));
                 transpose8x8(&mut v);
                 for (i, v) in v.into_iter().enumerate() {
-                    block[(y + i) * stride + x..][..8].copy_from_slice(&v.pack_u8());
+                    out[(y + i) * os + x..][..8].copy_from_slice(&v.pack_u8());
                 }
             }
         }
+    }
+
+    /// Z3 is Z1 along the left edge read upwards, its columns the rows of `t`.
+    #[inline(always)]
+    fn z3<BD: BitDepth, const W: usize, const H: usize, const STEP: usize>(
+        dst: Rav1dPictureDataComponentOffset,
+        e: &mut [u8; EXT],
+        dy: usize,
+        max: usize,
+    ) {
+        let mut t = [[0u8; TS]; W];
+        dir_rows::<H, STEP>(t.as_flattened_mut(), TS, W, e, max, dy);
+        let stride = dst.pixel_stride::<BD>() as usize;
+        let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
+        transpose_cols::<W, H>(&t, block.as_bytes_mut(), stride);
+    }
+
+    /// Two-tap interpolation of 8 pixels from `e[i..]`, the steps 2 apart where upsampled.
+    #[inline(always)]
+    fn dir8_at(e: &[u8], i: usize, frac: I16x8, upsampled: bool) -> [u8; 8] {
+        if upsampled {
+            dir8::<2>(e, i, frac)
+        } else {
+            dir8::<1>(e, i, frac)
+        }
+    }
+
+    /// Z2 from its edge, top-left pixel at 64. A row takes the left edge up to the column where
+    /// the top edge starts. Down a column the left edge is read in a straight line with one
+    /// fraction, so the left part runs per column into a scratch turned into rows; the top part
+    /// runs per row.
+    #[inline(always)]
+    fn z2<BD: BitDepth, const W: usize, const H: usize>(
+        dst: Rav1dPictureDataComponentOffset,
+        edge: &[u8; 64 + 64 + 1],
+        dx: usize,
+        dy: usize,
+        up_above: bool,
+        up_left: bool,
+    ) {
+        // The top edge with `TL` at the top-left pixel and the left edge reversed, `r[PAD + j]`
+        // the pixel `j` below it; the pads take the lanes before a row's or column's start.
+        const TL: usize = 80;
+        const PAD: usize = 16;
+        let mut e = [0u8; TL + 65 + 16];
+        e[TL - 64..][..129].copy_from_slice(edge);
+        let mut r = [0u8; PAD + 128];
+        for (j, r) in r[PAD..][..65].iter_mut().enumerate() {
+            *r = edge[64 - j];
+        }
+        let (inc_x, inc_y) = (1 + up_above as usize, 1 + up_left as usize);
+        let xpos = |y: usize| ((inc_x as isize) << 6) - (dx * (y + 1)) as isize;
+
+        // Row `y` takes the left edge in columns `..split[y]`; column `x` from row `y0[x]`.
+        let mut split = [0; H];
+        let mut y0 = [H; W];
+        let mut left_cols = 0;
+        for y in 0..H {
+            let base = xpos(y) >> 6;
+            let s = if base >= 0 { 0 } else { ((-base) as usize).div_ceil(inc_x).min(W) };
+            for x in left_cols..s {
+                y0[x] = y;
+            }
+            left_cols = left_cols.max(s);
+            split[y] = s;
+        }
+
+        let mut t = [[0u8; TS]; W];
+        for x in 0..left_cols {
+            let c = (dy * (x + 1)) as isize;
+            let frac = I16x8::splat(((-c & 0x3e) << 9) as i16);
+            let j0 = PAD as isize + (-c >> 6) + inc_y as isize;
+            for y in (y0[x] & !7..H).step_by(8) {
+                let j = (j0 + (inc_y * y) as isize) as usize;
+                t[x][y..y + 8].copy_from_slice(&dir8_at(&r, j, frac, up_left));
+            }
+        }
+        let mut left = [[0u8; 64]; H];
+        if left_cols != 0 {
+            transpose_cols::<W, H>(&t, left.as_flattened_mut(), 64);
+        }
+
+        let stride = dst.pixel_stride::<BD>() as usize;
+        let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
+        for (y, row) in block.as_bytes_mut().chunks_mut(stride).enumerate() {
+            let s = split[y];
+            let mut px = [0u8; 64 + 8];
+            if s < W {
+                let pos = xpos(y);
+                let frac = I16x8::splat(((pos & 0x3e) << 9) as i16);
+                for x in (s & !7..W).step_by(8) {
+                    let i = (TL as isize + (pos >> 6) + (inc_x * x) as isize) as usize;
+                    px[x..x + 8].copy_from_slice(&dir8_at(&e, i, frac, up_above));
+                }
+            }
+            px[..s].copy_from_slice(&left[y][..s]);
+            row[..W].copy_from_slice(&px[..W]);
+        }
+    }
+
+    /// `dst` has a stride of at least `width`.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn z2_128<BD: BitDepth>(
+        dst: Rav1dPictureDataComponentOffset,
+        topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
+        off: usize,
+        width: c_int,
+        height: c_int,
+        angle: c_int,
+        max_width: c_int,
+        max_height: c_int,
+        bd: BD,
+    ) {
+        let mut edge = [0.into(); 64 + 64 + 1];
+        let (dx, dy, up_above, up_left) = z2_edge::<BD>(
+            &mut edge,
+            topleft,
+            off,
+            width,
+            height,
+            angle,
+            max_width,
+            max_height,
+            bd,
+            filter_edge_simd::<BD>,
+        );
+        let edge: &[u8; 64 + 64 + 1] = edge.as_bytes().try_into().unwrap();
+        let (dx, dy) = (dx as usize, dy as usize);
+        by_size!(width, height, |W, H| z2::<BD, W, H>(
+            dst, edge, dx, dy, up_above, up_left
+        ))
     }
 
     /// `dst` has a stride of at least `width`.
@@ -1060,6 +1186,43 @@ mod rust_simd {
         }
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
         unsafe { z1_128::<BD>(dst, topleft, topleft_off, width, height, angle, bd) }
+    }
+
+    /// # Safety
+    ///
+    /// Must be called by [`angular_ipred::Fn::call`] at 8 bpc, on x86 once the CPU flags hold
+    /// SSE41.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn ipred_z2_erased<BD: BitDepth>(
+        _dst_ptr: *mut DynPixel,
+        _stride: ptrdiff_t,
+        topleft: *const DynPixel,
+        width: c_int,
+        height: c_int,
+        angle: c_int,
+        max_width: c_int,
+        max_height: c_int,
+        bitdepth_max: c_int,
+        topleft_off: usize,
+        dst: FFISafeRav1dPictureDataComponentOffset,
+    ) {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `angular_ipred::Fn::call`.
+        let dst = unsafe { FFISafe::from_with_offset(dst) };
+        // SAFETY: `fn angular_ipred::Fn::call` makes `topleft` `topleft_off` from the beginning of the array.
+        let topleft = unsafe { reconstruct_topleft::<BD>(topleft, topleft_off) };
+        let bd = BD::from_c(bitdepth_max);
+        if dst.pixel_stride::<BD>() < width as isize {
+            return ipred_z2_rust::<BD>(
+                dst, topleft, topleft_off, width, height, angle, max_width, max_height, bd,
+            );
+        }
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe {
+            z2_128::<BD>(
+                dst, topleft, topleft_off, width, height, angle, max_width, max_height, bd,
+            )
+        }
     }
 
     /// # Safety
@@ -1714,8 +1877,11 @@ fn ipred_z1_rust<BD: BitDepth>(
     }
 }
 
-fn ipred_z2_rust<BD: BitDepth>(
-    dst: Rav1dPictureDataComponentOffset,
+/// Z2's edge into `edge`, its top-left pixel at 64, the top filtered or upsampled as the
+/// angle asks and the left the same: `(dx, dy, upsample_above, upsample_left)`.
+#[inline(always)]
+fn z2_edge<BD: BitDepth>(
+    edge: &mut [BD::Pixel; 64 + 64 + 1],
     topleft_in: &[BD::Pixel; SCRATCH_EDGE_LEN],
     topleft_in_off: usize,
     width: c_int,
@@ -1724,7 +1890,8 @@ fn ipred_z2_rust<BD: BitDepth>(
     max_width: c_int,
     max_height: c_int,
     bd: BD,
-) {
+    filter: impl FnOnce(&mut [BD::Pixel], c_int, c_int, c_int, &[BD::Pixel; SCRATCH_EDGE_LEN], usize, c_int, c_int, c_int) + Copy,
+) -> (c_int, c_int, bool, bool) {
     let is_sm = (angle >> 9) & 1 != 0;
     let enable_intra_edge_filter = angle >> 10;
     angle &= 511;
@@ -1741,7 +1908,6 @@ fn ipred_z2_rust<BD: BitDepth>(
     } else {
         false
     };
-    let mut edge = [0.into(); 64 + 64 + 1];
     let topleft = 64;
 
     if upsample_above {
@@ -1762,7 +1928,7 @@ fn ipred_z2_rust<BD: BitDepth>(
             0
         };
         if filter_strength != 0 {
-            filter_edge::<BD>(
+            filter(
                 &mut edge[topleft + 1..],
                 width,
                 0,
@@ -1800,7 +1966,7 @@ fn ipred_z2_rust<BD: BitDepth>(
             0
         };
         if filter_strength_0 != 0 {
-            filter_edge::<BD>(
+            filter(
                 &mut edge[topleft - height as usize..],
                 height,
                 height - max_height,
@@ -1822,6 +1988,34 @@ fn ipred_z2_rust<BD: BitDepth>(
     }
     edge[topleft] = topleft_in[topleft_in_off];
 
+    (dx, dy, upsample_above, upsample_left)
+}
+
+fn ipred_z2_rust<BD: BitDepth>(
+    dst: Rav1dPictureDataComponentOffset,
+    topleft_in: &[BD::Pixel; SCRATCH_EDGE_LEN],
+    topleft_in_off: usize,
+    width: c_int,
+    height: c_int,
+    angle: c_int,
+    max_width: c_int,
+    max_height: c_int,
+    bd: BD,
+) {
+    let mut edge = [0.into(); 64 + 64 + 1];
+    let topleft = 64;
+    let (dx, dy, upsample_above, upsample_left) = z2_edge::<BD>(
+        &mut edge,
+        topleft_in,
+        topleft_in_off,
+        width,
+        height,
+        angle,
+        max_width,
+        max_height,
+        bd,
+        filter_edge::<BD>,
+    );
     let base_inc_x = 1 + upsample_above as usize;
     let left = topleft - (1 + upsample_left as usize);
     let width = width as usize;
@@ -3048,6 +3242,7 @@ impl Rav1dIntraPredDSPContext {
         a[SMOOTH_V_PRED as usize] = angular_ipred::Fn::new(ipred_smooth_erased::<BD, SMOOTH_V>);
         a[SMOOTH_H_PRED as usize] = angular_ipred::Fn::new(ipred_smooth_erased::<BD, SMOOTH_H>);
         a[Z1_PRED as usize] = angular_ipred::Fn::new(ipred_z1_erased::<BD>);
+        a[Z2_PRED as usize] = angular_ipred::Fn::new(ipred_z2_erased::<BD>);
         a[Z3_PRED as usize] = angular_ipred::Fn::new(ipred_z3_erased::<BD>);
         let c = &mut self.cfl_pred;
         c[DC_PRED as usize] = cfl_pred::Fn::new(ipred_cfl_erased::<BD, { DcGen::TopLeft as u8 }>);
@@ -3227,9 +3422,21 @@ mod tests {
         }
     }
 
-    /// Every angle Z1 and Z3 take, with and without the edge filter and the smooth flag.
+    /// The directional angles: the eight base angles and three steps of 3 degrees either side.
+    const ANGLES: [c_int; 56] = {
+        let base = [45, 67, 90, 113, 135, 157, 180, 203];
+        let mut a = [0; 56];
+        let mut i = 0;
+        while i < 56 {
+            a[i] = base[i / 7] + 3 * (i % 7) as c_int - 9;
+            i += 1;
+        }
+        a
+    };
+
+    /// Every angle Z1, Z2 and Z3 take, with and without the edge filter and the smooth flag.
     #[test]
-    fn z1_z3_match_scalar() {
+    fn directional_match_scalar() {
         let scalar = Rav1dIntraPredDSPContext::default::<BitDepth8>();
         let rust = rust();
         let mut rng = Rng(0x5851_f42d_4c95_7f2d);
@@ -3239,14 +3446,18 @@ mod tests {
                 _ => edge(&mut rng),
             };
             for (w, h) in SIZES {
-                for (mode, angles) in [(Z1_PRED, 3..90), (Z3_PRED, 183..270)] {
-                    for angle in angles.step_by(3) {
-                        for flags in [0, 1 << 9, 1 << 10, 3 << 9] {
-                            let a = angle | flags;
-                            let want = run_angle(&scalar.intra_pred[mode as usize], &edge, w, h, a);
-                            let got = run_angle(&rust.intra_pred[mode as usize], &edge, w, h, a);
-                            assert_eq!(got, want, "{w}x{h} mode {mode} angle {a:#x} round {round}");
-                        }
+                for angle in ANGLES {
+                    let mode = match angle {
+                        ..90 => Z1_PRED,
+                        91..180 => Z2_PRED,
+                        181.. => Z3_PRED,
+                        _ => continue,
+                    };
+                    for flags in [0, 1 << 9, 1 << 10, 3 << 9] {
+                        let a = angle | flags;
+                        let want = run_angle(&scalar.intra_pred[mode as usize], &edge, w, h, a);
+                        let got = run_angle(&rust.intra_pred[mode as usize], &edge, w, h, a);
+                        assert_eq!(got, want, "{w}x{h} mode {mode} angle {a:#x} round {round}");
                     }
                 }
             }
@@ -3386,7 +3597,11 @@ mod tests {
                 });
             }
         }
-        for (name, mode, angle) in [("z1", Z1_PRED, 45 | 1 << 10), ("z3", Z3_PRED, 225 | 1 << 10)] {
+        for (name, mode, angle) in [
+            ("z1", Z1_PRED, 45 | 1 << 10),
+            ("z2", Z2_PRED, 135 | 1 << 10),
+            ("z3", Z3_PRED, 225 | 1 << 10),
+        ] {
             for (w, h) in [(4, 4), (8, 8), (16, 8), (16, 16), (32, 32), (64, 64)] {
                 line(name, w, h, &|dsp| {
                     let f = &dsp.intra_pred[mode as usize];
