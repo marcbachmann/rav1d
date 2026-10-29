@@ -496,13 +496,6 @@ static EC_MIN_PROBS: [i16; 31] = {
     t
 };
 
-/// All ones at lane `n_symbols` from `[15 - n_symbols..]`.
-static COUNT_LANE: [i16; 31] = {
-    let mut t = [0; 31];
-    t[15] = -1;
-    t
-};
-
 /// [`rav1d_msac_decode_symbol_adapt_rust`] over all of the CDF's `LANES` at once: the symbol is the
 /// first lane whose bound is not above the window. The count at `cdf[n_symbols]` makes that lane's
 /// bound 0, so lanes past it are never read; like the asm, the adaptation leaves them alone only
@@ -594,25 +587,21 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
     if s.allow_update_cdf() {
         let count = cdf[n];
         let rate = 4 + (count >> 4) as u32 + (n_symbols > 2) as u32;
-        // The count's lane falls by `count >> rate` with the others; this restores it, plus one.
-        let count_step = I16x8::splat(((count >> rate) + (count < 32) as u16) as i16);
         let ones = I16x8::splat(-1);
         for k in 0..LANES.div_ceil(8) {
             // As in the asm, in signed lanes: below the symbol `(32768 - cdf) >> rate` is added,
             // from it on `((-1 - cdf) >> rate) + 1`, which is `-(cdf >> rate)`. A probability of 0
             // would wrap, and no CDF holds one.
             let step = ones.avg_u(at_or_past[k]).sub(cdfs[k]).shr_s_by(rate);
-            let count_lane = I16x8::load(&COUNT_LANE[15 - n + 8 * k..]);
-            let updated = cdfs[k]
-                .sub(at_or_past[k])
-                .add(step)
-                .add(count_step.and(count_lane));
+            let updated = cdfs[k].sub(at_or_past[k]).add(step);
             if LANES == 4 {
                 updated.store_u16_lo(cdf);
             } else {
                 updated.store_u16(&mut cdf[8 * k..]);
             }
         }
+        // The count's lane took a step with the others; as in the asm, it is written over.
+        cdf[n] = count + (count < 32) as u16;
     }
     val as u8
 }
@@ -704,7 +693,7 @@ fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
     let zero = I16x8::splat(0);
     let ones = I16x8::splat(-1);
     let min_probs = I16x8::load(&EC_MIN_PROBS[15 - 3..]);
-    let count_lane = I16x8::load(&COUNT_LANE[15 - 3..]);
+    let count_lane = I16x8::load(&[0, 0, 0, -1, 0, 0, 0, 0]);
     let mut cdfv = I16x8::load_u16_lo(cdf);
     let mut count = cdf[3];
     let (mut dif, mut rng) = (s.dif, s.rng);
@@ -726,6 +715,8 @@ fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
         let val = at_or_past.first_set() as usize & 3;
         if update {
             let rate = 5 + (count >> 4) as u32;
+            // The count's lane falls by `count >> rate` with the others; this restores it, plus
+            // one. In this loop that measured faster than writing the count over it at the end.
             let count_step = I16x8::splat(((count >> rate) + (count < 32) as u16) as i16);
             let step = ones.avg_u(at_or_past).sub(cdfv).shr_s_by(rate);
             cdfv = cdfv
