@@ -457,9 +457,9 @@ fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_s
     val as u8
 }
 
-/// [`rav1d_msac_decode_symbol_adapt_rust`] for at most 3 symbols, unrolled and without branches
-/// on the data, all in general registers: the bounds fall, so the symbol is how many of them lie
-/// above the window, and the pair around it is picked by selects.
+/// [`rav1d_msac_decode_symbol_adapt_rust`] for at most `N` symbols, unrolled and without
+/// branches on the data, all in general registers: the bounds fall, so the symbol is how many of
+/// them lie above the window, and the pair around it is picked from the bounds by index.
 #[cfg_attr(
     all(
         not(rav1d_rust_simd = "msac"),
@@ -469,47 +469,46 @@ fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_s
     allow(dead_code)
 )]
 #[inline(always)]
-fn rav1d_msac_decode_symbol_adapt3_unrolled(
+fn rav1d_msac_decode_symbol_adapt_unrolled<const N: usize>(
     s: &mut MsacContext,
     cdf: &mut [u16],
     n_symbols: u8,
 ) -> u8 {
-    let n = n_symbols as u32;
-    debug_assert!(n <= 3);
+    let n = n_symbols as usize;
+    debug_assert!(n <= N);
     let c = (s.dif >> (EC_WIN_SIZE - 16)) as c_uint;
     let r = s.rng >> 8;
-    let bound = |i: u32| -> c_uint {
-        if i < n {
-            (r * (cdf[i as usize] >> EC_PROB_SHIFT) as c_uint >> (7 - EC_PROB_SHIFT))
-                + EC_MIN_PROB * (n - i)
+    // `rng`, then the bounds, then 0: the symbol's pair is `[val]` and `[val + 1]`.
+    let mut bounds = [0; 17];
+    bounds[0] = s.rng;
+    let mut val = 0;
+    for i in 0..N {
+        let v = if i < n {
+            (r * (cdf[i] >> EC_PROB_SHIFT) as c_uint >> (7 - EC_PROB_SHIFT))
+                + EC_MIN_PROB * (n - i) as c_uint
         } else {
             0
-        }
-    };
-    let (v0, v1, v2) = (bound(0), bound(1), bound(2));
-    let val = (v0 > c) as u32 + (v1 > c) as u32 + (v2 > c) as u32;
-    let (u, v) = match val {
-        0 => (s.rng, v0),
-        1 => (v0, v1),
-        2 => (v1, v2),
-        _ => (v2, 0),
-    };
+        };
+        bounds[i + 1] = v;
+        val += (v > c) as usize;
+    }
+    let (u, v) = (bounds[val], bounds[val + 1]);
     ctx_norm(
         s,
         s.dif.wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
         u - v,
     );
     if s.allow_update_cdf() {
-        let count = cdf[n as usize];
+        let count = cdf[n];
         let rate = 4 + (count >> 4) + (n > 2) as u16;
-        for i in 0..3 {
+        for i in 0..N {
             if i < n {
-                let p = cdf[i as usize];
+                let p = cdf[i];
                 let (up, down) = (p + ((1 << 15) - p >> rate), p - (p >> rate));
-                cdf[i as usize] = if i < val { up } else { down };
+                cdf[i] = if i < val { up } else { down };
             }
         }
-        cdf[n as usize] = count + (count < 32) as u16;
+        cdf[n] = count + (count < 32) as u16;
     }
     val as u8
 }
@@ -535,9 +534,11 @@ fn decode_symbol_adapt<const LANES: usize>(
     cdf: &mut [u16],
     n_symbols: u8,
 ) -> u8 {
-    // On aarch64 three symbols decode faster in general registers than in a vector.
+    // On aarch64 up to 7 symbols decode faster in general registers than in a vector.
     if LANES == 4 && cfg!(target_arch = "aarch64") {
-        rav1d_msac_decode_symbol_adapt3_unrolled(s, cdf, n_symbols)
+        rav1d_msac_decode_symbol_adapt_unrolled::<3>(s, cdf, n_symbols)
+    } else if LANES == 8 && cfg!(target_arch = "aarch64") {
+        rav1d_msac_decode_symbol_adapt_unrolled::<7>(s, cdf, n_symbols)
     } else if MSAC_SIMD {
         rav1d_msac_decode_symbol_adapt_simd::<LANES>(s, cdf, n_symbols)
     } else {
@@ -1072,7 +1073,13 @@ mod tests {
                 let va = rav1d_msac_decode_symbol_adapt_rust(&mut a, &mut ca[..=n as usize], n);
                 let vb = match lanes {
                     4 if i % 2 == 0 => {
-                        rav1d_msac_decode_symbol_adapt3_unrolled(&mut b, &mut cb[..4], n)
+                        rav1d_msac_decode_symbol_adapt_unrolled::<3>(&mut b, &mut cb[..4], n)
+                    }
+                    8 if i % 2 == 0 => {
+                        rav1d_msac_decode_symbol_adapt_unrolled::<7>(&mut b, &mut cb[..8], n)
+                    }
+                    16 if i % 2 == 0 => {
+                        rav1d_msac_decode_symbol_adapt_unrolled::<15>(&mut b, &mut cb, n)
                     }
                     4 => rav1d_msac_decode_symbol_adapt_simd::<4>(&mut b, &mut cb[..4], n),
                     8 => rav1d_msac_decode_symbol_adapt_simd::<8>(&mut b, &mut cb[..8], n),
@@ -1170,9 +1177,13 @@ mod tests {
                         (1, 4) => {
                             rav1d_msac_decode_symbol_adapt_simd::<4>(&mut s, &mut cdf[..4], n)
                         }
-                        (3, _) => {
-                            rav1d_msac_decode_symbol_adapt3_unrolled(&mut s, &mut cdf[..4], n)
+                        (3, 4) => {
+                            rav1d_msac_decode_symbol_adapt_unrolled::<3>(&mut s, &mut cdf[..4], n)
                         }
+                        (3, 8) => {
+                            rav1d_msac_decode_symbol_adapt_unrolled::<7>(&mut s, &mut cdf[..8], n)
+                        }
+                        (3, _) => rav1d_msac_decode_symbol_adapt_unrolled::<15>(&mut s, cdf, n),
                         (1, 8) => {
                             rav1d_msac_decode_symbol_adapt_simd::<8>(&mut s, &mut cdf[..8], n)
                         }
@@ -1189,9 +1200,6 @@ mod tests {
                 (2, "dispatched (asm if built)"),
                 (3, "scalar unrolled"),
             ] {
-                if kind == 3 && lanes != 4 {
-                    continue;
-                }
                 time(&format!("adapt{lanes} n {n} {name}"), SYMBOLS, || run(kind));
             }
         }
