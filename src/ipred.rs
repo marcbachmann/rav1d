@@ -982,7 +982,11 @@ mod rust_simd {
         }
         for y in (0..H).step_by(8) {
             for x in (0..W).step_by(8) {
-                let mut v: [I16x8; 8] = std::array::from_fn(|i| I16x8::from_u8x8(&t[x + i][y..]));
+                // A loop, not a closure: a closure would not inherit the kernel's target features.
+                let mut v = [I16x8::splat(0); 8];
+                for i in 0..8 {
+                    v[i] = I16x8::from_u8x8(&t[x + i][y..]);
+                }
                 transpose8x8(&mut v);
                 for (i, v) in v.into_iter().enumerate() {
                     out[(y + i) * os + x..][..8].copy_from_slice(&v.pack_u8());
