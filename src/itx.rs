@@ -271,6 +271,7 @@ unsafe extern "C" fn inv_txfm_add_simd_erased<
     const H: usize,
     const TYPE: TxfmType,
     BD: BitDepth,
+    const G: usize,
 >(
     _dst_ptr: *mut DynPixel,
     _stride: isize,
@@ -285,12 +286,46 @@ unsafe extern "C" fn inv_txfm_add_simd_erased<
     // SAFETY: `fn itxfm::Fn::call` passes `coeff.len()` as `coeff_len`, and `BD::Coef` is `i16`
     // at 8 bpc, the only depth this is chosen for.
     let coeff = unsafe { slice::from_raw_parts_mut(coeff.cast::<i16>(), coeff_len.into()) };
+    // A debugging aid: `RAV1D_ITX_SIMD_SIZES` (a `TxfmSize` bit mask) leaves the other sizes scalar.
+    #[cfg(rav1d_itx_bisect)]
+    {
+        static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let mask = *MASK.get_or_init(|| {
+            std::env::var("RAV1D_ITX_SIMD_SIZES")
+                .ok()
+                .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(u32::MAX)
+        });
+        if mask >> TxfmSize::from_wh(W, H) as u32 & 1 == 0 {
+            let bd = BD::from_c(_bitdepth_max);
+            // SAFETY: `BD::Coef` is `i16` at 8 bpc, the only depth this is chosen for.
+            let coeff =
+                unsafe { slice::from_raw_parts_mut(coeff.as_mut_ptr().cast(), coeff.len()) };
+            return inv_txfm_add_rust::<W, H, TYPE, BD>(dst, coeff, eob, bd);
+        }
+    }
     // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
     unsafe {
         match (W, H) {
-            (8, 8) | (16, 16) | (8, 16) | (16, 8) | (32, 32) => {
-                itx_simd::add::<BD, W, H, TYPE>(dst, coeff, eob)
-            }
+            (4, 4)
+            | (4, 8)
+            | (8, 4)
+            | (4, 16)
+            | (16, 4)
+            | (8, 8)
+            | (16, 16)
+            | (8, 16)
+            | (16, 8)
+            | (32, 32)
+            | (8, 32)
+            | (32, 8)
+            | (16, 32)
+            | (32, 16)
+            | (16, 64)
+            | (64, 16)
+            | (32, 64)
+            | (64, 32)
+            | (64, 64) => itx_simd::add::<BD, W, H, TYPE, G>(dst, coeff, eob),
             _ => unreachable!(),
         }
     }
@@ -794,7 +829,7 @@ impl Rav1dInvTxfmDSPContext {
                 let tx = TxfmSize::from_wh($w, $h) as usize;
                 $(
                     self.itxfm_add[tx][$type as usize] =
-                        itxfm::Fn::new(inv_txfm_add_simd_erased::<$w, $h, $type, BD>);
+                        itxfm::Fn::new(inv_txfm_add_simd_erased::<$w, $h, $type, BD, { ($w + 7) / 8 }>);
                 )*
             }};
         }
@@ -876,6 +911,115 @@ impl Rav1dInvTxfmDSPContext {
             H_FLIPADST
         );
         assign!(32, 32, DCT_DCT, IDTX);
+        assign!(8, 32, DCT_DCT, IDTX);
+        assign!(32, 8, DCT_DCT, IDTX);
+        assign!(16, 32, DCT_DCT, IDTX);
+        assign!(32, 16, DCT_DCT, IDTX);
+        assign!(16, 64, DCT_DCT);
+        assign!(64, 16, DCT_DCT);
+        assign!(32, 64, DCT_DCT);
+        assign!(64, 32, DCT_DCT);
+        assign!(64, 64, DCT_DCT);
+        assign!(
+            4,
+            4,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT,
+            V_ADST,
+            H_ADST,
+            V_FLIPADST,
+            H_FLIPADST
+        );
+        assign!(
+            4,
+            8,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT,
+            V_ADST,
+            H_ADST,
+            V_FLIPADST,
+            H_FLIPADST
+        );
+        assign!(
+            8,
+            4,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT,
+            V_ADST,
+            H_ADST,
+            V_FLIPADST,
+            H_FLIPADST
+        );
+        assign!(
+            4,
+            16,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT,
+            V_ADST,
+            H_ADST,
+            V_FLIPADST,
+            H_FLIPADST
+        );
+        assign!(
+            16,
+            4,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT,
+            V_ADST,
+            H_ADST,
+            V_FLIPADST,
+            H_FLIPADST
+        );
         self
     }
 
@@ -926,8 +1070,8 @@ mod tests {
         }
     }
 
-    const STRIDE: usize = 64;
-    const ROWS: usize = 40;
+    const STRIDE: usize = 128;
+    const ROWS: usize = 72;
     /// A 16-wide block's rows are stored aligned by the asm, as the decoder lays them out.
     const BX: usize = 16;
 
@@ -944,22 +1088,26 @@ mod tests {
         buf.resize(orig.len(), 0);
         buf.as_mut_slice().copy_from_slice(orig);
         let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
-        let mut coeff = coeff.to_vec();
+        // The asm loads the coefficients aligned, as the decoder's buffers are.
+        let mut c = AlignedVec64::<i16>::new();
+        c.resize(coeff.len(), 0);
+        c.as_mut_slice().copy_from_slice(coeff);
         dsp.itxfm_add[tx as usize][t as usize].call::<BitDepth8>(
             WithOffset {
                 data: &comp,
                 offset: 4 * STRIDE + BX,
             },
-            &mut coeff,
+            c.as_mut_slice(),
             eob,
             BitDepth8::from_c(255),
         );
         drop(comp);
-        (buf.as_slice().to_vec(), coeff)
+        (buf.as_slice().to_vec(), c.as_slice().to_vec())
     }
 
     /// Every type of a size on random coefficients and pixels, against the scalar transform;
-    /// `eob` 0 takes the DC path.
+    /// `eob` 0 takes the DC path. Across the whole `i16` range the C's 32-bit intermediates and
+    /// the asm's saturating 16-bit ones part, and the conformance md5 is the oracle there.
     fn simd_matches_scalar(tx: TxfmSize, w: usize, h: usize) {
         rav1d_init_cpu();
         let scalar = Rav1dInvTxfmDSPContext::default::<BitDepth8>();
@@ -976,30 +1124,53 @@ mod tests {
                 let eob = if round < 2 {
                     round
                 } else {
-                    (rng.next() % (w * h) as u32) as i32
+                    (rng.next() % (w.min(32) * h.min(32)) as u32) as i32
                 };
-                let mut coeff = vec![0i16; w * h];
+                // A side of 64 has 32 coefficients.
+                let (cw, ch) = (w.min(32), h.min(32));
+                let mut coeff = vec![0i16; cw * ch];
                 let n = if eob == 0 { 1 } else { eob as usize + 1 };
-                let range = if round % 3 == 0 { 4096 } else { 512 };
+                let range = [512, 4096][round as usize % 2];
                 // A 32x32 block with `eob < 136` keeps its coefficients in the top-left 16x16.
-                let (nw, nh) = if w == 32 && eob < 136 {
+                let (nw, nh) = if w == 32 && h == 32 && eob < 136 {
                     (16, 16)
                 } else {
-                    (w, h)
+                    (cw, ch)
                 };
                 for _ in 0..n {
                     if rng.next() % 2 == 0 {
                         let (x, y) = (rng.next() as usize % nw, rng.next() as usize % nh);
-                        coeff[x * h + y] = (rng.next() % (2 * range) as u32) as i16 - range as i16;
+                        coeff[x * ch + y] =
+                            ((rng.next() % (2 * range + 1) as u32) as i32 - range as i32) as i16;
                     }
                 }
-                coeff[0] = (rng.next() % (2 * range) as u32) as i16 - range as i16;
+                coeff[0] = ((rng.next() % (2 * range + 1) as u32) as i32 - range as i32) as i16;
                 let orig: Vec<u8> = (0..STRIDE * ROWS).map(|_| rng.next() as u8).collect();
                 let want = run(&scalar, tx, t, &orig, &coeff, eob);
                 let got = run(&simd, tx, t, &orig, &coeff, eob);
                 assert_eq!(got, want, "{w}x{h} type {t} eob {eob}");
             }
         }
+    }
+
+    /// 4x16's identity rows halve at once: `x + 0.414x` overflows `i16` from about 23170 on, and
+    /// `x == -1` is the one lane where the overflow-free average needs its fix-up.
+    #[test]
+    fn identity4_rows_round_without_overflow() {
+        rav1d_init_cpu();
+        let scalar = Rav1dInvTxfmDSPContext::default::<BitDepth8>();
+        let simd = Rav1dInvTxfmDSPContext::default::<BitDepth8>()
+            .init_rust_simd::<BitDepth8>(rav1d_get_cpu_flags());
+        // Column 0: rows 0 and 1 overflow and their column DCT cancels to an in-range pixel near
+        // row 3; column 1: a lone -1, which must stay 0.
+        let mut coeff = vec![0i16; 64];
+        coeff[0] = 30000;
+        coeff[1] = -30000;
+        coeff[16 + 2] = -1;
+        let orig = vec![128u8; STRIDE * ROWS];
+        let want = run(&scalar, TxfmSize::R4x16, V_DCT, &orig, &coeff, 16);
+        let got = run(&simd, TxfmSize::R4x16, V_DCT, &orig, &coeff, 16);
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -1027,6 +1198,76 @@ mod tests {
         simd_matches_scalar(TxfmSize::S32x32, 32, 32);
     }
 
+    #[test]
+    fn simd_8x32_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R8x32, 8, 32);
+    }
+
+    #[test]
+    fn simd_32x8_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R32x8, 32, 8);
+    }
+
+    #[test]
+    fn simd_16x32_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R16x32, 16, 32);
+    }
+
+    #[test]
+    fn simd_32x16_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R32x16, 32, 16);
+    }
+
+    #[test]
+    fn simd_16x64_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R16x64, 16, 64);
+    }
+
+    #[test]
+    fn simd_64x16_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R64x16, 64, 16);
+    }
+
+    #[test]
+    fn simd_32x64_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R32x64, 32, 64);
+    }
+
+    #[test]
+    fn simd_64x32_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R64x32, 64, 32);
+    }
+
+    #[test]
+    fn simd_64x64_matches_scalar() {
+        simd_matches_scalar(TxfmSize::S64x64, 64, 64);
+    }
+
+    #[test]
+    fn simd_4x4_matches_scalar() {
+        simd_matches_scalar(TxfmSize::S4x4, 4, 4);
+    }
+
+    #[test]
+    fn simd_4x8_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R4x8, 4, 8);
+    }
+
+    #[test]
+    fn simd_8x4_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R8x4, 8, 4);
+    }
+
+    #[test]
+    fn simd_4x16_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R4x16, 4, 16);
+    }
+
+    #[test]
+    fn simd_16x4_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R16x4, 16, 4);
+    }
+
     /// ns per call of a size's DCT_DCT and ADST_ADST with a full block, scalar, Rust SIMD and asm.
     #[test]
     #[ignore]
@@ -1049,6 +1290,12 @@ mod tests {
             "asm",
             Rav1dInvTxfmDSPContext::default::<BitDepth8>().init_x86::<BitDepth8>(flags, 8),
         ));
+        #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+        dsps.push((
+            "asm 128",
+            Rav1dInvTxfmDSPContext::default::<BitDepth8>()
+                .init_x86::<BitDepth8>(flags.difference(CpuFlags::AVX2 | CpuFlags::AVX512ICL), 8),
+        ));
         #[cfg(all(feature = "asm", target_arch = "aarch64"))]
         dsps.push((
             "asm",
@@ -1062,18 +1309,30 @@ mod tests {
         }
         let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
         for (tx, w, h) in [
+            (TxfmSize::S4x4, 4, 4),
+            (TxfmSize::R8x4, 8, 4),
+            (TxfmSize::R4x16, 4, 16),
             (TxfmSize::S8x8, 8, 8),
             (TxfmSize::S16x16, 16, 16),
             (TxfmSize::R16x8, 16, 8),
+            (TxfmSize::R16x32, 16, 32),
             (TxfmSize::S32x32, 32, 32),
+            (TxfmSize::S64x64, 64, 64),
         ] {
-            for (t, eob) in [(DCT_DCT, w * h - 1), (ADST_ADST, w * h - 1), (DCT_DCT, 100)] {
-                if (t == ADST_ADST && w == 32) || (eob == 100 && w != 32) {
+            let (cw, ch) = (w.min(32), h.min(32));
+            for (t, eob) in [
+                (DCT_DCT, cw * ch - 1),
+                (ADST_ADST, cw * ch - 1),
+                (DCT_DCT, 100),
+            ] {
+                let unassigned = *dsps[0].1.itxfm_add[tx as usize][t as usize].get() as usize
+                    == *itxfm::Fn::DEFAULT.get() as usize;
+                if unassigned || (eob == 100 && (w, h) != (32, 32)) {
                     continue;
                 }
-                let coeff: Vec<i16> = (0..w * h)
+                let coeff: Vec<i16> = (0..cw * ch)
                     .map(|i| {
-                        if eob < 136 && (i / h >= 16 || i % h >= 16) {
+                        if eob < 136 && (i / ch >= 16 || i % ch >= 16) {
                             0
                         } else {
                             (rng.next() % 1024) as i16 - 512

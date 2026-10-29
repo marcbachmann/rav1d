@@ -48,11 +48,12 @@ const fn kinds(t: TxfmType) -> (Tx1d, Tx1d) {
     }
 }
 
-/// The outputs a transform leaves negated: the adst's odd ones, so the flipped adst's even ones.
-const fn negated(t: Tx1d) -> u32 {
+/// The outputs a transform of `n` points leaves negated: the adst's odd ones from 8 points on,
+/// so the flipped adst's even ones.
+const fn negated(t: Tx1d, n: usize) -> u32 {
     match t {
-        Adst => 0xaaaa,
-        FlipAdst => 0x5555,
+        Adst if n > 4 => 0xaaaa,
+        FlipAdst if n > 4 => 0x5555,
         _ => 0,
     }
 }
@@ -76,9 +77,10 @@ const fn row_shift(w: usize, h: usize) -> u32 {
 }
 
 /// The Q15 multiplier of a pass's rounding shift after transform `t` of `n` points; the identity
-/// transforms scale in their own way, and 32768 means nothing is left to do.
+/// transforms scale in their own way, 32768 means nothing is left to do and 65536 a doubling.
 const fn round_mul(t: Tx1d, n: usize, shift: u32) -> i32 {
     match (t, n) {
+        (Identity, 4) if shift == 1 => 32768,
         (Identity, 8) => 1 << (16 - shift),
         (Identity, 16) if shift < 4 => 32768,
         (Identity, 32) => 1 << (17 - shift),
@@ -88,12 +90,74 @@ const fn round_mul(t: Tx1d, n: usize, shift: u32) -> i32 {
 
 #[inline(always)]
 fn round<const N: usize>(v: &mut [I16x8; N], k: i32, negated: u32) {
+    if k == 65536 {
+        for x in v {
+            *x = x.add_sat(*x);
+        }
+        return;
+    }
     if k == 32768 {
+        let zero = I16x8::splat(0);
+        for i in 0..N {
+            if negated >> i & 1 != 0 {
+                v[i] = zero.sub_sat(v[i]);
+            }
+        }
         return;
     }
     let (pos, neg) = (I16x8::splat(k as i16), I16x8::splat(-k as i16));
     for i in 0..N {
         v[i] = v[i].mulhrs(if negated >> i & 1 != 0 { neg } else { pos });
+    }
+}
+
+#[inline(always)]
+fn dct4(v: &mut [I16x8; 4]) {
+    let (t1, t0) = v[0].rot(v[2], 2896, 2896);
+    let (t2, t3) = v[1].rot(v[3], 1567, 3784);
+    v[0] = t0.add_sat(t3);
+    v[1] = t1.add_sat(t2);
+    v[2] = t1.sub_sat(t2);
+    v[3] = t0.sub_sat(t3);
+}
+
+/// Four-term sums in 32 bits, as the C has them; nothing comes out negated.
+#[inline(always)]
+fn adst4(v: &mut [I16x8; 4]) {
+    let [a, b, c, d] = *v;
+    v[0] = a.madd4(b, c, d, [1321, 3344, 3803, 2482]);
+    v[1] = a.madd4(b, c, d, [2482, 3344, -1321, -3803]);
+    v[2] = a.madd4(b, c, d, [3344, 0, -3344, 3344]);
+    v[3] = a.madd4(b, c, d, [3803, -3344, 2482, -1321]);
+}
+
+/// `x + (x * 1697 + 2048 >> 12)`; with the pass's rounding shift by 1 folded in as the asm does
+/// it, an average that cannot overflow (`x` and the term share a sign, except at `x == -1`, whose
+/// result is 0).
+#[inline(always)]
+fn identity4(v: &mut [I16x8; 4], shift: u32) {
+    let k = I16x8::splat(1697 * 8);
+    let (minus_one, zero) = (I16x8::splat(-1), I16x8::splat(0));
+    for x in v {
+        let term = x.mulhrs(k);
+        *x = if shift == 1 {
+            x.avg_u(term).and(x.eq(minus_one).eq(zero))
+        } else {
+            x.add_sat(term)
+        };
+    }
+}
+
+#[inline(always)]
+fn tx4(v: &mut [I16x8; 4], t: Tx1d, shift: u32) {
+    match t {
+        Dct => dct4(v),
+        Adst => adst4(v),
+        FlipAdst => {
+            adst4(v);
+            v.reverse();
+        }
+        Identity => identity4(v, shift),
     }
 }
 
@@ -306,6 +370,207 @@ fn dct32<const HALF: bool>(v: &mut [I16x8; 32]) {
     }
 }
 
+/// A 64-point DCT sees 32 coefficients, so its upper inputs are always zero.
+#[inline(always)]
+fn dct64(v: &mut [I16x8; 64]) {
+    let mut e: [I16x8; 32] = std::array::from_fn(|i| v[2 * i]);
+    dct32::<true>(&mut e);
+
+    let (t32a, t63a) = rot1(v[1], 101, 4095);
+    let (t33a, t62a) = rot1(v[31], -2824, 2967);
+    let (t34a, t61a) = rot1(v[17], 1660, 3745);
+    let (t35a, t60a) = rot1(v[15], -1474, 3822);
+    let (t36a, t59a) = rot1(v[9], 897, 3996);
+    let (t37a, t58a) = rot1(v[23], -2191, 3461);
+    let (t38a, t57a) = rot1(v[25], 2359, 3349);
+    let (t39a, t56a) = rot1(v[7], -700, 4036);
+    let (t40a, t55a) = rot1(v[5], 501, 4065);
+    let (t41a, t54a) = rot1(v[27], -2520, 3229);
+    let (t42a, t53a) = rot1(v[21], 2019, 3564);
+    let (t43a, t52a) = rot1(v[11], -1092, 3948);
+    let (t44a, t51a) = rot1(v[13], 1285, 3889);
+    let (t45a, t50a) = rot1(v[19], -1842, 3659);
+    let (t46a, t49a) = rot1(v[29], 2675, 3102);
+    let (t47a, t48a) = rot1(v[3], -301, 4085);
+
+    let t32 = t32a.add_sat(t33a);
+    let t33 = t32a.sub_sat(t33a);
+    let t34 = t35a.sub_sat(t34a);
+    let t35 = t35a.add_sat(t34a);
+    let t36 = t36a.add_sat(t37a);
+    let t37 = t36a.sub_sat(t37a);
+    let t38 = t39a.sub_sat(t38a);
+    let t39 = t39a.add_sat(t38a);
+    let t40 = t40a.add_sat(t41a);
+    let t41 = t40a.sub_sat(t41a);
+    let t42 = t43a.sub_sat(t42a);
+    let t43 = t43a.add_sat(t42a);
+    let t44 = t44a.add_sat(t45a);
+    let t45 = t44a.sub_sat(t45a);
+    let t46 = t47a.sub_sat(t46a);
+    let t47 = t47a.add_sat(t46a);
+    let t48 = t48a.add_sat(t49a);
+    let t49 = t48a.sub_sat(t49a);
+    let t50 = t51a.sub_sat(t50a);
+    let t51 = t51a.add_sat(t50a);
+    let t52 = t52a.add_sat(t53a);
+    let t53 = t52a.sub_sat(t53a);
+    let t54 = t55a.sub_sat(t54a);
+    let t55 = t55a.add_sat(t54a);
+    let t56 = t56a.add_sat(t57a);
+    let t57 = t56a.sub_sat(t57a);
+    let t58 = t59a.sub_sat(t58a);
+    let t59 = t59a.add_sat(t58a);
+    let t60 = t60a.add_sat(t61a);
+    let t61 = t60a.sub_sat(t61a);
+    let t62 = t63a.sub_sat(t62a);
+    let t63 = t63a.add_sat(t62a);
+
+    let (t33a, t62a) = t62.rot(t33, 401, 4076);
+    let (t34a, t61a) = t34.madd2(t61, [-401, -4076], [-4076, 401]);
+    let (t37a, t58a) = t58.rot(t37, 3166, 2598);
+    let (t38a, t57a) = t38.madd2(t57, [-3166, -2598], [-2598, 3166]);
+    let (t41a, t54a) = t54.rot(t41, 1931, 3612);
+    let (t42a, t53a) = t42.madd2(t53, [-1931, -3612], [-3612, 1931]);
+    let (t45a, t50a) = t50.rot(t45, 3920, 1189);
+    let (t46a, t49a) = t46.madd2(t49, [-3920, -1189], [-1189, 3920]);
+
+    let t32a = t32.add_sat(t35);
+    let t33 = t33a.add_sat(t34a);
+    let t34 = t33a.sub_sat(t34a);
+    let t35a = t32.sub_sat(t35);
+    let t36a = t39.sub_sat(t36);
+    let t37 = t38a.sub_sat(t37a);
+    let t38 = t38a.add_sat(t37a);
+    let t39a = t39.add_sat(t36);
+    let t40a = t40.add_sat(t43);
+    let t41 = t41a.add_sat(t42a);
+    let t42 = t41a.sub_sat(t42a);
+    let t43a = t40.sub_sat(t43);
+    let t44a = t47.sub_sat(t44);
+    let t45 = t46a.sub_sat(t45a);
+    let t46 = t46a.add_sat(t45a);
+    let t47a = t47.add_sat(t44);
+    let t48a = t48.add_sat(t51);
+    let t49 = t49a.add_sat(t50a);
+    let t50 = t49a.sub_sat(t50a);
+    let t51a = t48.sub_sat(t51);
+    let t52a = t55.sub_sat(t52);
+    let t53 = t54a.sub_sat(t53a);
+    let t54 = t54a.add_sat(t53a);
+    let t55a = t55.add_sat(t52);
+    let t56a = t56.add_sat(t59);
+    let t57 = t57a.add_sat(t58a);
+    let t58 = t57a.sub_sat(t58a);
+    let t59a = t56.sub_sat(t59);
+    let t60a = t63.sub_sat(t60);
+    let t61 = t62a.sub_sat(t61a);
+    let t62 = t62a.add_sat(t61a);
+    let t63a = t63.add_sat(t60);
+
+    let (t34a, t61a) = t61.rot(t34, 799, 4017);
+    let (t35, t60) = t60a.rot(t35a, 799, 4017);
+    let (t36, t59) = t36a.madd2(t59a, [-799, -4017], [-4017, 799]);
+    let (t37a, t58a) = t37.madd2(t58, [-799, -4017], [-4017, 799]);
+    let (t42a, t53a) = t53.rot(t42, 3406, 2276);
+    let (t43, t52) = t52a.rot(t43a, 3406, 2276);
+    let (t44, t51) = t44a.madd2(t51a, [-3406, -2276], [-2276, 3406]);
+    let (t45a, t50a) = t45.madd2(t50, [-3406, -2276], [-2276, 3406]);
+
+    let t32 = t32a.add_sat(t39a);
+    let t33a = t33.add_sat(t38);
+    let t34 = t34a.add_sat(t37a);
+    let t35a = t35.add_sat(t36);
+    let t36a = t35.sub_sat(t36);
+    let t37 = t34a.sub_sat(t37a);
+    let t38a = t33.sub_sat(t38);
+    let t39 = t32a.sub_sat(t39a);
+    let t40 = t47a.sub_sat(t40a);
+    let t41a = t46.sub_sat(t41);
+    let t42 = t45a.sub_sat(t42a);
+    let t43a = t44.sub_sat(t43);
+    let t44a = t44.add_sat(t43);
+    let t45 = t45a.add_sat(t42a);
+    let t46a = t46.add_sat(t41);
+    let t47 = t47a.add_sat(t40a);
+    let t48 = t48a.add_sat(t55a);
+    let t49a = t49.add_sat(t54);
+    let t50 = t50a.add_sat(t53a);
+    let t51a = t51.add_sat(t52);
+    let t52a = t51.sub_sat(t52);
+    let t53 = t50a.sub_sat(t53a);
+    let t54a = t49.sub_sat(t54);
+    let t55 = t48a.sub_sat(t55a);
+    let t56 = t63a.sub_sat(t56a);
+    let t57a = t62.sub_sat(t57);
+    let t58 = t61a.sub_sat(t58a);
+    let t59a = t60.sub_sat(t59);
+    let t60a = t60.add_sat(t59);
+    let t61 = t61a.add_sat(t58a);
+    let t62a = t62.add_sat(t57);
+    let t63 = t63a.add_sat(t56a);
+
+    let (t36, t59) = t59a.rot(t36a, 1567, 3784);
+    let (t37a, t58a) = t58.rot(t37, 1567, 3784);
+    let (t38, t57) = t57a.rot(t38a, 1567, 3784);
+    let (t39a, t56a) = t56.rot(t39, 1567, 3784);
+    let (t40a, t55a) = t40.madd2(t55, [-1567, -3784], [-3784, 1567]);
+    let (t41, t54) = t41a.madd2(t54a, [-1567, -3784], [-3784, 1567]);
+    let (t42a, t53a) = t42.madd2(t53, [-1567, -3784], [-3784, 1567]);
+    let (t43, t52) = t43a.madd2(t52a, [-1567, -3784], [-3784, 1567]);
+
+    let t32a = t32.add_sat(t47);
+    let t33 = t33a.add_sat(t46a);
+    let t34a = t34.add_sat(t45);
+    let t35 = t35a.add_sat(t44a);
+    let t36a = t36.add_sat(t43);
+    let t37 = t37a.add_sat(t42a);
+    let t38a = t38.add_sat(t41);
+    let t39 = t39a.add_sat(t40a);
+    let t40 = t39a.sub_sat(t40a);
+    let t41a = t38.sub_sat(t41);
+    let t42 = t37a.sub_sat(t42a);
+    let t43a = t36.sub_sat(t43);
+    let t44 = t35a.sub_sat(t44a);
+    let t45a = t34.sub_sat(t45);
+    let t46 = t33a.sub_sat(t46a);
+    let t47a = t32.sub_sat(t47);
+    let t48a = t63.sub_sat(t48);
+    let t49 = t62a.sub_sat(t49a);
+    let t50a = t61.sub_sat(t50);
+    let t51 = t60a.sub_sat(t51a);
+    let t52a = t59.sub_sat(t52);
+    let t53 = t58a.sub_sat(t53a);
+    let t54a = t57.sub_sat(t54);
+    let t55 = t56a.sub_sat(t55a);
+    let t56 = t56a.add_sat(t55a);
+    let t57a = t57.add_sat(t54);
+    let t58 = t58a.add_sat(t53a);
+    let t59a = t59.add_sat(t52);
+    let t60 = t60a.add_sat(t51a);
+    let t61a = t61.add_sat(t50);
+    let t62 = t62a.add_sat(t49a);
+    let t63a = t63.add_sat(t48);
+
+    let (t40a, t55a) = t55.rot(t40, 2896, 2896);
+    let (t41, t54) = t54a.rot(t41a, 2896, 2896);
+    let (t42a, t53a) = t53.rot(t42, 2896, 2896);
+    let (t43, t52) = t52a.rot(t43a, 2896, 2896);
+    let (t44a, t51a) = t51.rot(t44, 2896, 2896);
+    let (t45, t50) = t50a.rot(t45a, 2896, 2896);
+    let (t46a, t49a) = t49.rot(t46, 2896, 2896);
+    let (t47, t48) = t48a.rot(t47a, 2896, 2896);
+
+    let o = [
+        t63a, t62, t61a, t60, t59a, t58, t57a, t56, t55a, t54, t53a, t52, t51a, t50, t49a, t48,
+        t47, t46a, t45, t44a, t43, t42a, t41, t40a, t39, t38a, t37, t36a, t35, t34a, t33, t32a,
+    ];
+    for i in 0..32 {
+        v[i] = e[i].add_sat(o[i]);
+        v[63 - i] = e[i].sub_sat(o[i]);
+    }
+}
+
 /// Outputs 1, 3, 5 and 7 come out negated. The last stage's `* 2896 >> 12` runs in 32 bits on
 /// the row pass and in 16 on the column pass, where the asm has the inputs small enough.
 #[inline(always)]
@@ -487,26 +752,35 @@ fn tx32(v: &mut [I16x8; 32], t: Tx1d, half: bool) {
 #[inline(always)]
 fn tx<const N: usize, const COLS: bool>(v: &mut [I16x8; N], t: Tx1d, shift: u32, half: bool) {
     match N {
+        4 => tx4((&mut v[..4]).try_into().unwrap(), t, shift),
         8 => tx8::<COLS>((&mut v[..8]).try_into().unwrap(), t),
         16 => tx16::<COLS>((&mut v[..16]).try_into().unwrap(), t, shift),
         32 => tx32((&mut v[..32]).try_into().unwrap(), t, half),
+        64 => dct64((&mut v[..64]).try_into().unwrap()),
         _ => unreachable!(),
     }
 }
 
-/// `v[y]` added to the block's row `y` from column `x0`, saturated to the pixel range.
+/// `v[y]` added to the block's row `y` from column `x0`, saturated to the pixel range; `W` lanes
+/// of 4 or 8.
 #[inline(always)]
-fn add_rows<BD: BitDepth, const H: usize>(
+fn add_rows<BD: BitDepth, const W: usize, const H: usize>(
     dst: Rav1dPictureDataComponentOffset,
     x0: usize,
     v: &[I16x8; H],
 ) {
+    let n = if W == 4 { 4 } else { 8 };
     for y in 0..H {
         let row = dst + (y as isize * dst.pixel_stride::<BD>());
-        let px = &mut *row.slice_mut::<BD>(x0 + 8);
+        let px = &mut *row.slice_mut::<BD>(x0 + n);
         let px = &mut px.as_bytes_mut()[x0..];
-        let out = I16x8::from_u8x8(px).add(v[y]);
-        px.copy_from_slice(&out.pack_u8());
+        let out = if n == 4 {
+            I16x8::from_u8x4(px)
+        } else {
+            I16x8::from_u8x8(px)
+        }
+        .add(v[y]);
+        px.copy_from_slice(&out.pack_u8()[..n]);
     }
 }
 
@@ -529,18 +803,27 @@ fn add_dc<BD: BitDepth, const W: usize, const H: usize>(
     for y in 0..H {
         let row = dst + (y as isize * dst.pixel_stride::<BD>());
         let px = &mut *row.slice_mut::<BD>(W);
-        for px in px.as_bytes_mut().chunks_exact_mut(8) {
+        let px = px.as_bytes_mut();
+        if W == 4 {
+            let out = I16x8::from_u8x4(px).add(dc);
+            px.copy_from_slice(&out.pack_u8()[..4]);
+            continue;
+        }
+        for px in px.chunks_exact_mut(8) {
             let out = I16x8::from_u8x8(px).add(dc);
             px.copy_from_slice(&out.pack_u8());
         }
     }
 }
 
-/// A `W`x`H` block of 8, 16 and 32: the rows eight at a time into `tmp`, the columns eight at a
-/// time out of it; 8x8 turns around in the registers. A 32x32 block with `eob < 136` has every
-/// coefficient in its top-left 16x16 (the asm's tier), so half the rows and inputs are skipped.
+/// A `W`x`H` block of 4 to 64 in `G = W / 8` (rounded up) column groups: the rows eight at a
+/// time, each group's 8x8 turned around into its column vectors, then each group's columns into
+/// the picture. The column vectors are an array the compiler keeps in registers where they fit,
+/// with no scratch in between. A side of 4 fills half the lanes; a side of 64 has 32
+/// coefficients. A 32x32 block with `eob < 136` has every coefficient in its top-left 16x16 (the
+/// asm's tier), so half the rows and inputs are skipped.
 #[inline(always)]
-fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType>(
+fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType, const G: usize>(
     dst: Rav1dPictureDataComponentOffset,
     coeff: &mut [i16],
     eob: i32,
@@ -550,61 +833,52 @@ fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType>
         return add_dc::<BD, W, H>(dst, coeff);
     }
     let shift = row_shift(W, H);
-    let coeff = &mut coeff[..W * H];
-    let half = W == 32 && eob < 136;
-    let (w, h) = if half { (16, 16) } else { (W, H) };
-    if W == 8 && H == 8 {
-        let mut v: [I16x8; 8] = std::array::from_fn(|x| I16x8::load(&coeff[x * 8..]));
-        coeff.fill(0);
-        tx8::<false>(&mut v, rows);
-        round(&mut v, round_mul(rows, 8, shift), negated(rows));
-        I16x8::transpose8x8(&mut v);
-        tx8::<true>(&mut v, cols);
-        round(&mut v, round_mul(cols, 8, 4), negated(cols));
-        return add_rows::<BD, 8>(dst, 0, &v);
-    }
-    let mut tmp = [0i16; 1024];
-    let tmp = &mut tmp[..W * H];
+    let (cw, ch) = (W.min(32), H.min(32));
+    let coeff = &mut coeff[..cw * ch];
+    let half = W == 32 && H == 32 && eob < 136;
+    let (w, h) = if half { (16, 16) } else { (cw, ch) };
     let rect = if W * 2 == H || H * 2 == W {
         Some(I16x8::splat(2896 * 8))
     } else {
         None
     };
     let zero = I16x8::splat(0);
+    let mut groups = [[zero; H]; G];
     for y0 in (0..h).step_by(8) {
         let mut v: [I16x8; W] = std::array::from_fn(|x| {
             if x >= w {
                 return zero;
             }
-            let c = &mut coeff[x * H + y0..];
-            let v = I16x8::load(c);
-            zero.store(c);
+            let c = &mut coeff[x * ch + y0..];
+            let v = if H == 4 {
+                let v = I16x8::load_lo(c);
+                zero.store_lo(c);
+                v
+            } else {
+                let v = I16x8::load(c);
+                zero.store(c);
+                v
+            };
             match rect {
                 Some(k) => v.mulhrs(k),
                 None => v,
             }
         });
         tx::<W, false>(&mut v, rows, shift, half);
-        round(&mut v, round_mul(rows, W, shift), negated(rows));
-        for x0 in (0..W).step_by(8) {
-            let block: &mut [I16x8; 8] = (&mut v[x0..x0 + 8]).try_into().unwrap();
-            I16x8::transpose8x8(block);
-            for y in 0..8 {
-                block[y].store(&mut tmp[(y0 + y) * W + x0..]);
+        round(&mut v, round_mul(rows, W, shift), negated(rows, W));
+        for (g, group) in groups.iter_mut().enumerate() {
+            let mut block: [I16x8; 8] =
+                std::array::from_fn(|i| v.get(g * 8 + i).copied().unwrap_or(zero));
+            I16x8::transpose8x8(&mut block);
+            for y in 0..8.min(H) {
+                group[y0 + y] = block[y];
             }
         }
     }
-    for x0 in (0..W).step_by(8) {
-        let mut v: [I16x8; H] = std::array::from_fn(|y| {
-            if y >= h {
-                zero
-            } else {
-                I16x8::load(&tmp[y * W + x0..])
-            }
-        });
-        tx::<H, true>(&mut v, cols, 4, half);
-        round(&mut v, round_mul(cols, H, 4), negated(cols));
-        add_rows::<BD, H>(dst, x0, &v);
+    for (g, group) in groups.iter_mut().enumerate() {
+        tx::<H, true>(group, cols, 4, half);
+        round(group, round_mul(cols, H, 4), negated(cols, H));
+        add_rows::<BD, W, H>(dst, g * 8, group);
     }
 }
 
@@ -612,10 +886,10 @@ fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType>
     any(target_arch = "x86", target_arch = "x86_64"),
     target_feature(enable = "sse4.1")
 )]
-pub fn add<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType>(
+pub fn add<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType, const G: usize>(
     dst: Rav1dPictureDataComponentOffset,
     coeff: &mut [i16],
     eob: i32,
 ) {
-    add_block::<BD, W, H, TYPE>(dst, coeff, eob)
+    add_block::<BD, W, H, TYPE, G>(dst, coeff, eob)
 }

@@ -296,6 +296,34 @@ mod imp {
             Self(unsafe { _mm_mulhrs_epi16(self.0, o.0) })
         }
 
+        /// Lanes `s[..4]`, the high four zero.
+        #[inline(always)]
+        pub fn load_lo(s: &[i16]) -> Self {
+            Self(unsafe { _mm_loadl_epi64(s[..4].as_ptr().cast()) })
+        }
+
+        /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
+            unsafe {
+                let k01 = _mm_set1_epi32(k[0] as u16 as i32 | (k[1] as i32) << 16);
+                let k23 = _mm_set1_epi32(k[2] as u16 as i32 | (k[3] as i32) << 16);
+                let rnd = _mm_set1_epi32(2048);
+                let lo = _mm_add_epi32(
+                    _mm_madd_epi16(_mm_unpacklo_epi16(self.0, b.0), k01),
+                    _mm_madd_epi16(_mm_unpacklo_epi16(c.0, d.0), k23),
+                );
+                let hi = _mm_add_epi32(
+                    _mm_madd_epi16(_mm_unpackhi_epi16(self.0, b.0), k01),
+                    _mm_madd_epi16(_mm_unpackhi_epi16(c.0, d.0), k23),
+                );
+                Self(_mm_packs_epi32(
+                    _mm_srai_epi32::<12>(_mm_add_epi32(lo, rnd)),
+                    _mm_srai_epi32::<12>(_mm_add_epi32(hi, rnd)),
+                ))
+            }
+        }
+
         /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
         /// saturated to `i16`.
         #[inline(always)]
@@ -572,6 +600,47 @@ mod imp {
         #[inline(always)]
         pub fn mulhrs(self, o: Self) -> Self {
             Self(unsafe { vqrdmulhq_s16(self.0, o.0) })
+        }
+
+        /// Lanes `s[..4]`, the high four zero.
+        #[inline(always)]
+        pub fn load_lo(s: &[i16]) -> Self {
+            Self(unsafe { vcombine_s16(vld1_s16(s[..4].as_ptr()), vdup_n_s16(0)) })
+        }
+
+        /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
+            unsafe {
+                let (k0, k1, k2, k3) = (
+                    vdup_n_s16(k[0]),
+                    vdup_n_s16(k[1]),
+                    vdup_n_s16(k[2]),
+                    vdup_n_s16(k[3]),
+                );
+                let lo = vmlal_s16(
+                    vmlal_s16(
+                        vmlal_s16(vmull_s16(vget_low_s16(self.0), k0), vget_low_s16(b.0), k1),
+                        vget_low_s16(c.0),
+                        k2,
+                    ),
+                    vget_low_s16(d.0),
+                    k3,
+                );
+                let hi = vmlal_s16(
+                    vmlal_s16(
+                        vmlal_s16(vmull_s16(vget_high_s16(self.0), k0), vget_high_s16(b.0), k1),
+                        vget_high_s16(c.0),
+                        k2,
+                    ),
+                    vget_high_s16(d.0),
+                    k3,
+                );
+                Self(vcombine_s16(
+                    vqrshrn_n_s32::<12>(lo),
+                    vqrshrn_n_s32::<12>(hi),
+                ))
+            }
         }
 
         /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
@@ -854,6 +923,49 @@ mod imp {
             Self(i16x8_q15mulr_sat(self.0, o.0))
         }
 
+        /// Lanes `s[..4]`, the high four zero.
+        #[inline(always)]
+        pub fn load_lo(s: &[i16]) -> Self {
+            let s = &s[..4];
+            Self(i16x8(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+
+        /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
+            let (k0, k1, k2, k3) = (
+                i16x8_splat(k[0]),
+                i16x8_splat(k[1]),
+                i16x8_splat(k[2]),
+                i16x8_splat(k[3]),
+            );
+            let rnd = i32x4_splat(2048);
+            let lo = i32x4_add(
+                i32x4_add(
+                    i32x4_extmul_low_i16x8(self.0, k0),
+                    i32x4_extmul_low_i16x8(b.0, k1),
+                ),
+                i32x4_add(
+                    i32x4_extmul_low_i16x8(c.0, k2),
+                    i32x4_extmul_low_i16x8(d.0, k3),
+                ),
+            );
+            let hi = i32x4_add(
+                i32x4_add(
+                    i32x4_extmul_high_i16x8(self.0, k0),
+                    i32x4_extmul_high_i16x8(b.0, k1),
+                ),
+                i32x4_add(
+                    i32x4_extmul_high_i16x8(c.0, k2),
+                    i32x4_extmul_high_i16x8(d.0, k3),
+                ),
+            );
+            Self(i16x8_narrow_i32x4(
+                i32x4_shr(i32x4_add(lo, rnd), 12),
+                i32x4_shr(i32x4_add(hi, rnd), 12),
+            ))
+        }
+
         /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
         /// saturated to `i16`.
         #[inline(always)]
@@ -1129,6 +1241,26 @@ mod imp {
         #[inline(always)]
         pub fn mulhrs(self, o: Self) -> Self {
             self.zip(o, |a, b| ((a as i32 * b as i32 + 0x4000) >> 15) as i16)
+        }
+
+        /// Lanes `s[..4]`, the high four zero.
+        #[inline(always)]
+        pub fn load_lo(s: &[i16]) -> Self {
+            Self([s[0], s[1], s[2], s[3], 0, 0, 0, 0])
+        }
+
+        /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
+            Self(std::array::from_fn(|i| {
+                (self.0[i] as i32 * k[0] as i32
+                    + b.0[i] as i32 * k[1] as i32
+                    + c.0[i] as i32 * k[2] as i32
+                    + d.0[i] as i32 * k[3] as i32
+                    + 2048
+                    >> 12)
+                    .clamp(i16::MIN as i32, i16::MAX as i32) as i16
+            }))
         }
 
         /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
