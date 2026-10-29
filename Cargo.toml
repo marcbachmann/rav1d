@@ -77,4 +77,4 @@ opt-level = 2
 codegen-units = 16
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(rav1d_rust_simd)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rav1d_rust_simd, values("cdef", "msac"))'] }

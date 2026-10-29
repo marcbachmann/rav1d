@@ -1097,11 +1097,11 @@ impl Rav1dCdefDSPContext {
         self
     }
 
-    /// The Rust SIMD kernels stand in where there is no asm, or over it with `--cfg rav1d_rust_simd`.
+    /// The Rust SIMD kernels stand in where there is no asm, or over it with `--cfg rav1d_rust_simd="cdef"`.
     #[inline(always)]
     const fn init<BD: BitDepth>(self, flags: CpuFlags) -> Self {
         let this = self.init_asm::<BD>(flags);
-        if cfg!(any(not(feature = "asm"), rav1d_rust_simd)) {
+        if cfg!(any(not(feature = "asm"), rav1d_rust_simd = "cdef")) {
             this.init_rust_simd::<BD>(flags)
         } else {
             this

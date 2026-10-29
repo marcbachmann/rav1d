@@ -2,9 +2,9 @@
 //! one source the Rust SIMD kernels are written in. Each backend maps an operation to one or two
 //! instructions; the kernels never name a target.
 //!
-//! On x86 every method needs SSE4.1. They are `#[inline(always)]` so that they compile into a
-//! kernel entered through `#[target_feature(enable = "sse4.1")]`, which is only chosen once the
-//! CPU flags hold SSE41.
+//! On x86 the methods are `#[inline(always)]` so that they compile into a kernel entered through
+//! `#[target_feature(enable = "sse4.1")]`, which is only chosen once the CPU flags hold SSE41.
+//! The ones from `xor` on need only SSE2, the x86_64 baseline, and inline anywhere.
 
 /// Whether [`I16x8`] maps to vector instructions on this target.
 pub const fn native() -> bool {
@@ -65,8 +65,8 @@ mod imp {
 
     pub type Inner = __m128i;
 
-    // SAFETY (every `unsafe` here): SSE4.1 holds where these are compiled in (see the module
-    // docs), and loads and stores go through bounds-checked slices of 8 or 4 lanes.
+    // SAFETY (every `unsafe` here): SSE4.1, or SSE2 from `xor` on, holds where these are
+    // compiled in (see the module docs), and loads and stores go through bounds-checked slices of 8 or 4 lanes.
     impl I16x8 {
         #[inline(always)]
         pub fn load(s: &[i16]) -> Self {
@@ -175,6 +175,61 @@ mod imp {
         #[inline(always)]
         pub(super) fn sign(self, o: Self) -> Self {
             Self(unsafe { _mm_sign_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn xor(self, o: Self) -> Self {
+            Self(unsafe { _mm_xor_si128(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn load_u16(s: &[u16]) -> Self {
+            Self(unsafe { _mm_loadu_si128(s[..8].as_ptr().cast()) })
+        }
+
+        /// `s[..4]` into the low four lanes.
+        #[inline(always)]
+        pub fn load_u16_lo(s: &[u16]) -> Self {
+            Self(unsafe { _mm_loadl_epi64(s[..4].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store_u16(self, d: &mut [u16]) {
+            unsafe { _mm_storeu_si128(d[..8].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn store_u16_lo(self, d: &mut [u16]) {
+            unsafe { _mm_storel_epi64(d[..4].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            Self(unsafe { _mm_and_si128(self.0, o.0) })
+        }
+
+        /// The high halves of the unsigned products.
+        #[inline(always)]
+        pub fn mulhi_u(self, o: Self) -> Self {
+            Self(unsafe { _mm_mulhi_epu16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            Self(unsafe { _mm_cmpeq_epi16(self.0, o.0) })
+        }
+
+        /// The first set lane of a mask, 8 if none is.
+        #[inline(always)]
+        pub fn first_set(self) -> u32 {
+            (unsafe { _mm_movemask_epi8(self.0) } as u32 | 1 << 16).trailing_zeros() / 2
+        }
+
+        /// The first set lane of the masks `self` then `o`, 16 if none is.
+        #[inline(always)]
+        pub fn first_set2(self, o: Self) -> u32 {
+            (unsafe { _mm_movemask_epi8(_mm_packs_epi16(self.0, o.0)) } as u32 | 1 << 16)
+                .trailing_zeros()
         }
     }
 }
@@ -303,6 +358,69 @@ mod imp {
         #[inline(always)]
         pub fn xor(self, o: Self) -> Self {
             Self(unsafe { veorq_s16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn load_u16(src: &[u16]) -> Self {
+            Self(s(unsafe { vld1q_u16(src[..8].as_ptr()) }))
+        }
+
+        /// `s[..4]` into the low four lanes.
+        #[inline(always)]
+        pub fn load_u16_lo(src: &[u16]) -> Self {
+            Self(s(unsafe {
+                vcombine_u16(vld1_u16(src[..4].as_ptr()), vdup_n_u16(0))
+            }))
+        }
+
+        #[inline(always)]
+        pub fn store_u16(self, d: &mut [u16]) {
+            unsafe { vst1q_u16(d[..8].as_mut_ptr(), u(self.0)) }
+        }
+
+        #[inline(always)]
+        pub fn store_u16_lo(self, d: &mut [u16]) {
+            unsafe { vst1_u16(d[..4].as_mut_ptr(), vget_low_u16(u(self.0))) }
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            Self(unsafe { vandq_s16(self.0, o.0) })
+        }
+
+        /// The high halves of the unsigned products.
+        #[inline(always)]
+        pub fn mulhi_u(self, o: Self) -> Self {
+            let (a, b) = (u(self.0), u(o.0));
+            let lo = unsafe { vmull_u16(vget_low_u16(a), vget_low_u16(b)) };
+            let hi = unsafe { vmull_high_u16(a, b) };
+            Self(s(unsafe {
+                vuzp2q_u16(vreinterpretq_u16_u32(lo), vreinterpretq_u16_u32(hi))
+            }))
+        }
+
+        #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            Self(s(unsafe { vceqq_s16(self.0, o.0) }))
+        }
+
+        /// The first set lane of a mask, 8 if none is.
+        #[inline(always)]
+        pub fn first_set(self) -> u32 {
+            let bytes = unsafe { vget_lane_u64::<0>(vreinterpret_u64_u8(vmovn_u16(u(self.0)))) };
+            bytes.trailing_zeros() / 8
+        }
+
+        /// The first set lane of the masks `self` then `o`, 16 if none is.
+        #[inline(always)]
+        pub fn first_set2(self, o: Self) -> u32 {
+            let lanes = unsafe { vcombine_u8(vmovn_u16(u(self.0)), vmovn_u16(u(o.0))) };
+            let nibbles = unsafe {
+                vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+                    lanes,
+                ))))
+            };
+            nibbles.trailing_zeros() / 4
         }
     }
 }
@@ -434,6 +552,61 @@ mod imp {
         pub fn xor(self, o: Self) -> Self {
             Self(v128_xor(self.0, o.0))
         }
+
+        #[inline(always)]
+        pub fn load_u16(s: &[u16]) -> Self {
+            // SAFETY: 8 lanes are in bounds; the load takes unaligned pointers.
+            Self(unsafe { v128_load(s[..8].as_ptr().cast()) })
+        }
+
+        /// `s[..4]` into the low four lanes.
+        #[inline(always)]
+        pub fn load_u16_lo(s: &[u16]) -> Self {
+            // SAFETY: 4 lanes are in bounds; the load takes unaligned pointers.
+            Self(unsafe { v128_load64_zero(s[..4].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store_u16(self, d: &mut [u16]) {
+            // SAFETY: 8 lanes are in bounds; the store takes unaligned pointers.
+            unsafe { v128_store(d[..8].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn store_u16_lo(self, d: &mut [u16]) {
+            // SAFETY: 4 lanes are in bounds; the store takes unaligned pointers.
+            unsafe { v128_store64_lane::<0>(self.0, d[..4].as_mut_ptr().cast()) }
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            Self(v128_and(self.0, o.0))
+        }
+
+        /// The high halves of the unsigned products.
+        #[inline(always)]
+        pub fn mulhi_u(self, o: Self) -> Self {
+            let lo = u32x4_extmul_low_u16x8(self.0, o.0);
+            let hi = u32x4_extmul_high_u16x8(self.0, o.0);
+            Self(i16x8_shuffle::<1, 3, 5, 7, 9, 11, 13, 15>(lo, hi))
+        }
+
+        #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            Self(i16x8_eq(self.0, o.0))
+        }
+
+        /// The first set lane of a mask, 8 if none is.
+        #[inline(always)]
+        pub fn first_set(self) -> u32 {
+            (i16x8_bitmask(self.0) as u32 | 1 << 8).trailing_zeros()
+        }
+
+        /// The first set lane of the masks `self` then `o`, 16 if none is.
+        #[inline(always)]
+        pub fn first_set2(self, o: Self) -> u32 {
+            (i8x16_bitmask(i8x16_narrow_i16x8(self.0, o.0)) as u32 | 1 << 16).trailing_zeros()
+        }
     }
 }
 
@@ -553,6 +726,63 @@ mod imp {
         #[inline(always)]
         pub fn xor(self, o: Self) -> Self {
             self.zip(o, |a, b| a ^ b)
+        }
+
+        #[inline(always)]
+        pub fn load_u16(s: &[u16]) -> Self {
+            Self(std::array::from_fn(|i| s[i] as i16))
+        }
+
+        /// `s[..4]` into the low four lanes.
+        #[inline(always)]
+        pub fn load_u16_lo(s: &[u16]) -> Self {
+            Self(std::array::from_fn(|i| if i < 4 { s[i] as i16 } else { 0 }))
+        }
+
+        #[inline(always)]
+        pub fn store_u16(self, d: &mut [u16]) {
+            for (d, v) in d[..8].iter_mut().zip(self.0) {
+                *d = v as u16;
+            }
+        }
+
+        #[inline(always)]
+        pub fn store_u16_lo(self, d: &mut [u16]) {
+            for (d, v) in d[..4].iter_mut().zip(self.0) {
+                *d = v as u16;
+            }
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            self.zip(o, |a, b| a & b)
+        }
+
+        /// The high halves of the unsigned products.
+        #[inline(always)]
+        pub fn mulhi_u(self, o: Self) -> Self {
+            self.zip(o, |a, b| ((a as u16 as u32 * b as u16 as u32) >> 16) as i16)
+        }
+
+        #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            self.zip(o, |a, b| -((a == b) as i16))
+        }
+
+        /// The first set lane of a mask, 8 if none is.
+        #[inline(always)]
+        pub fn first_set(self) -> u32 {
+            self.0.iter().position(|&m| m != 0).unwrap_or(8) as u32
+        }
+
+        /// The first set lane of the masks `self` then `o`, 16 if none is.
+        #[inline(always)]
+        pub fn first_set2(self, o: Self) -> u32 {
+            self.0
+                .iter()
+                .chain(&o.0)
+                .position(|&m| m != 0)
+                .unwrap_or(16) as u32
         }
     }
 }
