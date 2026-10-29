@@ -150,11 +150,14 @@ pub struct Options {
     /// partitions where a photo's few wins are marginal.
     pub rect_adaptive: bool,
     /// 16×16 blocks are no longer searched below 16×16 (8×8 splits and the rect partitions tried
-    /// after them) once 32 such searches gained at most 2% of the cost decided there with wins
-    /// over 2% of a block's cost rarer than 1 in 8, one in 16 still searched: the fast search's
-    /// cut above qindex 100, learnt per picture, and learnt afresh after a sampled big win. A
-    /// photo reads 0.2-0.7% and 1-7% at Q25-Q35 and 1.2% and 19% at Q50; a logo 19-34% and 50%,
-    /// a tile grid 48-148% and 27%. Pictures of 512×512 and under have too few 16×16 blocks to
+    /// after them) once 32 such searches of the block's activity class gained at most 5% of the
+    /// cost decided there with wins over 2% of a block's cost rarer than 1 in 4, one in 16 still
+    /// searched: the fast search's cut above qindex 100, learnt per picture and activity class
+    /// (a block's variance under 4, 32, 256, above), and learnt afresh after a sampled big win.
+    /// One count per picture let a flat background train the counters for the photo beside it
+    /// (a product on white lost 0.36 dB at these bars); per class, a photo's textured blocks
+    /// read 1% and 14% at Q50 where the same photo squeezed into that product read 7.5% and 45%,
+    /// and a tile grid 88% and 53%. Pictures of 512×512 and under have too few 16×16 blocks to
     /// learn on before their content changes (a 361×85 logo lost 1 dB at Q40).
     pub split8_adaptive: bool,
     /// libaom's `CDEF_FAST_SEARCH_LVL3` of cpu-used 5: CDEF primaries of 0, 2, 4, 8, 14 and

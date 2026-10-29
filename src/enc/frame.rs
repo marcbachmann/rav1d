@@ -507,11 +507,11 @@ pub struct Encoder<D: Decide> {
     pub rect_adaptive: bool,
     /// See `Options::split8_adaptive`.
     pub split8_adaptive: bool,
-    /// 16×16 blocks met, searched below 16×16 (8×8 splits and the rect partitions after them),
-    /// the cost that search gained over None where a partition won, the cost of every decision
-    /// tried, and the wins that gained over 2% of their block's cost: a few edge blocks of a flat
-    /// picture, hidden in the mean.
-    pub split_seen: (u32, u32, f64, f64, u32),
+    /// Per activity class of the block (`activity_bucket`): 16×16 blocks met, searched below
+    /// 16×16 (8×8 splits and the rect partitions after them), the cost that search gained over
+    /// None where a partition won, the cost of every decision tried, and the wins that gained
+    /// over 2% of their block's cost.
+    pub split_seen: [(u32, u32, f64, f64, u32); 4],
     /// Per partition level under `rect_ratio`: rect partitions met and tried, the cost their wins
     /// saved over the best square partition, and the cost of every decision tried.
     pub rect_seen: [(u32, u32, f64, f64); 5],
@@ -667,7 +667,7 @@ impl<D: Decide> Encoder<D> {
             rect_ratio: 0.0,
             rect_adaptive: false,
             split8_adaptive: false,
-            split_seen: (0, 0, 0.0, 0.0, 0),
+            split_seen: [(0, 0, 0.0, 0.0, 0); 4],
             rect_seen: [(0, 0, 0.0, 0.0); 5],
             fast_cdef: false,
             ssim: [1.0; 16],
@@ -1702,6 +1702,27 @@ impl<D: Decide> Encoder<D> {
         err as f64 / 64.0 + self.lambda * c.bits as f64 / 512.0
     }
 
+    /// Which of four activity classes a 16×16 luma block at `(x, y)` (in 4-pixel units) belongs
+    /// to, by its variance: under 4, 32, 256, and above.
+    fn activity_bucket(&self, x: i32, y: i32) -> usize {
+        let x0 = x as usize * 4;
+        let w = cmp::min(16, (self.seq.width as usize).saturating_sub(x0));
+        let h = cmp::min(16, (self.seq.height as usize).saturating_sub(y as usize * 4));
+        if w == 0 || h == 0 {
+            return 0;
+        }
+        let px = self.source(0, x, y, w, h);
+        let n = (w * h) as u64;
+        let (sum, sse) = px.iter().fold((0u64, 0u64), |(s, q), &p| (s + p as u64, q + (p as u64) * (p as u64)));
+        let var = (sse * n - sum * sum) / (n * n);
+        match var {
+            ..4 => 0,
+            ..32 => 1,
+            ..256 => 2,
+            _ => 3,
+        }
+    }
+
     /// Chooses a transform type from `cands`, its levels and their end of block by rate and
     /// distortion; the prediction is in place in the reconstruction.
     #[allow(clippy::too_many_arguments)]
@@ -2056,10 +2077,14 @@ impl<D: Decide> Encoder<D> {
         let (mut none_cost, mut split_cost) = (f64::INFINITY, f64::INFINITY);
         let mut rect_under = false;
         let split8 = self.split8_adaptive && level == 2 && halves == Halves::Both && none_allowed && split_allowed;
+        // The block's own activity picks the counters it learns from: a flat region teaches
+        // nothing about the edges and textures beside it.
+        let bucket = if split8 { self.activity_bucket(x, y) } else { 0 };
         let prune8 = split8 && {
-            self.split_seen.0 += 1;
-            let (met, tried, gained, total, big) = self.split_seen;
-            tried >= 32 && gained <= total * 0.02 && big * 8 <= tried && met % 16 != 0
+            let seen = &mut self.split_seen[bucket];
+            seen.0 += 1;
+            let (met, tried, gained, total, big) = *seen;
+            tried >= 32 && gained <= total * 0.05 && big * 4 <= tried && met % 16 != 0
         };
         for &bp in cands {
             if halves == Halves::Both && cands.len() > 1 {
@@ -2166,7 +2191,7 @@ impl<D: Decide> Encoder<D> {
         }
         let (cost, bits, snap, nodes) = best.unwrap();
         if split8 && !prune8 && none_cost.is_finite() {
-            let seen = &mut self.split_seen;
+            let seen = &mut self.split_seen[bucket];
             seen.1 += 1;
             seen.3 += cost;
             if !matches!(nodes[0], Node::Part(None)) {
@@ -2174,7 +2199,7 @@ impl<D: Decide> Encoder<D> {
                 if none_cost - cost > 0.02 * none_cost {
                     seen.4 += 1;
                     // A big win after the prune engaged: the content changed, so learn afresh.
-                    if seen.1 > 32 && seen.4 * 8 <= seen.1 {
+                    if seen.1 > 32 && seen.4 * 4 <= seen.1 {
                         *seen = (seen.0, 0, 0.0, 0.0, 0);
                     }
                 }
@@ -3938,7 +3963,7 @@ pub(crate) mod tests {
                 println!("  searches per 8x8 / coefficients per pixel: rank {} depth {} chroma {} final {} code {}", per[0], per[1], per[2], per[4], per[5]);
                 println!("  ms: rank {} depth {} chroma {} final {}, coded {searched}, with filters {t}; kept modes {}; scoring restore {} predict {} mode bits {} estimate {}", ns[0], ns[1], ns[2], ns[4], ns[3], ns[6], ns[7], ns[8], ns[9]);
                 println!("  rect under the ratio, met/tried/gain% by level: {}", rect_seen.iter().map(|s| format!("{}/{}/{:.3}", s.0, s.1, 100.0 * s.2 / s.3.max(1.0))).collect::<Vec<_>>().join(" "));
-                println!("  16x16 splits met/tried/gain%/big: {}/{}/{:.3}/{}", split_seen.0, split_seen.1, 100.0 * split_seen.2 / split_seen.3.max(1.0), split_seen.4);
+                println!("  16x16 splits met/tried/gain%/big by activity: {}", split_seen.iter().map(|s| format!("{}/{}/{:.3}/{}", s.0, s.1, 100.0 * s.2 / s.3.max(1.0), s.4)).collect::<Vec<_>>().join(" "));
                 println!("  ms by block side: 4 {} 8 {} 16 {} 32 {} 64 {}", sizes[0], sizes[1], sizes[2], sizes[3], sizes[4]);
             }
             let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));
