@@ -18,7 +18,7 @@ use crate::include::common::intops::iclip;
 use crate::include::dav1d::picture::{
     FFISafeRav1dPictureDataComponentOffset, Rav1dPictureDataComponentOffset,
 };
-#[cfg(not(all(feature = "asm", target_feature = "neon")))]
+#[cfg(not(all(feature = "asm", target_feature = "neon", not(rav1d_rust_simd = "itx"))))]
 use crate::itx_1d::rav1d_inv_wht4_1d_c;
 use crate::itx_1d::{
     rav1d_inv_adst16_1d_c, rav1d_inv_adst4_1d_c, rav1d_inv_adst8_1d_c, rav1d_inv_dct16_1d_c,
@@ -191,7 +191,7 @@ fn inv_txfm_add_rust<const W: usize, const H: usize, const TYPE: TxfmType, BD: B
         V_ADST => (Adst, Identity),
         V_FLIPADST => (FlipAdst, Identity),
 
-        #[cfg(not(all(feature = "asm", target_feature = "neon")))]
+        #[cfg(not(all(feature = "asm", target_feature = "neon", not(rav1d_rust_simd = "itx"))))]
         WHT_WHT if (W, H) == (4, 4) => return inv_txfm_add_wht_wht_4x4_rust(dst, coeff, bd),
 
         _ => unreachable!(),
@@ -370,7 +370,7 @@ pub struct Rav1dInvTxfmDSPContext {
     pub itxfm_add: [[itxfm::Fn; N_TX_TYPES_PLUS_LL]; TxfmSize::COUNT],
 }
 
-#[cfg(not(all(feature = "asm", target_feature = "neon")))]
+#[cfg(not(all(feature = "asm", target_feature = "neon", not(rav1d_rust_simd = "itx"))))]
 fn inv_txfm_add_wht_wht_4x4_rust<BD: BitDepth>(
     dst: Rav1dPictureDataComponentOffset,
     coeff: &mut [BD::Coef],
