@@ -288,7 +288,7 @@ unsafe extern "C" fn inv_txfm_add_simd_erased<
     // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
     unsafe {
         match (W, H) {
-            (8, 8) => itx_simd::add_8x8::<BD, TYPE>(dst, coeff, eob),
+            (8, 8) | (16, 16) => itx_simd::add::<BD, W, H, TYPE>(dst, coeff, eob),
             _ => unreachable!(),
         }
     }
@@ -817,6 +817,22 @@ impl Rav1dInvTxfmDSPContext {
             V_FLIPADST,
             H_FLIPADST
         );
+        assign!(
+            16,
+            16,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT
+        );
         self
     }
 
@@ -867,10 +883,12 @@ mod tests {
         }
     }
 
-    const STRIDE: usize = 32;
-    const ROWS: usize = 16;
+    const STRIDE: usize = 64;
+    const ROWS: usize = 24;
+    /// A 16-wide block's rows are stored aligned by the asm, as the decoder lays them out.
+    const BX: usize = 16;
 
-    /// The block at (8, 4) of a random plane after `dsp`'s transform of `coeff`, and the coefficients it leaves.
+    /// The block at (16, 4) of a random plane after `dsp`'s transform of `coeff`, and the coefficients it leaves.
     fn run(
         dsp: &Rav1dInvTxfmDSPContext,
         tx: TxfmSize,
@@ -887,7 +905,7 @@ mod tests {
         dsp.itxfm_add[tx as usize][t as usize].call::<BitDepth8>(
             WithOffset {
                 data: &comp,
-                offset: 4 * STRIDE + 8,
+                offset: 4 * STRIDE + BX,
             },
             &mut coeff,
             eob,
@@ -939,6 +957,11 @@ mod tests {
         simd_matches_scalar(TxfmSize::S8x8, 8, 8);
     }
 
+    #[test]
+    fn simd_16x16_matches_scalar() {
+        simd_matches_scalar(TxfmSize::S16x16, 16, 16);
+    }
+
     /// ns per call of a size's DCT_DCT and ADST_ADST with a full block, scalar, Rust SIMD and asm.
     #[test]
     #[ignore]
@@ -973,7 +996,7 @@ mod tests {
             *b = rng.next() as u8;
         }
         let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
-        for (tx, w, h) in [(TxfmSize::S8x8, 8, 8)] {
+        for (tx, w, h) in [(TxfmSize::S8x8, 8, 8), (TxfmSize::S16x16, 16, 16)] {
             for t in [DCT_DCT, ADST_ADST] {
                 let coeff: Vec<i16> = (0..w * h)
                     .map(|_| (rng.next() % 1024) as i16 - 512)
@@ -988,14 +1011,14 @@ mod tests {
                     let c = c.as_mut_slice();
                     let mut best = f64::MAX;
                     for _ in 0..20 {
-                        let n = 2000;
+                        let n = 16000 / (w * h);
                         let start = Instant::now();
                         for _ in 0..n {
                             c.copy_from_slice(&coeff);
                             f.call::<BitDepth8>(
                                 WithOffset {
                                     data: &comp,
-                                    offset: 4 * STRIDE + 8,
+                                    offset: 4 * STRIDE + BX,
                                 },
                                 black_box(&mut *c),
                                 eob,

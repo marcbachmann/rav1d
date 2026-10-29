@@ -52,6 +52,13 @@ impl I16x8 {
         }
     }
 
+    /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
+    /// in 32 bits, each result saturated to `i16`.
+    #[inline(always)]
+    pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+        self.madd2(o, [c1, -c2], [c2, c1])
+    }
+
     /// `v[i]` lane `j` becomes `v[j]` lane `i`: three rounds of interleaves, 24 shuffles.
     #[inline(always)]
     pub fn transpose8x8(v: &mut [Self; 8]) {
@@ -289,28 +296,27 @@ mod imp {
             Self(unsafe { _mm_mulhrs_epi16(self.0, o.0) })
         }
 
-        /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
-        /// in 32 bits, each result saturated to `i16`.
+        /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
+        /// saturated to `i16`.
         #[inline(always)]
-        pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+        pub fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
             let pair =
-                |lo: i16, hi: i16| unsafe { _mm_set1_epi32(lo as u16 as i32 | (hi as i32) << 16) };
-            let (k1, k2, rnd) = (pair(c1, c2.wrapping_neg()), pair(c2, c1), unsafe {
-                _mm_set1_epi32(2048)
-            });
+                |k: [i16; 2]| unsafe { _mm_set1_epi32(k[0] as u16 as i32 | (k[1] as i32) << 16) };
+            let rnd = unsafe { _mm_set1_epi32(2048) };
             let (lo, hi) = unsafe {
                 (
                     _mm_unpacklo_epi16(self.0, o.0),
                     _mm_unpackhi_epi16(self.0, o.0),
                 )
             };
-            let mul = |k| unsafe {
-                _mm_packs_epi32(
+            let madd = |k| unsafe {
+                let k = pair(k);
+                Self(_mm_packs_epi32(
                     _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(lo, k), rnd)),
                     _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(hi, k), rnd)),
-                )
+                ))
             };
-            (Self(mul(k1)), Self(mul(k2)))
+            (madd(k1), madd(k2))
         }
 
         #[inline(always)]
@@ -567,23 +573,21 @@ mod imp {
             Self(unsafe { vqrdmulhq_s16(self.0, o.0) })
         }
 
-        /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
-        /// in 32 bits, each result saturated to `i16`.
+        /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
+        /// saturated to `i16`.
         #[inline(always)]
-        pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+        pub fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
             unsafe {
                 let (a_lo, a_hi) = (vget_low_s16(self.0), vget_high_s16(self.0));
                 let (b_lo, b_hi) = (vget_low_s16(o.0), vget_high_s16(o.0));
-                let (c1, c2) = (vdup_n_s16(c1), vdup_n_s16(c2));
-                let first = vcombine_s16(
-                    vqrshrn_n_s32::<12>(vmlsl_s16(vmull_s16(a_lo, c1), b_lo, c2)),
-                    vqrshrn_n_s32::<12>(vmlsl_s16(vmull_s16(a_hi, c1), b_hi, c2)),
-                );
-                let second = vcombine_s16(
-                    vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_lo, c2), b_lo, c1)),
-                    vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_hi, c2), b_hi, c1)),
-                );
-                (Self(first), Self(second))
+                let madd = |k: [i16; 2]| {
+                    let (ka, kb) = (vdup_n_s16(k[0]), vdup_n_s16(k[1]));
+                    Self(vcombine_s16(
+                        vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_lo, ka), b_lo, kb)),
+                        vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_hi, ka), b_hi, kb)),
+                    ))
+                };
+                (madd(k1), madd(k2))
             }
         }
 
@@ -845,43 +849,27 @@ mod imp {
             Self(i16x8_q15mulr_sat(self.0, o.0))
         }
 
-        /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
-        /// in 32 bits, each result saturated to `i16`.
+        /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
+        /// saturated to `i16`.
         #[inline(always)]
-        pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
-            let (c1, c2, rnd) = (i16x8_splat(c1), i16x8_splat(c2), i32x4_splat(2048));
-            let first = |lo: bool| {
-                let (a, b) = if lo {
-                    (
-                        i32x4_extmul_low_i16x8(self.0, c1),
-                        i32x4_extmul_low_i16x8(o.0, c2),
-                    )
-                } else {
-                    (
-                        i32x4_extmul_high_i16x8(self.0, c1),
-                        i32x4_extmul_high_i16x8(o.0, c2),
-                    )
-                };
-                i32x4_shr(i32x4_add(i32x4_sub(a, b), rnd), 12)
+        pub fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
+            let rnd = i32x4_splat(2048);
+            let madd = |k: [i16; 2]| {
+                let (ka, kb) = (i16x8_splat(k[0]), i16x8_splat(k[1]));
+                let lo = i32x4_add(
+                    i32x4_extmul_low_i16x8(self.0, ka),
+                    i32x4_extmul_low_i16x8(o.0, kb),
+                );
+                let hi = i32x4_add(
+                    i32x4_extmul_high_i16x8(self.0, ka),
+                    i32x4_extmul_high_i16x8(o.0, kb),
+                );
+                Self(i16x8_narrow_i32x4(
+                    i32x4_shr(i32x4_add(lo, rnd), 12),
+                    i32x4_shr(i32x4_add(hi, rnd), 12),
+                ))
             };
-            let second = |lo: bool| {
-                let (a, b) = if lo {
-                    (
-                        i32x4_extmul_low_i16x8(self.0, c2),
-                        i32x4_extmul_low_i16x8(o.0, c1),
-                    )
-                } else {
-                    (
-                        i32x4_extmul_high_i16x8(self.0, c2),
-                        i32x4_extmul_high_i16x8(o.0, c1),
-                    )
-                };
-                i32x4_shr(i32x4_add(i32x4_add(a, b), rnd), 12)
-            };
-            (
-                Self(i16x8_narrow_i32x4(first(true), first(false))),
-                Self(i16x8_narrow_i32x4(second(true), second(false))),
-            )
+            (madd(k1), madd(k2))
         }
 
         #[inline(always)]
@@ -1126,16 +1114,17 @@ mod imp {
             self.zip(o, |a, b| ((a as i32 * b as i32 + 0x4000) >> 15) as i16)
         }
 
-        /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
-        /// in 32 bits, each result saturated to `i16`.
+        /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
+        /// saturated to `i16`.
         #[inline(always)]
-        pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
-            let (c1, c2) = (c1 as i32, c2 as i32);
-            let sat = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            (
-                self.zip(o, |a, b| sat(a as i32 * c1 - b as i32 * c2 + 2048 >> 12)),
-                self.zip(o, |a, b| sat(a as i32 * c2 + b as i32 * c1 + 2048 >> 12)),
-            )
+        pub fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
+            let madd = |k: [i16; 2]| {
+                self.zip(o, |a, b| {
+                    (a as i32 * k[0] as i32 + b as i32 * k[1] as i32 + 2048 >> 12)
+                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16
+                })
+            };
+            (madd(k1), madd(k2))
         }
 
         #[inline(always)]
