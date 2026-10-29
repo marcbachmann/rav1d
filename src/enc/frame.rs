@@ -2082,6 +2082,8 @@ impl<D: Decide> Encoder<D> {
                         continue;
                     }
                 }
+            }
+            if matches!(bp, H | V) && halves == Halves::Both && self.rect >= 1 {
                 if split_cost < self.rect_ratio * none_cost {
                     if !self.rect_adaptive {
                         continue;
