@@ -128,7 +128,9 @@ pub struct Options {
     pub skip_prediction: bool,
     /// libaom's `cfl_search_range` 3 and its chroma angle search: each chroma plane's CfL alpha
     /// and the chroma angle delta are searched outward from 0 while the cost falls, instead of
-    /// over every value.
+    /// over every value. Photos over 512×512 take it at efforts 4-5 (a native one codes in 75-84%
+    /// of the time, a 1600 px one in 85-93%, within 0.01 dB at equal bytes); a 800×213 posterised
+    /// picture lost 0.15-0.24 dB, so small pictures and screen content search every value.
     pub uv_outward: bool,
     /// Horizontal and vertical partitions are skipped where Split's cost is under this share of
     /// None's: they win where the two are close. A native-size photo at Q90 spent 44% of its
@@ -180,7 +182,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && (!fine || !screen && pixels > 512 * 512), reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: false, rect_ratio: if (4..=5).contains(&effort) { 0.9 } else { 0.0 }, rect_adaptive: true, fast_cdef: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && (!fine || !screen && pixels > 512 * 512), reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: effort <= 5 && !screen && pixels > 512 * 512, rect_ratio: if (4..=5).contains(&effort) { 0.9 } else { 0.0 }, rect_adaptive: true, fast_cdef: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
     }
 }
 
