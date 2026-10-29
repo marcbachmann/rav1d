@@ -73,6 +73,8 @@ pub trait Lanes: Copy {
     fn select(m: Self, a: Self, b: Self) -> Self;
     fn and(self, o: Self) -> Self;
     fn eq(self, o: Self) -> Self;
+    /// Whether any lane is set.
+    fn any(self) -> bool;
     /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
     /// saturated to `i16`.
     fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self);
@@ -124,6 +126,10 @@ macro_rules! forward_lanes {
             #[inline(always)]
             fn add(self, o: Self) -> Self {
                 <$t>::add(self, o)
+            }
+            #[inline(always)]
+            fn any(self) -> bool {
+                <$t>::any(self)
             }
             #[inline(always)]
             fn sub(self, o: Self) -> Self {
@@ -346,6 +352,11 @@ mod wide {
         #[inline(always)]
         pub fn and(self, o: Self) -> Self {
             Self(unsafe { _mm256_and_si256(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { _mm256_movemask_epi8(self.0) != 0 }
         }
 
         #[inline(always)]
@@ -609,6 +620,12 @@ mod imp {
         #[inline(always)]
         pub fn first_set(self) -> u32 {
             (unsafe { _mm_movemask_epi8(self.0) } as u32 | 1 << 16).trailing_zeros() / 2
+        }
+
+        /// Whether any lane is set.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { _mm_movemask_epi8(self.0) != 0 }
         }
 
         /// The first set lane of the masks `self` then `o`, 16 if none is.
@@ -937,6 +954,12 @@ mod imp {
             let v = unsafe { vreinterpretq_u64_s16(self.0) };
             let (lo, hi) = unsafe { (vgetq_lane_u64::<0>(v), vgetq_lane_u64::<1>(v)) };
             lo as u128 | (hi as u128) << 64
+        }
+
+        /// Whether any lane is set.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { vmaxvq_u16(u(self.0)) != 0 }
         }
 
         /// The first set lane of the masks `self` then `o`, 16 if none is.
@@ -1272,6 +1295,12 @@ mod imp {
             (i16x8_bitmask(self.0) as u32 | 1 << 8).trailing_zeros()
         }
 
+        /// Whether any lane is set.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            v128_any_true(self.0)
+        }
+
         /// The first set lane of the masks `self` then `o`, 16 if none is.
         #[inline(always)]
         pub fn first_set2(self, o: Self) -> u32 {
@@ -1592,6 +1621,12 @@ mod imp {
         #[inline(always)]
         pub fn first_set(self) -> u32 {
             self.0.iter().position(|&m| m != 0).unwrap_or(8) as u32
+        }
+
+        /// Whether any lane is set.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            self.0.iter().any(|&m| m != 0)
         }
 
         /// The first set lane of the masks `self` then `o`, 16 if none is.

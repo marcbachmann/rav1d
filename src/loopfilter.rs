@@ -493,6 +493,10 @@ mod rust_simd {
             let c = le(absdiff(p3, p2), p.i).and(le(absdiff(q3, q2), p.i));
             fm = fm.and(V::select(p.gt6, c, ones));
         }
+        // As the asm, each step only where some lane takes it.
+        if !fm.any() {
+            return;
+        }
 
         let hev = le(absdiff(p1, p0), p.h)
             .and(le(absdiff(q1, q0), p.h))
@@ -524,6 +528,9 @@ mod rust_simd {
         let mut out = orig;
         if MAX == 6 {
             let m = flat_in.and(p.gt4);
+            if !m.any() {
+                return;
+            }
             flat6(&orig, &mut out);
             for k in 5..=8 {
                 px[k] = V::select(m, out[k], px[k]);
@@ -531,11 +538,14 @@ mod rust_simd {
             return;
         }
         let m = flat_in.and(p.gt6);
+        if !m.any() {
+            return;
+        }
         flat8(&orig, &mut out);
         for k in 4..=9 {
             px[k] = V::select(m, out[k], px[k]);
         }
-        if MAX == 16 {
+        if MAX == 16 && flat_in.and(p.wd16).any() {
             let flat_out = le(absdiff(p6, p0), one)
                 .and(le(absdiff(p5, p0), one))
                 .and(le(absdiff(p4, p0), one))
