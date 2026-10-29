@@ -711,9 +711,14 @@ fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
     let mut tok = 3;
     loop {
         let c = I16x8::splat_lo((dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
-        let r = I16x8::splat_lo((rng & 0xff00) as u16 as i16);
         let p = cdfv.and(I16x8::splat(-64));
-        let v = p.add(p).mulhi_u(r).add(min_probs);
+        #[cfg(not(target_arch = "aarch64"))]
+        let scaled = p.add(p).mulhi_u(I16x8::splat_lo((rng & 0xff00) as u16 as i16));
+        // The doubling multiply-high of `rng >> 8` less 128, as in the symbol decoder: one
+        // multiply on the path `rng` carries from one symbol to the next.
+        #[cfg(target_arch = "aarch64")]
+        let scaled = p.add(p.qdmulh(I16x8::splat((rng & 0x7f00) as u16 as i16)));
+        let v = scaled.add(min_probs);
         let mut bounds = [0; 10];
         bounds[0] = rng as u16 as i16;
         v.store(&mut bounds[1..]);
