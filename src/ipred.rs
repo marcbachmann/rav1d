@@ -3452,8 +3452,8 @@ mod tests {
             for (w, h) in SIZES {
                 for angle in ANGLES {
                     let mode = match angle {
-                        ..90 => Z1_PRED,
-                        91..180 => Z2_PRED,
+                        ..=89 => Z1_PRED,
+                        91..=179 => Z2_PRED,
                         181.. => Z3_PRED,
                         _ => continue,
                     };
