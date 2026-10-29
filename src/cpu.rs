@@ -108,12 +108,7 @@ impl CpuFlags {
         combined_flags
     }
 
-    #[cfg(not(feature = "asm"))]
-    pub fn run_time_detect() -> Self {
-        Self::empty()
-    }
-
-    #[cfg(feature = "asm")]
+    /// Detected with or without the `asm` feature: the encoder's intrinsics read these too.
     pub fn run_time_detect() -> Self {
         let mut flags = Self::empty();
 
