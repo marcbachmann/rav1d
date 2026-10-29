@@ -205,14 +205,15 @@ impl Options {
     }
 
     /// libaom's shortcuts from cpu-used 5 that cost AVIF gates at effort 4, for speed: partitions
-    /// pruned by its intra CNN, no 8×8 blocks above qindex 100, luma modes pre-ranked by SATD
-    /// above qindex 64, CfL alphas searched outward and the CDEF picks of cpu-used 5; and H and V
-    /// partitions only where Split beat None by under 5%. At qindex 64 and below the pre-ranking
-    /// cost a native-size photo crop 1.1 dB at Q90.
+    /// pruned by its intra CNN, luma modes pre-ranked by SATD above qindex 64, CfL alphas searched
+    /// outward and the CDEF picks of cpu-used 5; and H and V partitions only where Split beat None
+    /// by under 5%. At qindex 64 and below the pre-ranking cost a native-size photo crop 1.1 dB at
+    /// Q90. The 8×8 blocks are left to the learnt prune of `split8_adaptive`: the static cut above
+    /// qindex 100 it had cost two strips, a small JPEG and a product on white their gates, for
+    /// 2-7% of a photo's time at Q25-Q50.
     pub fn fast(self) -> Self {
-        let levels = if self.qidx > 100 { self.levels.start..self.levels.end.min(3) } else { self.levels.clone() };
         let rank_pre = if self.qidx > 64 { 6 } else { self.rank_pre };
-        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre, uv_outward: true, rect_ratio: 0.95, rect_adaptive: false, split8_adaptive: false, fast_cdef: true, ..self }
+        Self { cnn_prune: if self.screen { 1 } else { 2 }, rank_pre, uv_outward: true, rect_ratio: 0.95, rect_adaptive: false, fast_cdef: true, ..self }
     }
 }
 
