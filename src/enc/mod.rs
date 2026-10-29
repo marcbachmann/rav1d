@@ -166,6 +166,12 @@ pub struct Options {
     /// secondaries of 0, 2. Deblocking levels stay searched: taken from the qindex as libaom's
     /// `LPF_PICK_FROM_Q` they cost a native-size photo crop 0.86 dB at Q90 for 1% of the time.
     pub fast_cdef: bool,
+    /// The CNN prune and a static `rect_ratio` leave alone blocks that hold flat 4×4 areas over a
+    /// quarter of them beside a hard edge, or are smooth throughout, as drawn graphics and
+    /// gradients are: the CNN, trained on natural content, pruned the splits such blocks need
+    /// (an illustration 1-2 dB, a colour wheel 1 dB, a gradient test pattern 1.9 dB below the
+    /// full search at equal bytes), where photos have few such blocks and keep the speed.
+    pub graphic_guard: bool,
     /// libaom's tune-IQ filters: no CDEF up to qindex 32 (`CDEF_ADAPTIVE`), deblocking sharpness
     /// 7 up to qindex 112 and 1 up to 160 (adaptive sharpness).
     pub iq_filters: bool,
@@ -199,7 +205,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && (!fine || !screen && pixels > 512 * 512), reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: !screen && pixels > 512 * 512, rect_ratio: if effort >= 4 { 0.9 } else { 0.0 }, rect_adaptive: true, split8_adaptive: effort <= 5 && pixels > 512 * 512, fast_cdef: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && (!fine || !screen && pixels > 512 * 512), reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: !screen && pixels > 512 * 512, rect_ratio: if effort >= 4 { 0.9 } else { 0.0 }, rect_adaptive: true, split8_adaptive: effort <= 5 && pixels > 512 * 512, fast_cdef: false, graphic_guard: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
     }
 }
 
@@ -210,15 +216,17 @@ impl Options {
     }
 
     /// libaom's shortcuts from cpu-used 5 that cost AVIF gates at effort 4, for speed: partitions
-    /// pruned by its intra CNN, luma modes pre-ranked by SATD above qindex 64, CfL alphas searched
-    /// outward and the CDEF picks of cpu-used 5; and H and V partitions only where Split beat None
-    /// by under 5%. At qindex 64 and below the pre-ranking cost a native-size photo crop 1.1 dB at
+    /// pruned by its intra CNN outside drawn blocks (`graphic_guard`), luma modes pre-ranked by
+    /// SATD above qindex 64 and the CDEF picks of cpu-used 5; and H and V partitions only where
+    /// Split beat None by under 5%. CfL alphas are searched outward where the full search does
+    /// (photos over 512²): on text over a gradient everywhere it coded 25% under the full
+    /// search's bytes at the same quality, off the quality scale. At qindex 64 and below the pre-ranking cost a native-size photo crop 1.1 dB at
     /// Q90. The 8×8 blocks are left to the learnt prune of `split8_adaptive`: the static cut above
     /// qindex 100 it had cost two strips, a small JPEG and a product on white their gates, for
     /// 2-7% of a photo's time at Q25-Q50.
     pub fn fast(self) -> Self {
         let rank_pre = if self.qidx > 64 { 6 } else { self.rank_pre };
-        Self { cnn_prune: if self.screen { 1 } else { 2 }, rank_pre, uv_outward: true, rect_ratio: 0.95, rect_adaptive: false, fast_cdef: true, ..self }
+        Self { cnn_prune: if self.screen { 1 } else { 2 }, rank_pre, rect_ratio: 0.95, rect_adaptive: false, fast_cdef: true, graphic_guard: true, ..self }
     }
 }
 
@@ -388,6 +396,7 @@ pub(crate) fn encoder(width: u32, height: u32, planes: &[&[u8]], options: &Optio
     e.skip_prediction = options.skip_prediction;
     e.uv_outward = options.uv_outward;
     e.fast_cdef = options.fast_cdef;
+    e.graphic_guard = options.graphic_guard;
     e.rect_ratio = options.rect_ratio;
     e.rect_adaptive = options.rect_adaptive;
     e.split8_adaptive = options.split8_adaptive;

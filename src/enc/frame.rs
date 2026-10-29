@@ -518,6 +518,8 @@ pub struct Encoder<D: Decide> {
     pub rect_seen: [[(u32, u32, f64, f64, u32); 4]; 5],
     /// See `Options::fast_cdef`.
     pub fast_cdef: bool,
+    /// See `Options::graphic_guard`.
+    pub graphic_guard: bool,
     /// The superblock's 16×16 blocks' factors over `ssim_reference`, and its λ before them.
     ssim: [f64; 16],
     sb_lambda: f64,
@@ -671,6 +673,7 @@ impl<D: Decide> Encoder<D> {
             split_seen: [(0, 0, 0.0, 0.0, 0); 4],
             rect_seen: [[(0, 0, 0.0, 0.0, 0); 4]; 5],
             fast_cdef: false,
+            graphic_guard: false,
             ssim: [1.0; 16],
             sb_lambda: 1.0,
 
@@ -1703,6 +1706,35 @@ impl<D: Decide> Encoder<D> {
         err as f64 / 64.0 + self.lambda * c.bits as f64 / 512.0
     }
 
+    /// Whether a luma block is drawn rather than photographed: flat 4×4 areas (variance under
+    /// 0.5) over a quarter of it beside a hard edge (a 4×4 area of variance over 16), or smooth
+    /// throughout (every 4×4 area under 16), as gradients are.
+    fn graphic_block(&self, x: i32, y: i32, n4: usize) -> bool {
+        let w = cmp::min(n4 * 4, (self.seq.width as usize).saturating_sub(x as usize * 4)) & !3;
+        let h = cmp::min(n4 * 4, (self.seq.height as usize).saturating_sub(y as usize * 4)) & !3;
+        if w == 0 || h == 0 {
+            return false;
+        }
+        let px = self.source(0, x, y, w, h);
+        let (mut flat, mut most) = (0, 0i64);
+        for by in (0..h).step_by(4) {
+            for bx in (0..w).step_by(4) {
+                let (mut s, mut q) = (0i64, 0i64);
+                for row in px[by * w + bx..].chunks(w).take(4) {
+                    for &p in &row[..4] {
+                        s += p as i64;
+                        q += p as i64 * p as i64;
+                    }
+                }
+                // 16 × 16 × the variance.
+                let v = 16 * q - s * s;
+                flat += (v < 128) as usize;
+                most = most.max(v);
+            }
+        }
+        most < 4096 || flat * 64 >= w * h
+    }
+
     /// Which of four activity classes a 16×16 luma block at `(x, y)` (in 4-pixel units) belongs
     /// to, by its variance: under 4, 32, 256, and above.
     fn activity_bucket(&self, x: i32, y: i32, n4: usize) -> usize {
@@ -2071,6 +2103,9 @@ impl<D: Decide> Encoder<D> {
             }
             _ => Prune::default(),
         };
+        let mut graphic = Option::None;
+        let mut is_graphic = |e: &Self| *graphic.get_or_insert_with(|| e.graphic_block(x, y, n4));
+        let cnn = if self.graphic_guard && (cnn.none || cnn.split || cnn.rect) && is_graphic(self) { Prune::default() } else { cnn };
         // The best candidate's pixels and contexts are snapped only when a later candidate is
         // about to overwrite them; a best left in place needs neither the snap nor the restore.
         let mut best: Option<(f64, u32, Option<Snap>, Vec<Node>)> = Option::None;
@@ -2113,7 +2148,7 @@ impl<D: Decide> Encoder<D> {
                 }
             }
             if matches!(bp, H | V) && halves == Halves::Both && self.rect >= 1 {
-                if split_cost < self.rect_ratio * none_cost {
+                if split_cost < self.rect_ratio * none_cost && !(self.graphic_guard && !self.rect_adaptive && is_graphic(self)) {
                     if !self.rect_adaptive {
                         continue;
                     }
@@ -3912,6 +3947,7 @@ pub(crate) mod tests {
             rect_ratio: std::env::var("ENC_RECT_RATIO").map_or(0.0, |v| v.parse().unwrap()),
             rect_adaptive: std::env::var("ENC_RECT_ADAPTIVE").map_or(true, |v| v != "0"),
             split8_adaptive: std::env::var("ENC_SPLIT8").is_ok_and(|v| v == "1"),
+            graphic_guard: false,
             fast_cdef: std::env::var("ENC_FAST_CDEF").is_ok_and(|v| v == "1"),
             tile_cols_log2: std::env::var("ENC_TILES").map_or(1, |v| v.parse().unwrap()),
         };
