@@ -272,6 +272,7 @@ unsafe extern "C" fn inv_txfm_add_simd_erased<
     const TYPE: TxfmType,
     BD: BitDepth,
     const G: usize,
+    const WIDE: bool,
 >(
     _dst_ptr: *mut DynPixel,
     _stride: isize,
@@ -304,8 +305,13 @@ unsafe extern "C" fn inv_txfm_add_simd_erased<
             return inv_txfm_add_rust::<W, H, TYPE, BD>(dst, coeff, eob, bd);
         }
     }
-    // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+    // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86, and AVX2 before `WIDE` is;
+    // elsewhere it is safe.
     unsafe {
+        #[cfg(target_arch = "x86_64")]
+        if WIDE {
+            return itx_simd::add_avx2::<BD, W, H, TYPE, G>(dst, coeff, eob);
+        }
         match (W, H) {
             (4, 4)
             | (4, 8)
@@ -819,17 +825,26 @@ impl Rav1dInvTxfmDSPContext {
         if !flags.contains(CpuFlags::SSE41) {
             return self;
         }
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = flags.contains(CpuFlags::AVX2);
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx2 = false;
         let _ = flags;
         if !crate::simd128::native() || BD::BITDEPTH != 8 {
             return self;
         }
 
+        // Sixteen lanes on AVX2 where a side reaches 16.
         macro_rules! assign {
             ($w:literal, $h:literal, $($type:ident),*) => {{
                 let tx = TxfmSize::from_wh($w, $h) as usize;
+                let wide = avx2 && ($w >= 16 || $h >= 16);
                 $(
-                    self.itxfm_add[tx][$type as usize] =
-                        itxfm::Fn::new(inv_txfm_add_simd_erased::<$w, $h, $type, BD, { ($w + 7) / 8 }>);
+                    self.itxfm_add[tx][$type as usize] = if wide {
+                        itxfm::Fn::new(inv_txfm_add_simd_erased::<$w, $h, $type, BD, { ($w + 7) / 8 }, true>)
+                    } else {
+                        itxfm::Fn::new(inv_txfm_add_simd_erased::<$w, $h, $type, BD, { ($w + 7) / 8 }, false>)
+                    };
                 )*
             }};
         }
@@ -1105,14 +1120,32 @@ mod tests {
         (buf.as_slice().to_vec(), c.as_slice().to_vec())
     }
 
+    /// The Rust SIMD kernels at every width the CPU has: 128-bit, and on x86_64 also AVX2.
+    fn simd_contexts() -> Vec<(&'static str, Rav1dInvTxfmDSPContext)> {
+        rav1d_init_cpu();
+        let flags = rav1d_get_cpu_flags();
+        let ctx = |flags| {
+            Rav1dInvTxfmDSPContext::default::<BitDepth8>().init_rust_simd::<BitDepth8>(flags)
+        };
+        #[allow(unused_mut)]
+        let mut out = vec![("rust simd", ctx(flags))];
+        #[cfg(target_arch = "x86_64")]
+        if flags.contains(CpuFlags::AVX2) {
+            out.push((
+                "rust 128",
+                ctx(flags.difference(CpuFlags::AVX2 | CpuFlags::AVX512ICL)),
+            ));
+        }
+        out
+    }
+
     /// Every type of a size on random coefficients and pixels, against the scalar transform;
     /// `eob` 0 takes the DC path. Across the whole `i16` range the C's 32-bit intermediates and
     /// the asm's saturating 16-bit ones part, and the conformance md5 is the oracle there.
     fn simd_matches_scalar(tx: TxfmSize, w: usize, h: usize) {
         rav1d_init_cpu();
         let scalar = Rav1dInvTxfmDSPContext::default::<BitDepth8>();
-        let simd = Rav1dInvTxfmDSPContext::default::<BitDepth8>()
-            .init_rust_simd::<BitDepth8>(rav1d_get_cpu_flags());
+        let simds = simd_contexts();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         for t in 0..N_TX_TYPES_PLUS_LL as TxfmType - 1 {
             if *scalar.itxfm_add[tx as usize][t as usize].get() as usize
@@ -1147,8 +1180,10 @@ mod tests {
                 coeff[0] = ((rng.next() % (2 * range + 1) as u32) as i32 - range as i32) as i16;
                 let orig: Vec<u8> = (0..STRIDE * ROWS).map(|_| rng.next() as u8).collect();
                 let want = run(&scalar, tx, t, &orig, &coeff, eob);
-                let got = run(&simd, tx, t, &orig, &coeff, eob);
-                assert_eq!(got, want, "{w}x{h} type {t} eob {eob}");
+                for (name, simd) in &simds {
+                    let got = run(simd, tx, t, &orig, &coeff, eob);
+                    assert_eq!(got, want, "{w}x{h} type {t} eob {eob} {name}");
+                }
             }
         }
     }
@@ -1159,8 +1194,6 @@ mod tests {
     fn identity4_rows_round_without_overflow() {
         rav1d_init_cpu();
         let scalar = Rav1dInvTxfmDSPContext::default::<BitDepth8>();
-        let simd = Rav1dInvTxfmDSPContext::default::<BitDepth8>()
-            .init_rust_simd::<BitDepth8>(rav1d_get_cpu_flags());
         // Column 0: rows 0 and 1 overflow and their column DCT cancels to an in-range pixel near
         // row 3; column 1: a lone -1, which must stay 0.
         let mut coeff = vec![0i16; 64];
@@ -1169,8 +1202,10 @@ mod tests {
         coeff[16 + 2] = -1;
         let orig = vec![128u8; STRIDE * ROWS];
         let want = run(&scalar, TxfmSize::R4x16, V_DCT, &orig, &coeff, 16);
-        let got = run(&simd, TxfmSize::R4x16, V_DCT, &orig, &coeff, 16);
-        assert_eq!(got, want);
+        for (name, simd) in &simd_contexts() {
+            let got = run(simd, TxfmSize::R4x16, V_DCT, &orig, &coeff, 16);
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]
@@ -1278,13 +1313,8 @@ mod tests {
         rav1d_init_cpu();
         let flags = rav1d_get_cpu_flags();
         #[allow(unused_mut)]
-        let mut dsps = vec![
-            ("scalar", Rav1dInvTxfmDSPContext::default::<BitDepth8>()),
-            (
-                "rust simd",
-                Rav1dInvTxfmDSPContext::default::<BitDepth8>().init_rust_simd::<BitDepth8>(flags),
-            ),
-        ];
+        let mut dsps = vec![("scalar", Rav1dInvTxfmDSPContext::default::<BitDepth8>())];
+        dsps.extend(simd_contexts());
         #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
         dsps.push((
             "asm",
@@ -1301,6 +1331,7 @@ mod tests {
             "asm",
             Rav1dInvTxfmDSPContext::default::<BitDepth8>().init_arm::<BitDepth8>(flags, 8),
         ));
+        let _ = flags;
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         let mut buf = AlignedVec64::<u8>::new();
         buf.resize(STRIDE * ROWS, 0);

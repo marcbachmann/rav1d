@@ -51,40 +51,322 @@ impl I16x8 {
             self.xor(m).sub(m)
         }
     }
+}
+
+/// The lane operations the transforms take, for [`I16x8`] on every target and, on x86_64 with
+/// AVX2, [`I16x16`]: one kernel source for both widths.
+pub trait Lanes: Copy {
+    fn splat(v: i16) -> Self;
+    fn add_sat(self, o: Self) -> Self;
+    fn sub_sat(self, o: Self) -> Self;
+    /// `(a * b + 0x4000) >> 15`: a product in Q15 with rounding.
+    fn mulhrs(self, o: Self) -> Self;
+    /// The unsigned averages rounded up.
+    fn avg_u(self, o: Self) -> Self;
+    fn shr_s1(self) -> Self;
+    fn and(self, o: Self) -> Self;
+    fn eq(self, o: Self) -> Self;
+    /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
+    /// saturated to `i16`.
+    fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self);
+    /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.
+    fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self;
+    /// The interleaves, within each 128-bit half.
+    fn zip_lo16(self, o: Self) -> Self;
+    fn zip_hi16(self, o: Self) -> Self;
+    fn zip_lo32(self, o: Self) -> Self;
+    fn zip_hi32(self, o: Self) -> Self;
+    fn zip_lo64(self, o: Self) -> Self;
+    fn zip_hi64(self, o: Self) -> Self;
 
     /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
     /// in 32 bits, each result saturated to `i16`.
     #[inline(always)]
-    pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+    fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
         self.madd2(o, [c1, -c2], [c2, c1])
     }
+}
 
-    /// `v[i]` lane `j` becomes `v[j]` lane `i`: three rounds of interleaves, 24 shuffles.
-    #[inline(always)]
-    pub fn transpose8x8(v: &mut [Self; 8]) {
-        let a = [
-            v[0].zip_lo16(v[1]),
-            v[0].zip_hi16(v[1]),
-            v[2].zip_lo16(v[3]),
-            v[2].zip_hi16(v[3]),
-            v[4].zip_lo16(v[5]),
-            v[4].zip_hi16(v[5]),
-            v[6].zip_lo16(v[7]),
-            v[6].zip_hi16(v[7]),
-        ];
-        let b = [
-            a[0].zip_lo32(a[2]),
-            a[0].zip_hi32(a[2]),
-            a[1].zip_lo32(a[3]),
-            a[1].zip_hi32(a[3]),
-            a[4].zip_lo32(a[6]),
-            a[4].zip_hi32(a[6]),
-            a[5].zip_lo32(a[7]),
-            a[5].zip_hi32(a[7]),
-        ];
-        for i in 0..4 {
-            v[2 * i] = b[i].zip_lo64(b[i + 4]);
-            v[2 * i + 1] = b[i].zip_hi64(b[i + 4]);
+macro_rules! forward_lanes {
+    ($t:ty) => {
+        impl Lanes for $t {
+            #[inline(always)]
+            fn splat(v: i16) -> Self {
+                <$t>::splat(v)
+            }
+            #[inline(always)]
+            fn add_sat(self, o: Self) -> Self {
+                <$t>::add_sat(self, o)
+            }
+            #[inline(always)]
+            fn sub_sat(self, o: Self) -> Self {
+                <$t>::sub_sat(self, o)
+            }
+            #[inline(always)]
+            fn mulhrs(self, o: Self) -> Self {
+                <$t>::mulhrs(self, o)
+            }
+            #[inline(always)]
+            fn avg_u(self, o: Self) -> Self {
+                <$t>::avg_u(self, o)
+            }
+            #[inline(always)]
+            fn shr_s1(self) -> Self {
+                <$t>::shr_s::<1>(self)
+            }
+            #[inline(always)]
+            fn and(self, o: Self) -> Self {
+                <$t>::and(self, o)
+            }
+            #[inline(always)]
+            fn eq(self, o: Self) -> Self {
+                <$t>::eq(self, o)
+            }
+            #[inline(always)]
+            fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
+                <$t>::madd2(self, o, k1, k2)
+            }
+            #[inline(always)]
+            fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
+                <$t>::madd4(self, b, c, d, k)
+            }
+            #[inline(always)]
+            fn zip_lo16(self, o: Self) -> Self {
+                <$t>::zip_lo16(self, o)
+            }
+            #[inline(always)]
+            fn zip_hi16(self, o: Self) -> Self {
+                <$t>::zip_hi16(self, o)
+            }
+            #[inline(always)]
+            fn zip_lo32(self, o: Self) -> Self {
+                <$t>::zip_lo32(self, o)
+            }
+            #[inline(always)]
+            fn zip_hi32(self, o: Self) -> Self {
+                <$t>::zip_hi32(self, o)
+            }
+            #[inline(always)]
+            fn zip_lo64(self, o: Self) -> Self {
+                <$t>::zip_lo64(self, o)
+            }
+            #[inline(always)]
+            fn zip_hi64(self, o: Self) -> Self {
+                <$t>::zip_hi64(self, o)
+            }
+        }
+    };
+}
+
+forward_lanes!(I16x8);
+#[cfg(target_arch = "x86_64")]
+forward_lanes!(I16x16);
+
+/// `v[i]` lane `j` becomes `v[j]` lane `i` within each 128-bit half: three rounds of interleaves,
+/// 24 shuffles; [`I16x16`] turns two 8x8 blocks at once.
+#[inline(always)]
+pub fn transpose8x8<V: Lanes>(v: &mut [V; 8]) {
+    let a = [
+        v[0].zip_lo16(v[1]),
+        v[0].zip_hi16(v[1]),
+        v[2].zip_lo16(v[3]),
+        v[2].zip_hi16(v[3]),
+        v[4].zip_lo16(v[5]),
+        v[4].zip_hi16(v[5]),
+        v[6].zip_lo16(v[7]),
+        v[6].zip_hi16(v[7]),
+    ];
+    let b = [
+        a[0].zip_lo32(a[2]),
+        a[0].zip_hi32(a[2]),
+        a[1].zip_lo32(a[3]),
+        a[1].zip_hi32(a[3]),
+        a[4].zip_lo32(a[6]),
+        a[4].zip_hi32(a[6]),
+        a[5].zip_lo32(a[7]),
+        a[5].zip_hi32(a[7]),
+    ];
+    for i in 0..4 {
+        v[2 * i] = b[i].zip_lo64(b[i + 4]);
+        v[2 * i + 1] = b[i].zip_hi64(b[i + 4]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub use wide::I16x16;
+
+/// Sixteen `i16` lanes in one AVX2 register, entered only through a
+/// `#[target_feature(enable = "avx2")]` kernel chosen once the CPU flags hold AVX2.
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_unsafe)]
+mod wide {
+    use std::arch::x86_64::*;
+
+    use super::I16x8;
+
+    #[derive(Clone, Copy)]
+    pub struct I16x16(__m256i);
+
+    // SAFETY (every `unsafe` here): AVX2 holds where these are compiled in (see the type's docs),
+    // and loads and stores go through bounds-checked slices of 16 lanes.
+    impl I16x16 {
+        #[inline(always)]
+        pub fn load(s: &[i16]) -> Self {
+            Self(unsafe { _mm256_loadu_si256(s[..16].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [i16]) {
+            unsafe { _mm256_storeu_si256(d[..16].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn from_halves(lo: I16x8, hi: I16x8) -> Self {
+            Self(unsafe { _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo.0), hi.0) })
+        }
+
+        #[inline(always)]
+        pub fn lo(self) -> I16x8 {
+            I16x8(unsafe { _mm256_castsi256_si128(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn hi(self) -> I16x8 {
+            I16x8(unsafe { _mm256_extracti128_si256::<1>(self.0) })
+        }
+
+        /// Bytes `b[..16]` zero-extended.
+        #[inline(always)]
+        pub fn from_u8x16(b: &[u8]) -> Self {
+            Self(unsafe { _mm256_cvtepu8_epi16(_mm_loadu_si128(b[..16].as_ptr().cast())) })
+        }
+
+        /// The lanes saturated to `u8`.
+        #[inline(always)]
+        pub fn pack_u8(self) -> [u8; 16] {
+            let mut out = [0; 16];
+            unsafe {
+                let v = _mm_packus_epi16(self.lo().0, self.hi().0);
+                _mm_storeu_si128(out.as_mut_ptr().cast(), v);
+            }
+            out
+        }
+
+        #[inline(always)]
+        pub fn splat(v: i16) -> Self {
+            Self(unsafe { _mm256_set1_epi16(v) })
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(unsafe { _mm256_add_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            Self(unsafe { _mm256_adds_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub_sat(self, o: Self) -> Self {
+            Self(unsafe { _mm256_subs_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn mulhrs(self, o: Self) -> Self {
+            Self(unsafe { _mm256_mulhrs_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn avg_u(self, o: Self) -> Self {
+            Self(unsafe { _mm256_avg_epu16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn shr_s<const N: i32>(self) -> Self {
+            Self(unsafe { _mm256_srai_epi16::<N>(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            Self(unsafe { _mm256_and_si256(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            Self(unsafe { _mm256_cmpeq_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
+            unsafe {
+                let k1 = _mm256_set1_epi32(k1[0] as u16 as i32 | (k1[1] as i32) << 16);
+                let k2 = _mm256_set1_epi32(k2[0] as u16 as i32 | (k2[1] as i32) << 16);
+                let rnd = _mm256_set1_epi32(2048);
+                let lo = _mm256_unpacklo_epi16(self.0, o.0);
+                let hi = _mm256_unpackhi_epi16(self.0, o.0);
+                (
+                    Self(_mm256_packs_epi32(
+                        _mm256_srai_epi32::<12>(_mm256_add_epi32(_mm256_madd_epi16(lo, k1), rnd)),
+                        _mm256_srai_epi32::<12>(_mm256_add_epi32(_mm256_madd_epi16(hi, k1), rnd)),
+                    )),
+                    Self(_mm256_packs_epi32(
+                        _mm256_srai_epi32::<12>(_mm256_add_epi32(_mm256_madd_epi16(lo, k2), rnd)),
+                        _mm256_srai_epi32::<12>(_mm256_add_epi32(_mm256_madd_epi16(hi, k2), rnd)),
+                    )),
+                )
+            }
+        }
+
+        #[inline(always)]
+        pub fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
+            unsafe {
+                let k01 = _mm256_set1_epi32(k[0] as u16 as i32 | (k[1] as i32) << 16);
+                let k23 = _mm256_set1_epi32(k[2] as u16 as i32 | (k[3] as i32) << 16);
+                let rnd = _mm256_set1_epi32(2048);
+                let lo = _mm256_add_epi32(
+                    _mm256_madd_epi16(_mm256_unpacklo_epi16(self.0, b.0), k01),
+                    _mm256_madd_epi16(_mm256_unpacklo_epi16(c.0, d.0), k23),
+                );
+                let hi = _mm256_add_epi32(
+                    _mm256_madd_epi16(_mm256_unpackhi_epi16(self.0, b.0), k01),
+                    _mm256_madd_epi16(_mm256_unpackhi_epi16(c.0, d.0), k23),
+                );
+                Self(_mm256_packs_epi32(
+                    _mm256_srai_epi32::<12>(_mm256_add_epi32(lo, rnd)),
+                    _mm256_srai_epi32::<12>(_mm256_add_epi32(hi, rnd)),
+                ))
+            }
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpacklo_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpackhi_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpacklo_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpackhi_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpacklo_epi64(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpackhi_epi64(self.0, o.0) })
         }
     }
 }

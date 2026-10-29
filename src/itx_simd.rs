@@ -13,7 +13,7 @@ use crate::levels::{
     TxfmType, ADST_ADST, ADST_DCT, ADST_FLIPADST, DCT_ADST, DCT_DCT, DCT_FLIPADST, FLIPADST_ADST,
     FLIPADST_DCT, FLIPADST_FLIPADST, H_ADST, H_DCT, H_FLIPADST, IDTX, V_ADST, V_DCT, V_FLIPADST,
 };
-use crate::simd128::I16x8;
+use crate::simd128::{transpose8x8, I16x8, Lanes};
 use crate::strided::Strided as _;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,7 +89,7 @@ const fn round_mul(t: Tx1d, n: usize, shift: u32) -> i32 {
 }
 
 #[inline(always)]
-fn round<const N: usize>(v: &mut [I16x8; N], k: i32, negated: u32) {
+fn round<V: Lanes, const N: usize>(v: &mut [V; N], k: i32, negated: u32) {
     if k == 65536 {
         for x in v {
             *x = x.add_sat(*x);
@@ -97,7 +97,7 @@ fn round<const N: usize>(v: &mut [I16x8; N], k: i32, negated: u32) {
         return;
     }
     if k == 32768 {
-        let zero = I16x8::splat(0);
+        let zero = V::splat(0);
         for i in 0..N {
             if negated >> i & 1 != 0 {
                 v[i] = zero.sub_sat(v[i]);
@@ -105,14 +105,14 @@ fn round<const N: usize>(v: &mut [I16x8; N], k: i32, negated: u32) {
         }
         return;
     }
-    let (pos, neg) = (I16x8::splat(k as i16), I16x8::splat(-k as i16));
+    let (pos, neg) = (V::splat(k as i16), V::splat(-k as i16));
     for i in 0..N {
         v[i] = v[i].mulhrs(if negated >> i & 1 != 0 { neg } else { pos });
     }
 }
 
 #[inline(always)]
-fn dct4(v: &mut [I16x8; 4]) {
+fn dct4<V: Lanes>(v: &mut [V; 4]) {
     let (t1, t0) = v[0].rot(v[2], 2896, 2896);
     let (t2, t3) = v[1].rot(v[3], 1567, 3784);
     v[0] = t0.add_sat(t3);
@@ -123,7 +123,7 @@ fn dct4(v: &mut [I16x8; 4]) {
 
 /// Four-term sums in 32 bits, as the C has them; nothing comes out negated.
 #[inline(always)]
-fn adst4(v: &mut [I16x8; 4]) {
+fn adst4<V: Lanes>(v: &mut [V; 4]) {
     let [a, b, c, d] = *v;
     v[0] = a.madd4(b, c, d, [1321, 3344, 3803, 2482]);
     v[1] = a.madd4(b, c, d, [2482, 3344, -1321, -3803]);
@@ -135,9 +135,9 @@ fn adst4(v: &mut [I16x8; 4]) {
 /// it, an average that cannot overflow (`x` and the term share a sign, except at `x == -1`, whose
 /// result is 0).
 #[inline(always)]
-fn identity4(v: &mut [I16x8; 4], shift: u32) {
-    let k = I16x8::splat(1697 * 8);
-    let (minus_one, zero) = (I16x8::splat(-1), I16x8::splat(0));
+fn identity4<V: Lanes>(v: &mut [V; 4], shift: u32) {
+    let k = V::splat(1697 * 8);
+    let (minus_one, zero) = (V::splat(-1), V::splat(0));
     for x in v {
         let term = x.mulhrs(k);
         *x = if shift == 1 {
@@ -149,7 +149,7 @@ fn identity4(v: &mut [I16x8; 4], shift: u32) {
 }
 
 #[inline(always)]
-fn tx4(v: &mut [I16x8; 4], t: Tx1d, shift: u32) {
+fn tx4<V: Lanes>(v: &mut [V; 4], t: Tx1d, shift: u32) {
     match t {
         Dct => dct4(v),
         Adst => adst4(v),
@@ -163,19 +163,16 @@ fn tx4(v: &mut [I16x8; 4], t: Tx1d, shift: u32) {
 
 /// `(x * c1 + 2048 >> 12, x * c2 + 2048 >> 12)`: a rotation whose other input is zero.
 #[inline(always)]
-fn rot1(x: I16x8, c1: i16, c2: i16) -> (I16x8, I16x8) {
-    (
-        x.mulhrs(I16x8::splat(c1 * 8)),
-        x.mulhrs(I16x8::splat(c2 * 8)),
-    )
+fn rot1<V: Lanes>(x: V, c1: i16, c2: i16) -> (V, V) {
+    (x.mulhrs(V::splat(c1 * 8)), x.mulhrs(V::splat(c2 * 8)))
 }
 
 /// `HALF`: the upper half of the inputs is zero (the C's `tx64`), so the first rotations are
 /// single products.
 #[inline(always)]
-fn dct8<const HALF: bool>(v: &mut [I16x8; 8]) {
+fn dct8<V: Lanes, const HALF: bool>(v: &mut [V; 8]) {
     let (t1, t0) = if HALF {
-        let t = v[0].mulhrs(I16x8::splat(2896 * 8));
+        let t = v[0].mulhrs(V::splat(2896 * 8));
         (t, t)
     } else {
         v[0].rot(v[4], 2896, 2896)
@@ -217,9 +214,9 @@ fn dct8<const HALF: bool>(v: &mut [I16x8; 8]) {
 }
 
 #[inline(always)]
-fn dct16<const HALF: bool>(v: &mut [I16x8; 16]) {
+fn dct16<V: Lanes, const HALF: bool>(v: &mut [V; 16]) {
     let mut e = [v[0], v[2], v[4], v[6], v[8], v[10], v[12], v[14]];
-    dct8::<HALF>(&mut e);
+    dct8::<_, HALF>(&mut e);
 
     let ((t8a, t15a), (t9a, t14a), (t10a, t13a), (t11a, t12a)) = if HALF {
         (
@@ -269,9 +266,9 @@ fn dct16<const HALF: bool>(v: &mut [I16x8; 16]) {
 }
 
 #[inline(always)]
-fn dct32<const HALF: bool>(v: &mut [I16x8; 32]) {
-    let mut e: [I16x8; 16] = std::array::from_fn(|i| v[2 * i]);
-    dct16::<HALF>(&mut e);
+fn dct32<V: Lanes, const HALF: bool>(v: &mut [V; 32]) {
+    let mut e: [V; 16] = std::array::from_fn(|i| v[2 * i]);
+    dct16::<_, HALF>(&mut e);
 
     let (t16a, t31a, t17a, t30a, t18a, t29a, t19a, t28a);
     let (t20a, t27a, t21a, t26a, t22a, t25a, t23a, t24a);
@@ -372,9 +369,9 @@ fn dct32<const HALF: bool>(v: &mut [I16x8; 32]) {
 
 /// A 64-point DCT sees 32 coefficients, so its upper inputs are always zero.
 #[inline(always)]
-fn dct64(v: &mut [I16x8; 64]) {
-    let mut e: [I16x8; 32] = std::array::from_fn(|i| v[2 * i]);
-    dct32::<true>(&mut e);
+fn dct64<V: Lanes>(v: &mut [V; 64]) {
+    let mut e: [V; 32] = std::array::from_fn(|i| v[2 * i]);
+    dct32::<_, true>(&mut e);
 
     let (t32a, t63a) = rot1(v[1], 101, 4095);
     let (t33a, t62a) = rot1(v[31], -2824, 2967);
@@ -574,7 +571,7 @@ fn dct64(v: &mut [I16x8; 64]) {
 /// Outputs 1, 3, 5 and 7 come out negated. The last stage's `* 2896 >> 12` runs in 32 bits on
 /// the row pass and in 16 on the column pass, where the asm has the inputs small enough.
 #[inline(always)]
-fn adst8<const COLS: bool>(v: &mut [I16x8; 8]) {
+fn adst8<V: Lanes, const COLS: bool>(v: &mut [V; 8]) {
     let (t1a, t0a) = v[7].rot(v[0], 401, 4076);
     let (t3a, t2a) = v[5].rot(v[2], 1931, 3612);
     let (t5a, t4a) = v[3].rot(v[4], 3166, 2598);
@@ -601,15 +598,15 @@ fn adst8<const COLS: bool>(v: &mut [I16x8; 8]) {
     let t6 = t4a.sub_sat(t6a);
     let t7 = t5a.sub_sat(t7a);
 
-    (v[4], v[3]) = half_rot::<COLS>(t2, t3);
-    (v[5], v[2]) = half_rot::<COLS>(t6, t7);
+    (v[4], v[3]) = half_rot::<_, COLS>(t2, t3);
+    (v[5], v[2]) = half_rot::<_, COLS>(t6, t7);
 }
 
 /// `((a - b) * 2896 >> 12, (a + b) * 2896 >> 12)`: the adst's last stage.
 #[inline(always)]
-fn half_rot<const COLS: bool>(a: I16x8, b: I16x8) -> (I16x8, I16x8) {
+fn half_rot<V: Lanes, const COLS: bool>(a: V, b: V) -> (V, V) {
     if COLS {
-        let k = I16x8::splat(2896 * 8);
+        let k = V::splat(2896 * 8);
         (a.sub_sat(b).mulhrs(k), a.add_sat(b).mulhrs(k))
     } else {
         a.rot(b, 2896, 2896)
@@ -618,7 +615,7 @@ fn half_rot<const COLS: bool>(a: I16x8, b: I16x8) -> (I16x8, I16x8) {
 
 /// The odd outputs come out negated, as in [`adst8`].
 #[inline(always)]
-fn adst16<const COLS: bool>(v: &mut [I16x8; 16]) {
+fn adst16<V: Lanes, const COLS: bool>(v: &mut [V; 16]) {
     let (t1, t0) = v[15].rot(v[0], 201, 4091);
     let (t3, t2) = v[13].rot(v[2], 995, 3973);
     let (t5, t4) = v[11].rot(v[4], 1751, 3703);
@@ -689,35 +686,35 @@ fn adst16<const COLS: bool>(v: &mut [I16x8; 16]) {
     let t14a = t12.sub_sat(t14);
     let t15a = t13.sub_sat(t15);
 
-    (v[8], v[7]) = half_rot::<COLS>(t2a, t3a);
-    (v[11], v[4]) = half_rot::<COLS>(t6, t7);
-    (v[9], v[6]) = half_rot::<COLS>(t10, t11);
-    (v[10], v[5]) = half_rot::<COLS>(t14a, t15a);
+    (v[8], v[7]) = half_rot::<_, COLS>(t2a, t3a);
+    (v[11], v[4]) = half_rot::<_, COLS>(t6, t7);
+    (v[9], v[6]) = half_rot::<_, COLS>(t10, t11);
+    (v[10], v[5]) = half_rot::<_, COLS>(t14a, t15a);
 }
 
 /// `2 * x + (x * 1697 + 1024 >> 11)`, with the pass's rounding shift folded in before the
 /// picture: by 2 as an average of `x` and the half term (the same sign, so the unsigned average
 /// is exact), by 1 as `x + (term + 1 >> 1)`.
 #[inline(always)]
-fn identity16(v: &mut [I16x8; 16], shift: u32) {
-    let k = I16x8::splat(1697 * 16);
+fn identity16<V: Lanes>(v: &mut [V; 16], shift: u32) {
+    let k = V::splat(1697 * 16);
     for x in v {
         let term = x.mulhrs(k);
         *x = match shift {
-            1 => x.add_sat(term.mulhrs(I16x8::splat(16384))),
-            2 => x.avg_u(term.shr_s::<1>()),
+            1 => x.add_sat(term.mulhrs(V::splat(16384))),
+            2 => x.avg_u(term.shr_s1()),
             _ => x.add_sat(*x).add_sat(term),
         };
     }
 }
 
 #[inline(always)]
-fn tx8<const COLS: bool>(v: &mut [I16x8; 8], t: Tx1d) {
+fn tx8<V: Lanes, const COLS: bool>(v: &mut [V; 8], t: Tx1d) {
     match t {
-        Dct => dct8::<false>(v),
-        Adst => adst8::<COLS>(v),
+        Dct => dct8::<_, false>(v),
+        Adst => adst8::<_, COLS>(v),
         FlipAdst => {
-            adst8::<COLS>(v);
+            adst8::<_, COLS>(v);
             v.reverse();
         }
         Identity => {}
@@ -725,12 +722,12 @@ fn tx8<const COLS: bool>(v: &mut [I16x8; 8], t: Tx1d) {
 }
 
 #[inline(always)]
-fn tx16<const COLS: bool>(v: &mut [I16x8; 16], t: Tx1d, shift: u32) {
+fn tx16<V: Lanes, const COLS: bool>(v: &mut [V; 16], t: Tx1d, shift: u32) {
     match t {
-        Dct => dct16::<false>(v),
-        Adst => adst16::<COLS>(v),
+        Dct => dct16::<_, false>(v),
+        Adst => adst16::<_, COLS>(v),
         FlipAdst => {
-            adst16::<COLS>(v);
+            adst16::<_, COLS>(v);
             v.reverse();
         }
         Identity => identity16(v, shift),
@@ -740,21 +737,21 @@ fn tx16<const COLS: bool>(v: &mut [I16x8; 16], t: Tx1d, shift: u32) {
 /// Only the DCT and the identity reach 32 points; the identity's factor of 4 is a shift the
 /// rounding absorbs.
 #[inline(always)]
-fn tx32(v: &mut [I16x8; 32], t: Tx1d, half: bool) {
+fn tx32<V: Lanes>(v: &mut [V; 32], t: Tx1d, half: bool) {
     match (t, half) {
-        (Dct, true) => dct32::<true>(v),
-        (Dct, false) => dct32::<false>(v),
+        (Dct, true) => dct32::<_, true>(v),
+        (Dct, false) => dct32::<_, false>(v),
         _ => {}
     }
 }
 
 /// `half`: the upper half of the inputs is zero.
 #[inline(always)]
-fn tx<const N: usize, const COLS: bool>(v: &mut [I16x8; N], t: Tx1d, shift: u32, half: bool) {
+fn tx<V: Lanes, const N: usize, const COLS: bool>(v: &mut [V; N], t: Tx1d, shift: u32, half: bool) {
     match N {
         4 => tx4((&mut v[..4]).try_into().unwrap(), t, shift),
-        8 => tx8::<COLS>((&mut v[..8]).try_into().unwrap(), t),
-        16 => tx16::<COLS>((&mut v[..16]).try_into().unwrap(), t, shift),
+        8 => tx8::<_, COLS>((&mut v[..8]).try_into().unwrap(), t),
+        16 => tx16::<_, COLS>((&mut v[..16]).try_into().unwrap(), t, shift),
         32 => tx32((&mut v[..32]).try_into().unwrap(), t, half),
         64 => dct64((&mut v[..64]).try_into().unwrap()),
         _ => unreachable!(),
@@ -823,7 +820,14 @@ fn add_dc<BD: BitDepth, const W: usize, const H: usize>(
 /// coefficients. A 32x32 block with `eob < 136` has every coefficient in its top-left 16x16 (the
 /// asm's tier), so half the rows and inputs are skipped.
 #[inline(always)]
-fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType, const G: usize>(
+fn add_block<
+    BD: BitDepth,
+    const W: usize,
+    const H: usize,
+    const TYPE: TxfmType,
+    const G: usize,
+    const WIDE: bool,
+>(
     dst: Rav1dPictureDataComponentOffset,
     coeff: &mut [i16],
     eob: i32,
@@ -837,20 +841,22 @@ fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType,
     let coeff = &mut coeff[..cw * ch];
     let half = W == 32 && H == 32 && eob < 136;
     let (w, h) = if half { (16, 16) } else { (cw, ch) };
-    let rect = if W * 2 == H || H * 2 == W {
-        Some(I16x8::splat(2896 * 8))
-    } else {
-        None
-    };
+    let rect = W * 2 == H || H * 2 == W;
     let zero = I16x8::splat(0);
     let mut groups = [[zero; H]; G];
-    for y0 in (0..h).step_by(8) {
-        let mut v: [I16x8; W] = std::array::from_fn(|x| {
-            if x >= w {
-                return zero;
-            }
+    let mut y0 = 0;
+    #[cfg(target_arch = "x86_64")]
+    if WIDE && ch >= 16 {
+        while y0 < h {
+            wide::rows::<W, H, G>(coeff, ch, y0, w, rect, rows, shift, half, &mut groups);
+            y0 += 16;
+        }
+    }
+    while y0 < h {
+        let mut v = [zero; W];
+        for x in 0..w {
             let c = &mut coeff[x * ch + y0..];
-            let v = if H == 4 {
+            v[x] = if H == 4 {
                 let v = I16x8::load_lo(c);
                 zero.store_lo(c);
                 v
@@ -859,26 +865,109 @@ fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType,
                 zero.store(c);
                 v
             };
-            match rect {
-                Some(k) => v.mulhrs(k),
-                None => v,
+            if rect {
+                v[x] = v[x].mulhrs(I16x8::splat(2896 * 8));
             }
-        });
-        tx::<W, false>(&mut v, rows, shift, half);
+        }
+        tx::<_, W, false>(&mut v, rows, shift, half);
         round(&mut v, round_mul(rows, W, shift), negated(rows, W));
         for (g, group) in groups.iter_mut().enumerate() {
-            let mut block: [I16x8; 8] =
-                std::array::from_fn(|i| v.get(g * 8 + i).copied().unwrap_or(zero));
-            I16x8::transpose8x8(&mut block);
+            let mut block = [zero; 8];
+            for i in 0..8.min(W) {
+                block[i] = v[g * 8 + i];
+            }
+            transpose8x8(&mut block);
             for y in 0..8.min(H) {
                 group[y0 + y] = block[y];
             }
         }
+        y0 += 8;
     }
-    for (g, group) in groups.iter_mut().enumerate() {
-        tx::<H, true>(group, cols, 4, half);
+    let mut g = 0;
+    #[cfg(target_arch = "x86_64")]
+    if WIDE && W >= 16 {
+        while g + 1 < G {
+            wide::cols::<BD, H>(dst, g * 8, &groups[g], &groups[g + 1], cols, half);
+            g += 2;
+        }
+    }
+    while g < G {
+        let group = &mut groups[g];
+        tx::<_, H, true>(group, cols, 4, half);
         round(group, round_mul(cols, H, 4), negated(cols, H));
         add_rows::<BD, W, H>(dst, g * 8, group);
+        g += 1;
+    }
+}
+
+/// The passes sixteen lanes at a time: rows where a column holds 16 coefficients, columns where
+/// the block is 16 wide. A 16-lane 8x8 turn is two 8x8 turns, one per 128-bit half, so the row
+/// pass hands each column group rows `y0..y0 + 8` from the low halves and the next eight from
+/// the high ones, and the column pass joins two groups' rows.
+#[cfg(target_arch = "x86_64")]
+mod wide {
+    use super::*;
+    use crate::simd128::I16x16;
+
+    #[inline(always)]
+    pub fn rows<const W: usize, const H: usize, const G: usize>(
+        coeff: &mut [i16],
+        ch: usize,
+        y0: usize,
+        w: usize,
+        rect: bool,
+        rows: Tx1d,
+        shift: u32,
+        half: bool,
+        groups: &mut [[I16x8; H]; G],
+    ) {
+        let zero = I16x16::splat(0);
+        let mut v = [zero; W];
+        for x in 0..w {
+            let c = &mut coeff[x * ch + y0..];
+            v[x] = I16x16::load(c);
+            zero.store(c);
+            if rect {
+                v[x] = v[x].mulhrs(I16x16::splat(2896 * 8));
+            }
+        }
+        tx::<_, W, false>(&mut v, rows, shift, half);
+        round(&mut v, round_mul(rows, W, shift), negated(rows, W));
+        for (g, group) in groups.iter_mut().enumerate() {
+            let mut block = [zero; 8];
+            for i in 0..8.min(W) {
+                block[i] = v[g * 8 + i];
+            }
+            transpose8x8(&mut block);
+            for y in 0..8 {
+                group[y0 + y] = block[y].lo();
+                group[y0 + 8 + y] = block[y].hi();
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn cols<BD: BitDepth, const H: usize>(
+        dst: Rav1dPictureDataComponentOffset,
+        x0: usize,
+        a: &[I16x8; H],
+        b: &[I16x8; H],
+        cols: Tx1d,
+        half: bool,
+    ) {
+        let mut v = [I16x16::splat(0); H];
+        for y in 0..H {
+            v[y] = I16x16::from_halves(a[y], b[y]);
+        }
+        tx::<_, H, true>(&mut v, cols, 4, half);
+        round(&mut v, round_mul(cols, H, 4), negated(cols, H));
+        for y in 0..H {
+            let row = dst + (y as isize * dst.pixel_stride::<BD>());
+            let px = &mut *row.slice_mut::<BD>(x0 + 16);
+            let px = &mut px.as_bytes_mut()[x0..];
+            let out = I16x16::from_u8x16(px).add(v[y]);
+            px.copy_from_slice(&out.pack_u8());
+        }
     }
 }
 
@@ -891,5 +980,21 @@ pub fn add<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType, c
     coeff: &mut [i16],
     eob: i32,
 ) {
-    add_block::<BD, W, H, TYPE, G>(dst, coeff, eob)
+    add_block::<BD, W, H, TYPE, G, false>(dst, coeff, eob)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub fn add_avx2<
+    BD: BitDepth,
+    const W: usize,
+    const H: usize,
+    const TYPE: TxfmType,
+    const G: usize,
+>(
+    dst: Rav1dPictureDataComponentOffset,
+    coeff: &mut [i16],
+    eob: i32,
+) {
+    add_block::<BD, W, H, TYPE, G, true>(dst, coeff, eob)
 }
