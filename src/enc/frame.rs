@@ -503,6 +503,11 @@ pub struct Encoder<D: Decide> {
     pub uv_outward: bool,
     /// See `Options::rect_ratio`.
     pub rect_ratio: f64,
+    /// See `Options::rect_adaptive`.
+    pub rect_adaptive: bool,
+    /// Per partition level under `rect_ratio`: rect partitions met and tried, the cost their wins
+    /// saved over the best square partition, and the cost of every decision tried.
+    pub rect_seen: [(u32, u32, f64, f64); 5],
     /// See `Options::fast_cdef`.
     pub fast_cdef: bool,
     /// The superblock's 16×16 blocks' factors over `ssim_reference`, and its λ before them.
@@ -653,6 +658,8 @@ impl<D: Decide> Encoder<D> {
             skip_predicted: false,
             uv_outward: false,
             rect_ratio: 0.0,
+            rect_adaptive: false,
+            rect_seen: [(0, 0, 0.0, 0.0); 5],
             fast_cdef: false,
             ssim: [1.0; 16],
             sb_lambda: 1.0,
@@ -2038,6 +2045,7 @@ impl<D: Decide> Encoder<D> {
         let mut best: Option<(f64, u32, Option<Snap>, Vec<Node>)> = Option::None;
         let mut dirty = false;
         let (mut none_cost, mut split_cost) = (f64::INFINITY, f64::INFINITY);
+        let mut rect_under = false;
         for &bp in cands {
             if halves == Halves::Both && cands.len() > 1 {
                 let skip = match bp {
@@ -2060,7 +2068,21 @@ impl<D: Decide> Encoder<D> {
                     }
                 }
                 if split_cost < self.rect_ratio * none_cost {
-                    continue;
+                    if !self.rect_adaptive {
+                        continue;
+                    }
+                    let seen = &mut self.rect_seen[level as usize];
+                    if !rect_under {
+                        seen.0 += 1;
+                    }
+                    let (met, tried, gained, total) = *seen;
+                    if tried >= 32 && gained <= total * 0.003 && met % 16 != 0 {
+                        continue;
+                    }
+                    if !rect_under {
+                        rect_under = true;
+                        seen.1 += 1;
+                    }
                 }
             }
             if bp != None && self.prune > 0.0 && best.as_ref().is_some_and(|b| b.0 < self.prune * self.lambda * (n4 * n4) as f64) {
@@ -2125,7 +2147,14 @@ impl<D: Decide> Encoder<D> {
                 best = Some((cost, bits, Option::None, self.plan[plan_len..].to_vec()));
             }
         }
-        let (_, bits, snap, nodes) = best.unwrap();
+        let (cost, bits, snap, nodes) = best.unwrap();
+        if rect_under {
+            let seen = &mut self.rect_seen[level as usize];
+            seen.3 += cost;
+            if matches!(nodes[0], Node::Part(H | V)) {
+                seen.2 += none_cost.min(split_cost) - cost;
+            }
+        }
         if let Some(snap) = snap {
             self.restore(&snap);
         }
@@ -3816,6 +3845,7 @@ pub(crate) mod tests {
             filter_search: std::env::var("ENC_FILTER_SEARCH").is_ok_and(|v| v == "1"),
             uv_outward: std::env::var("ENC_UV_OUTWARD").is_ok_and(|v| v == "1"),
             rect_ratio: std::env::var("ENC_RECT_RATIO").map_or(0.0, |v| v.parse().unwrap()),
+            rect_adaptive: std::env::var("ENC_RECT_ADAPTIVE").map_or(true, |v| v != "0"),
             fast_cdef: std::env::var("ENC_FAST_CDEF").is_ok_and(|v| v == "1"),
             tile_cols_log2: std::env::var("ENC_TILES").map_or(1, |v| v.parse().unwrap()),
         };
@@ -3856,6 +3886,7 @@ pub(crate) mod tests {
             let mut e = crate::enc::still_rows(w as u32, h as u32, &rows, &options, std::env::var("ENC_STATS").is_ok(), workers);
             let searched = t.elapsed().as_millis();
             let stats = e.stats;
+            let rect_seen = e.rect_seen;
             let ns = e.stage_ns.map(|n| n / 1_000_000);
             let sizes = e.size_ns.map(|n| n / 1_000_000);
             let estimated = e.estimated as f64 / 4096.0;
@@ -3872,6 +3903,7 @@ pub(crate) mod tests {
                 println!("  estimated {estimated:.0} B {estimated_db:.2} dB unfiltered");
                 println!("  searches per 8x8 / coefficients per pixel: rank {} depth {} chroma {} final {} code {}", per[0], per[1], per[2], per[4], per[5]);
                 println!("  ms: rank {} depth {} chroma {} final {}, coded {searched}, with filters {t}; kept modes {}; scoring restore {} predict {} mode bits {} estimate {}", ns[0], ns[1], ns[2], ns[4], ns[3], ns[6], ns[7], ns[8], ns[9]);
+                println!("  rect under the ratio, met/tried/gain% by level: {}", rect_seen.iter().map(|s| format!("{}/{}/{:.3}", s.0, s.1, 100.0 * s.2 / s.3.max(1.0))).collect::<Vec<_>>().join(" "));
                 println!("  ms by block side: 4 {} 8 {} 16 {} 32 {} 64 {}", sizes[0], sizes[1], sizes[2], sizes[3], sizes[4]);
             }
             let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));
