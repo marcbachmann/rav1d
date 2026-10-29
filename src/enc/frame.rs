@@ -2089,9 +2089,12 @@ impl<D: Decide> Encoder<D> {
         };
         for &bp in cands {
             if halves == Halves::Both && cands.len() > 1 {
+                // The CNN may prune None only where Split is searched: with Split pruned as
+                // well, by the CNN or the learnt prune, nothing would be left to code.
+                let split_pruned = cnn.split && none_allowed || prune8;
                 let skip = match bp {
-                    Split => !split_allowed || cnn.split && none_allowed || prune8,
-                    None => !none_allowed || cnn.none && split_allowed,
+                    Split => !split_allowed || split_pruned,
+                    None => !none_allowed || cnn.none && split_allowed && !split_pruned,
                     _ => !none_allowed || cnn.rect,
                 };
                 if skip {
