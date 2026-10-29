@@ -505,6 +505,13 @@ pub struct Encoder<D: Decide> {
     pub rect_ratio: f64,
     /// See `Options::rect_adaptive`.
     pub rect_adaptive: bool,
+    /// See `Options::split8_adaptive`.
+    pub split8_adaptive: bool,
+    /// 16×16 blocks met, searched below 16×16 (8×8 splits and the rect partitions after them),
+    /// the cost that search gained over None where a partition won, the cost of every decision
+    /// tried, and the wins that gained over 2% of their block's cost: a few edge blocks of a flat
+    /// picture, hidden in the mean.
+    pub split_seen: (u32, u32, f64, f64, u32),
     /// Per partition level under `rect_ratio`: rect partitions met and tried, the cost their wins
     /// saved over the best square partition, and the cost of every decision tried.
     pub rect_seen: [(u32, u32, f64, f64); 5],
@@ -659,6 +666,8 @@ impl<D: Decide> Encoder<D> {
             uv_outward: false,
             rect_ratio: 0.0,
             rect_adaptive: false,
+            split8_adaptive: false,
+            split_seen: (0, 0, 0.0, 0.0, 0),
             rect_seen: [(0, 0, 0.0, 0.0); 5],
             fast_cdef: false,
             ssim: [1.0; 16],
@@ -2046,10 +2055,16 @@ impl<D: Decide> Encoder<D> {
         let mut dirty = false;
         let (mut none_cost, mut split_cost) = (f64::INFINITY, f64::INFINITY);
         let mut rect_under = false;
+        let split8 = self.split8_adaptive && level == 2 && halves == Halves::Both && none_allowed && split_allowed;
+        let prune8 = split8 && {
+            self.split_seen.0 += 1;
+            let (met, tried, gained, total, big) = self.split_seen;
+            tried >= 32 && gained <= total * 0.02 && big * 8 <= tried && met % 16 != 0
+        };
         for &bp in cands {
             if halves == Halves::Both && cands.len() > 1 {
                 let skip = match bp {
-                    Split => !split_allowed || cnn.split && none_allowed,
+                    Split => !split_allowed || cnn.split && none_allowed || prune8,
                     None => !none_allowed || cnn.none && split_allowed,
                     _ => !none_allowed || cnn.rect,
                 };
@@ -2148,6 +2163,21 @@ impl<D: Decide> Encoder<D> {
             }
         }
         let (cost, bits, snap, nodes) = best.unwrap();
+        if split8 && !prune8 && none_cost.is_finite() {
+            let seen = &mut self.split_seen;
+            seen.1 += 1;
+            seen.3 += cost;
+            if !matches!(nodes[0], Node::Part(None)) {
+                seen.2 += none_cost - cost;
+                if none_cost - cost > 0.02 * none_cost {
+                    seen.4 += 1;
+                    // A big win after the prune engaged: the content changed, so learn afresh.
+                    if seen.1 > 32 && seen.4 * 8 <= seen.1 {
+                        *seen = (seen.0, 0, 0.0, 0.0, 0);
+                    }
+                }
+            }
+        }
         if rect_under {
             let seen = &mut self.rect_seen[level as usize];
             seen.3 += cost;
@@ -3846,6 +3876,7 @@ pub(crate) mod tests {
             uv_outward: std::env::var("ENC_UV_OUTWARD").is_ok_and(|v| v == "1"),
             rect_ratio: std::env::var("ENC_RECT_RATIO").map_or(0.0, |v| v.parse().unwrap()),
             rect_adaptive: std::env::var("ENC_RECT_ADAPTIVE").map_or(true, |v| v != "0"),
+            split8_adaptive: std::env::var("ENC_SPLIT8").is_ok_and(|v| v == "1"),
             fast_cdef: std::env::var("ENC_FAST_CDEF").is_ok_and(|v| v == "1"),
             tile_cols_log2: std::env::var("ENC_TILES").map_or(1, |v| v.parse().unwrap()),
         };
@@ -3887,6 +3918,7 @@ pub(crate) mod tests {
             let searched = t.elapsed().as_millis();
             let stats = e.stats;
             let rect_seen = e.rect_seen;
+            let split_seen = e.split_seen;
             let ns = e.stage_ns.map(|n| n / 1_000_000);
             let sizes = e.size_ns.map(|n| n / 1_000_000);
             let estimated = e.estimated as f64 / 4096.0;
@@ -3904,6 +3936,7 @@ pub(crate) mod tests {
                 println!("  searches per 8x8 / coefficients per pixel: rank {} depth {} chroma {} final {} code {}", per[0], per[1], per[2], per[4], per[5]);
                 println!("  ms: rank {} depth {} chroma {} final {}, coded {searched}, with filters {t}; kept modes {}; scoring restore {} predict {} mode bits {} estimate {}", ns[0], ns[1], ns[2], ns[4], ns[3], ns[6], ns[7], ns[8], ns[9]);
                 println!("  rect under the ratio, met/tried/gain% by level: {}", rect_seen.iter().map(|s| format!("{}/{}/{:.3}", s.0, s.1, 100.0 * s.2 / s.3.max(1.0))).collect::<Vec<_>>().join(" "));
+                println!("  16x16 splits met/tried/gain%/big: {}/{}/{:.3}/{}", split_seen.0, split_seen.1, 100.0 * split_seen.2 / split_seen.3.max(1.0), split_seen.4);
                 println!("  ms by block side: 4 {} 8 {} 16 {} 32 {} 64 {}", sizes[0], sizes[1], sizes[2], sizes[3], sizes[4]);
             }
             let d = psnr(&planes, &decode_with(c.data.clone(), w, h, 3, true));

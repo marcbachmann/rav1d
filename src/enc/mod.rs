@@ -145,6 +145,14 @@ pub struct Options {
     /// honest: content with long straight edges (a text page, a tile grid) gains from rect
     /// partitions where a photo's few wins are marginal.
     pub rect_adaptive: bool,
+    /// 16×16 blocks are no longer searched below 16×16 (8×8 splits and the rect partitions tried
+    /// after them) once 32 such searches gained at most 2% of the cost decided there with wins
+    /// over 2% of a block's cost rarer than 1 in 8, one in 16 still searched: the fast search's
+    /// cut above qindex 100, learnt per picture, and learnt afresh after a sampled big win. A
+    /// photo reads 0.2-0.7% and 1-7% at Q25-Q35 and 1.2% and 19% at Q50; a logo 19-34% and 50%,
+    /// a tile grid 48-148% and 27%. Pictures of 512×512 and under have too few 16×16 blocks to
+    /// learn on before their content changes (a 361×85 logo lost 1 dB at Q40).
+    pub split8_adaptive: bool,
     /// libaom's `CDEF_FAST_SEARCH_LVL3` of cpu-used 5: CDEF primaries of 0, 2, 4, 8, 14 and
     /// secondaries of 0, 2. Deblocking levels stay searched: taken from the qindex as libaom's
     /// `LPF_PICK_FROM_Q` they cost a native-size photo crop 0.86 dB at Q90 for 1% of the time.
@@ -182,7 +190,7 @@ impl Options {
         let fine = effort >= 4 && (qidx <= 64 || pixels <= 512 * 512);
         let (keep_modes, keep_chroma) = if fine { (4, 0) } else { (keep_modes, keep_chroma) };
         let rdoq = if effort >= 8 { 8 } else { 0 };
-        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && (!fine || !screen && pixels > 512 * 512), reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: effort <= 5 && !screen && pixels > 512 * 512, rect_ratio: if (4..=5).contains(&effort) { 0.9 } else { 0.0 }, rect_adaptive: true, fast_cdef: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
+        Self { qidx, keep_modes, keep_chroma, screen, rect, late_txtp: effort <= 5 && (!fine || !screen && pixels > 512 * 512), reduced_txtp: effort <= 5 || effort <= 7 && !fine, tx_domain_dist: effort <= 7, uv_from_luma: effort <= 5, prune_intra: effort <= 5 || effort <= 7 && !fine, rank_rd: fine, rank_pre: if effort <= 3 || effort <= 5 && qidx > 64 { 6 } else { 0 }, tx_depths: if effort <= 5 { 1 } else { 2 }, levels, prune, variance_boost: false, cnn_prune: if effort > 3 { 0 } else if screen { 1 } else { 2 }, rdoq, ssim: false, quant_matrices: false, chroma_delta_q: false, iq_rdmult: false, skip_prediction: true, iq_filters: false, filter_search: effort >= 4, uv_outward: effort <= 5 && !screen && pixels > 512 * 512, rect_ratio: if (4..=5).contains(&effort) { 0.9 } else { 0.0 }, rect_adaptive: true, split8_adaptive: effort <= 5 && pixels > 512 * 512, fast_cdef: false, tile_cols_log2: (!screen && pixels > 512 * 512) as u8 }
     }
 }
 
@@ -200,7 +208,7 @@ impl Options {
     pub fn fast(self) -> Self {
         let levels = if self.qidx > 100 { self.levels.start..self.levels.end.min(3) } else { self.levels.clone() };
         let rank_pre = if self.qidx > 64 { 6 } else { self.rank_pre };
-        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre, uv_outward: true, rect_ratio: 0.95, rect_adaptive: false, fast_cdef: true, ..self }
+        Self { cnn_prune: if self.screen { 1 } else { 2 }, levels, rank_pre, uv_outward: true, rect_ratio: 0.95, rect_adaptive: false, split8_adaptive: false, fast_cdef: true, ..self }
     }
 }
 
@@ -372,6 +380,7 @@ pub(crate) fn encoder(width: u32, height: u32, planes: &[&[u8]], options: &Optio
     e.fast_cdef = options.fast_cdef;
     e.rect_ratio = options.rect_ratio;
     e.rect_adaptive = options.rect_adaptive;
+    e.split8_adaptive = options.split8_adaptive;
     e.keep_modes = options.keep_modes;
     e.keep_chroma = options.keep_chroma;
     e.rect = options.rect;
