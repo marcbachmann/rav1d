@@ -337,9 +337,13 @@ fn ctx_refill_bytes(buf: &[u8], mut dif: EcWin, mut c: c_int) -> (EcWin, c_int, 
 
 #[inline]
 fn ctx_norm(s: &mut MsacContext, dif: EcWin, rng: c_uint) {
-    let d = 15 ^ (31 ^ clz(rng));
+    ctx_norm_by(s, dif, rng, 15 ^ (31 ^ clz(rng)));
+}
+
+#[inline]
+fn ctx_norm_by(s: &mut MsacContext, dif: EcWin, rng: c_uint, d: c_int) {
     let cnt = s.cnt;
-    assert!(rng <= 65535);
+    debug_assert!(rng <= 65535);
     s.dif = dif << d;
     s.rng = rng << d;
     s.cnt = cnt - d;
@@ -355,15 +359,15 @@ fn ctx_norm(s: &mut MsacContext, dif: EcWin, rng: c_uint) {
 )]
 fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
     let r = s.rng;
-    let mut dif = s.dif;
+    let dif = s.dif;
     assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
-    let mut v = (r >> 8 << 7) + EC_MIN_PROB;
-    let vw = (v as EcWin) << (EC_WIN_SIZE - 16);
-    let ret = dif >= vw;
-    dif -= (ret as EcWin) * vw;
-    v = v.wrapping_add((ret as c_uint) * (r.wrapping_sub(2 * v)));
-    ctx_norm(s, dif, v);
-    !ret
+    let (bit, dif, v) = split_at(dif, r, (r >> 8 << 7) + EC_MIN_PROB);
+    // Half of an `r` of at least 0x8000 is at least 0x3ffc, so the shift is 0, 1 or 2, read off
+    // the top bits without a bit scan, as in the asm.
+    let d = (0xbfff - v as c_int) >> 14;
+    debug_assert_eq!(d, 15 ^ (31 ^ clz(v)));
+    ctx_norm_by(s, dif, v, d);
+    bit
 }
 
 #[cfg_attr(
@@ -372,15 +376,25 @@ fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
 )]
 fn rav1d_msac_decode_bool_rust(s: &mut MsacContext, f: c_uint) -> bool {
     let r = s.rng;
-    let mut dif = s.dif;
+    let dif = s.dif;
     assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
-    let mut v = ((r >> 8) * (f >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
-    let vw = (v as EcWin) << (EC_WIN_SIZE - 16);
-    let ret = dif >= vw;
-    dif -= (ret as EcWin) * vw;
-    v = v.wrapping_add((ret as c_uint) * (r.wrapping_sub(2 * v)));
+    let v = ((r >> 8) * (f >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
+    let (bit, dif, v) = split_at(dif, r, v);
     ctx_norm(s, dif, v);
-    !ret
+    bit
+}
+
+/// The bit whose interval holds the window when the range `r` splits at `v`, and that interval
+/// (window, range); selects, as in the asm, rather than products with the bit, which put two
+/// more steps on the chain from one decode to the next.
+#[inline(always)]
+fn split_at(dif: EcWin, r: c_uint, v: c_uint) -> (bool, EcWin, c_uint) {
+    let (above, below) = dif.overflowing_sub((v as EcWin) << (EC_WIN_SIZE - 16));
+    if below {
+        (true, dif, v)
+    } else {
+        (false, above, r - v)
+    }
 }
 
 pub fn rav1d_msac_decode_subexp(s: &mut MsacContext, r#ref: c_uint, n: c_uint, mut k: u8) -> c_int {
@@ -503,7 +517,7 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
     let zero = I16x8::splat(0);
     let (mut cdfs, mut at_or_past) = ([zero; 2], [zero; 2]);
     // `rng`, then the bounds: the symbol's bounds are `[val]` and `[val + 1]`.
-    let mut bounds = [0; 17];
+    let mut bounds = [0; 18];
     bounds[0] = s.rng as u16 as i16;
     for k in 0..LANES.div_ceil(8) {
         cdfs[k] = if LANES == 4 {
@@ -525,7 +539,8 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
     } else {
         at_or_past[0].first_set()
     } as usize;
-    let val = val.min(n);
+    // At most `n_symbols`, as its lane always is at or past; the mask only drops the check.
+    let val = val & 15;
     let u = bounds[val] as u16 as c_uint;
     let v = bounds[val + 1] as u16 as c_uint;
     ctx_norm(
@@ -536,21 +551,19 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
     if s.allow_update_cdf() {
         let count = cdf[n];
         let rate = 4 + (count >> 4) as u32 + (n_symbols > 2) as u32;
-        let new_count = I16x8::splat((count + (count < 32) as u16) as i16);
+        // The count's lane falls by `count >> rate` with the others; this restores it, plus one.
+        let count_step = I16x8::splat(((count >> rate) + (count < 32) as u16) as i16);
         let ones = I16x8::splat(-1);
         for k in 0..LANES.div_ceil(8) {
-            // Lanes below the symbol rise towards 32768, the others fall.
-            let up = I16x8::splat(i16::MIN).sub(cdfs[k]).shr_u(rate);
-            let down = cdfs[k].shr_u(rate);
-            let updated = cdfs[k]
-                .add(up.and(at_or_past[k].xor(ones)))
-                .sub(down.and(at_or_past[k]));
-            // The count goes in with the lanes: a separate store into them would stall the next
-            // symbol's load of this CDF, which cannot be forwarded from two stores.
+            // As in the asm, in signed lanes: below the symbol `(32768 - cdf) >> rate` is added,
+            // from it on `((-1 - cdf) >> rate) + 1`, which is `-(cdf >> rate)`. A probability of 0
+            // would wrap, and no CDF holds one.
+            let step = ones.avg_u(at_or_past[k]).sub(cdfs[k]).shr_s_by(rate);
             let count_lane = I16x8::load(&COUNT_LANE[15 - n + 8 * k..]);
-            let updated = updated
-                .and(count_lane.xor(ones))
-                .xor(new_count.and(count_lane));
+            let updated = cdfs[k]
+                .sub(at_or_past[k])
+                .add(step)
+                .add(count_step.and(count_lane));
             if LANES == 4 {
                 updated.store_u16_lo(cdf);
             } else {
@@ -595,15 +608,16 @@ unsafe extern "C" fn rav1d_msac_decode_symbol_adapt_c(
     allow(dead_code)
 )]
 fn rav1d_msac_decode_bool_adapt_rust(s: &mut MsacContext, cdf: &mut [u16; 2]) -> bool {
-    let bit = rav1d_msac_decode_bool(s, cdf[0] as c_uint);
+    let bit = rav1d_msac_decode_bool_rust(s, cdf[0] as c_uint);
     if s.allow_update_cdf() {
         let count = cdf[1];
         let rate = 4 + (count >> 4);
-        if bit {
-            cdf[0] += (1 << 15) - cdf[0] >> rate;
-        } else {
-            cdf[0] -= cdf[0] >> rate;
-        }
+        // Both steps, then a select: a branch on the decoded bit mispredicts as often as it is random.
+        let (up, down) = (
+            cdf[0] + ((1 << 15) - cdf[0] >> rate),
+            cdf[0] - (cdf[0] >> rate),
+        );
+        cdf[0] = if bit { up } else { down };
         cdf[1] = count + (count < 32) as u16;
     }
     bit
@@ -848,15 +862,16 @@ mod tests {
         )
     }
 
-    /// Falling probabilities for `n` symbols and the adaptation count after them; the lanes past
-    /// it hold 0 as in the tables, or junk that no decoder may read.
+    /// Falling probabilities within 1..32768 for `n` symbols, as in every AV1 CDF, and the
+    /// adaptation count after them; the lanes past it hold 0 as in the tables, or junk that no
+    /// decoder may read.
     fn random_cdf(rng: &mut Rng, n: usize, junk: bool) -> [u16; 16] {
         let mut cdf: [u16; 16] = std::array::from_fn(|_| if junk { rng.next() as u16 } else { 0 });
         let mut p: Vec<u16> = (0..n)
             .map(|_| match rng.below(4) {
-                0 => 0,
+                0 => 1,
                 1 => 32767,
-                _ => rng.below(32768) as u16,
+                _ => 1 + rng.below(32767) as u16,
             })
             .collect();
         p.sort_unstable_by(|a, b| b.cmp(a));
@@ -987,6 +1002,44 @@ mod tests {
                         rav1d_msac_decode_hi_tok(&mut s, cdf)
                     } else {
                         rav1d_msac_decode_hi_tok_rust(&mut s, cdf)
+                    });
+                }
+            });
+        }
+        let probs: Vec<[u16; 2]> = (0..64)
+            .map(|_| [1 + rng.below(32767) as u16, rng.below(33) as u16])
+            .collect();
+        for (dispatched, name) in [(false, "rust"), (true, "dispatched (asm if built)")] {
+            time(&format!("bool_adapt {name}"), SYMBOLS, || {
+                let mut s = context(&data, true);
+                let mut cdfs = probs.clone();
+                for i in 0..SYMBOLS {
+                    let cdf = &mut cdfs[i % 64];
+                    black_box(if dispatched {
+                        rav1d_msac_decode_bool_adapt(&mut s, cdf)
+                    } else {
+                        rav1d_msac_decode_bool_adapt_rust(&mut s, cdf)
+                    });
+                }
+            });
+            time(&format!("bool {name}"), SYMBOLS, || {
+                let mut s = context(&data, true);
+                for i in 0..SYMBOLS {
+                    let f = probs[i % 64][0] as c_uint;
+                    black_box(if dispatched {
+                        rav1d_msac_decode_bool(&mut s, f)
+                    } else {
+                        rav1d_msac_decode_bool_rust(&mut s, f)
+                    });
+                }
+            });
+            time(&format!("bool_equi {name}"), SYMBOLS, || {
+                let mut s = context(&data, true);
+                for _ in 0..SYMBOLS {
+                    black_box(if dispatched {
+                        rav1d_msac_decode_bool_equi(&mut s)
+                    } else {
+                        rav1d_msac_decode_bool_equi_rust(&mut s)
                     });
                 }
             });

@@ -4,7 +4,7 @@
 //!
 //! On x86 the methods are `#[inline(always)]` so that they compile into a kernel entered through
 //! `#[target_feature(enable = "sse4.1")]`, which is only chosen once the CPU flags hold SSE41.
-//! The ones from `xor` on need only SSE2, the x86_64 baseline, and inline anywhere.
+//! The ones from `load_u16` on need only SSE2, the x86_64 baseline, and inline anywhere.
 
 /// Whether [`I16x8`] maps to vector instructions on this target.
 pub const fn native() -> bool {
@@ -65,7 +65,7 @@ mod imp {
 
     pub type Inner = __m128i;
 
-    // SAFETY (every `unsafe` here): SSE4.1, or SSE2 from `xor` on, holds where these are
+    // SAFETY (every `unsafe` here): SSE4.1, or SSE2 from `load_u16` on, holds where these are
     // compiled in (see the module docs), and loads and stores go through bounds-checked slices of 8 or 4 lanes.
     impl I16x8 {
         #[inline(always)]
@@ -178,11 +178,6 @@ mod imp {
         }
 
         #[inline(always)]
-        pub fn xor(self, o: Self) -> Self {
-            Self(unsafe { _mm_xor_si128(self.0, o.0) })
-        }
-
-        #[inline(always)]
         pub fn load_u16(s: &[u16]) -> Self {
             Self(unsafe { _mm_loadu_si128(s[..8].as_ptr().cast()) })
         }
@@ -212,6 +207,17 @@ mod imp {
         #[inline(always)]
         pub fn mulhi_u(self, o: Self) -> Self {
             Self(unsafe { _mm_mulhi_epu16(self.0, o.0) })
+        }
+
+        /// The unsigned averages rounded up.
+        #[inline(always)]
+        pub fn avg_u(self, o: Self) -> Self {
+            Self(unsafe { _mm_avg_epu16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn shr_s_by(self, n: u32) -> Self {
+            Self(unsafe { _mm_sra_epi16(self.0, _mm_cvtsi32_si128(n as i32)) })
         }
 
         #[inline(always)]
@@ -397,6 +403,17 @@ mod imp {
             Self(s(unsafe {
                 vuzp2q_u16(vreinterpretq_u16_u32(lo), vreinterpretq_u16_u32(hi))
             }))
+        }
+
+        /// The unsigned averages rounded up.
+        #[inline(always)]
+        pub fn avg_u(self, o: Self) -> Self {
+            Self(s(unsafe { vrhaddq_u16(u(self.0), u(o.0)) }))
+        }
+
+        #[inline(always)]
+        pub fn shr_s_by(self, n: u32) -> Self {
+            Self(unsafe { vshlq_s16(self.0, vdupq_n_s16(-(n as i16))) })
         }
 
         #[inline(always)]
@@ -591,6 +608,17 @@ mod imp {
             Self(i16x8_shuffle::<1, 3, 5, 7, 9, 11, 13, 15>(lo, hi))
         }
 
+        /// The unsigned averages rounded up.
+        #[inline(always)]
+        pub fn avg_u(self, o: Self) -> Self {
+            Self(u16x8_avgr(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn shr_s_by(self, n: u32) -> Self {
+            Self(i16x8_shr(self.0, n))
+        }
+
         #[inline(always)]
         pub fn eq(self, o: Self) -> Self {
             Self(i16x8_eq(self.0, o.0))
@@ -762,6 +790,19 @@ mod imp {
         #[inline(always)]
         pub fn mulhi_u(self, o: Self) -> Self {
             self.zip(o, |a, b| ((a as u16 as u32 * b as u16 as u32) >> 16) as i16)
+        }
+
+        /// The unsigned averages rounded up.
+        #[inline(always)]
+        pub fn avg_u(self, o: Self) -> Self {
+            self.zip(o, |a, b| {
+                ((a as u16 as u32 + b as u16 as u32 + 1) >> 1) as i16
+            })
+        }
+
+        #[inline(always)]
+        pub fn shr_s_by(self, n: u32) -> Self {
+            self.zip(self, |a, _| a >> n)
         }
 
         #[inline(always)]
