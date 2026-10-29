@@ -174,7 +174,7 @@ impl Rav1dPalDSPContext {
 
     #[inline(always)]
     const fn init(self, flags: CpuFlags) -> Self {
-        #[cfg(feature = "asm")]
+        #[cfg(all(feature = "asm", not(rav1d_rust_simd = "pal")))]
         {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {

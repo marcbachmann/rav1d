@@ -1811,7 +1811,7 @@ impl Rav1dRefmvsDSPContext {
 
     #[inline(always)]
     const fn init(self, flags: CpuFlags) -> Self {
-        #[cfg(feature = "asm")]
+        #[cfg(all(feature = "asm", not(rav1d_rust_simd = "refmvs")))]
         {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {

@@ -455,7 +455,7 @@ impl Rav1dLoopFilterDSPContext {
 
     #[inline(always)]
     const fn init<BD: BitDepth>(self, flags: CpuFlags) -> Self {
-        #[cfg(feature = "asm")]
+        #[cfg(all(feature = "asm", not(rav1d_rust_simd = "loopfilter")))]
         {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {

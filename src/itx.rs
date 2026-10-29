@@ -743,7 +743,7 @@ impl Rav1dInvTxfmDSPContext {
 
     #[inline(always)]
     const fn init<BD: BitDepth>(self, flags: CpuFlags, bpc: u8) -> Self {
-        #[cfg(feature = "asm")]
+        #[cfg(all(feature = "asm", not(rav1d_rust_simd = "itx")))]
         {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
