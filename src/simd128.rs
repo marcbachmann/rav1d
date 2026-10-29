@@ -77,7 +77,12 @@ mod imp {
         #[inline(always)]
         pub fn load_halves(lo: &[i16], hi: &[i16]) -> Self {
             let (lo, hi) = (&lo[..4], &hi[..4]);
-            Self(unsafe { _mm_unpacklo_epi64(_mm_loadl_epi64(lo.as_ptr().cast()), _mm_loadl_epi64(hi.as_ptr().cast())) })
+            Self(unsafe {
+                _mm_unpacklo_epi64(
+                    _mm_loadl_epi64(lo.as_ptr().cast()),
+                    _mm_loadl_epi64(hi.as_ptr().cast()),
+                )
+            })
         }
 
         #[inline(always)]
@@ -321,7 +326,9 @@ mod imp {
         #[inline(always)]
         pub fn load_halves(lo: &[i16], hi: &[i16]) -> Self {
             let (lo, hi) = (&lo[..4], &hi[..4]);
-            Self(i16x8(lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]))
+            Self(i16x8(
+                lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3],
+            ))
         }
 
         #[inline(always)]
@@ -472,7 +479,9 @@ mod imp {
         /// Little-endian lanes from `b[..16]`.
         #[inline(always)]
         pub fn from_bytes(b: &[u8]) -> Self {
-            Self(std::array::from_fn(|i| i16::from_le_bytes([b[2 * i], b[2 * i + 1]])))
+            Self(std::array::from_fn(|i| {
+                i16::from_le_bytes([b[2 * i], b[2 * i + 1]])
+            }))
         }
 
         #[inline(always)]

@@ -550,7 +550,10 @@ mod rust_simd {
         let pri = I16x8::splat(pri_strength as i16);
         let sec = I16x8::splat(sec_strength as i16);
         let pri_tap = 4 - (pri_strength >> (bd.bitdepth() - 8) & 1);
-        let pri_taps = [I16x8::splat(pri_tap as i16), I16x8::splat((pri_tap & 3 | 2) as i16)];
+        let pri_taps = [
+            I16x8::splat(pri_tap as i16),
+            I16x8::splat((pri_tap & 3 | 2) as i16),
+        ];
         let pri_shift = cmp::max(0, damping - (pri_strength | 1).ilog2() as c_int) as u32;
         let sec_shift = (damping - (sec_strength | 1).ilog2() as c_int) as u32;
         let round = I16x8::splat(8);
@@ -571,7 +574,11 @@ mod rust_simd {
                 if PRI {
                     let off = DAV1D_CDEF_DIRECTIONS[dir + 2][k] as isize;
                     let (p0, p1) = (at(off), at(-off));
-                    let c = constrain(p0.sub(px), pri, pri_shift).add(constrain(p1.sub(px), pri, pri_shift));
+                    let c = constrain(p0.sub(px), pri, pri_shift).add(constrain(
+                        p1.sub(px),
+                        pri,
+                        pri_shift,
+                    ));
                     sum = sum.add(c.mul(pri_taps[k]));
                     min = min.min_u(p0).min_u(p1);
                     max = max.max(p0).max(p1);
@@ -604,7 +611,9 @@ mod rust_simd {
             }
             for r in 0..rows {
                 let dst = dst + ((y + r) as isize * dst.pixel_stride::<BD>());
-                dst.slice_mut::<BD>(W).as_bytes_mut().copy_from_slice(&bytes[r * n..][..n]);
+                dst.slice_mut::<BD>(W)
+                    .as_bytes_mut()
+                    .copy_from_slice(&bytes[r * n..][..n]);
             }
         }
     }
@@ -645,16 +654,26 @@ mod rust_simd {
         let px = |p: BD::Pixel| p.as_::<i16>();
         // `line[0]` is column `x_start` of a padded row above or below the block.
         let outer = |row: &mut [i16], line: &[BD::Pixel]| {
-            row[..2].copy_from_slice(&if has_left { [px(line[0]), px(line[1])] } else { [NONE; 2] });
+            row[..2].copy_from_slice(&if has_left {
+                [px(line[0]), px(line[1])]
+            } else {
+                [NONE; 2]
+            });
             center::<BD, W>(&mut row[2..], &line[2 - x_start..]);
             let r = W + 2 - x_start;
-            row[W + 2..W + 4].copy_from_slice(&if has_right { [px(line[r]), px(line[r + 1])] } else { [NONE; 2] });
+            row[W + 2..W + 4].copy_from_slice(&if has_right {
+                [px(line[r]), px(line[r + 1])]
+            } else {
+                [NONE; 2]
+            });
         };
 
         if edges.contains(CdefEdgeFlags::HAVE_TOP) {
             for i in 0..2 {
                 let top = top - 2_usize + i as isize * stride;
-                let line = &*top.data.slice_as::<_, BD::Pixel>((top.offset + x_start.., ..x_end - x_start));
+                let line = &*top
+                    .data
+                    .slice_as::<_, BD::Pixel>((top.offset + x_start.., ..x_end - x_start));
                 outer(&mut tmp[i * TMP_STRIDE..], line);
             }
         } else {
@@ -665,7 +684,11 @@ mod rust_simd {
             let line = &*(src + y as isize * stride).slice::<BD>(x_end - 2);
             row[..2].copy_from_slice(&if has_left { left[y].map(px) } else { [NONE; 2] });
             center::<BD, W>(&mut row[2..], line);
-            row[W + 2..W + 4].copy_from_slice(&if has_right { [px(line[W]), px(line[W + 1])] } else { [NONE; 2] });
+            row[W + 2..W + 4].copy_from_slice(&if has_right {
+                [px(line[W]), px(line[W + 1])]
+            } else {
+                [NONE; 2]
+            });
         }
         if edges.contains(CdefEdgeFlags::HAVE_BOTTOM) {
             for i in 0..2 {
@@ -682,7 +705,10 @@ mod rust_simd {
         }
     }
 
-    #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse4.1"))]
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     fn filter_block<BD: BitDepth, const W: usize, const H: usize>(
         dst: Rav1dPictureDataComponentOffset,
         left: &[LeftPixelRow2px<BD::Pixel>; 8],
@@ -699,9 +725,36 @@ mod rust_simd {
         padding::<BD, W, H>(&mut tmp, dst, left, top, bottom, edges);
         let dir = dir as usize;
         match (pri_strength != 0, sec_strength != 0) {
-            (true, true) => filter::<BD, W, true, true>(&tmp, dst, H, pri_strength, sec_strength, dir, damping, bd),
-            (true, false) => filter::<BD, W, true, false>(&tmp, dst, H, pri_strength, sec_strength, dir, damping, bd),
-            _ => filter::<BD, W, false, true>(&tmp, dst, H, pri_strength, sec_strength, dir, damping, bd),
+            (true, true) => filter::<BD, W, true, true>(
+                &tmp,
+                dst,
+                H,
+                pri_strength,
+                sec_strength,
+                dir,
+                damping,
+                bd,
+            ),
+            (true, false) => filter::<BD, W, true, false>(
+                &tmp,
+                dst,
+                H,
+                pri_strength,
+                sec_strength,
+                dir,
+                damping,
+                bd,
+            ),
+            _ => filter::<BD, W, false, true>(
+                &tmp,
+                dst,
+                H,
+                pri_strength,
+                sec_strength,
+                dir,
+                damping,
+                bd,
+            ),
         }
     }
 
@@ -710,7 +763,11 @@ mod rust_simd {
     /// Must be called by [`cdef::Fn::call`], on x86 once the CPU flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
-    pub unsafe extern "C" fn cdef_filter_block_simd_erased<BD: BitDepth, const W: usize, const H: usize>(
+    pub unsafe extern "C" fn cdef_filter_block_simd_erased<
+        BD: BitDepth,
+        const W: usize,
+        const H: usize,
+    >(
         _dst_ptr: *mut DynPixel,
         _stride: ptrdiff_t,
         left: *const [LeftPixelRow2px<DynPixel>; 8],
@@ -1157,11 +1214,19 @@ mod tests {
             top.resize(bytes.len(), 0);
             top.as_mut_slice().copy_from_slice(&bytes);
             let left = [[0; 2]; 8].map(|r: [u8; 2]| r.map(|_| px(rng)));
-            Self { orig, comp, _buf: buf, top: DisjointMut::new(top), left }
+            Self {
+                orig,
+                comp,
+                _buf: buf,
+                top: DisjointMut::new(top),
+                left,
+            }
         }
 
         fn reset(&self) {
-            self.comp.slice_mut::<BD, _>((0.., ..STRIDE * ROWS)).copy_from_slice(&self.orig);
+            self.comp
+                .slice_mut::<BD, _>((0.., ..STRIDE * ROWS))
+                .copy_from_slice(&self.orig);
         }
 
         fn plane(&self) -> Vec<BD::Pixel> {
@@ -1171,10 +1236,19 @@ mod tests {
         fn call(&self, dsp: &Rav1dCdefDSPContext, c: Case, bd: BD) {
             let h = SIZES[c.size].1;
             dsp.fb[c.size].call::<BD>(
-                WithOffset { data: &self.comp, offset: BY * STRIDE + BX },
+                WithOffset {
+                    data: &self.comp,
+                    offset: BY * STRIDE + BX,
+                },
                 &self.left,
-                WithOffset { data: &self.top, offset: BX },
-                WithOffset { data: PicOrBuf::Pic(&self.comp), offset: (BY + h) * STRIDE + BX },
+                WithOffset {
+                    data: &self.top,
+                    offset: BX,
+                },
+                WithOffset {
+                    data: PicOrBuf::Pic(&self.comp),
+                    offset: (BY + h) * STRIDE + BX,
+                },
                 c.pri,
                 c.sec,
                 c.dir,
@@ -1190,8 +1264,14 @@ mod tests {
         let flags = rav1d_get_cpu_flags();
         [
             ("scalar", Rav1dCdefDSPContext::default::<BD>()),
-            ("rust simd", Rav1dCdefDSPContext::default::<BD>().init_rust_simd::<BD>(flags)),
-            ("asm", Rav1dCdefDSPContext::default::<BD>().init_asm::<BD>(flags)),
+            (
+                "rust simd",
+                Rav1dCdefDSPContext::default::<BD>().init_rust_simd::<BD>(flags),
+            ),
+            (
+                "asm",
+                Rav1dCdefDSPContext::default::<BD>().init_asm::<BD>(flags),
+            ),
         ]
     }
 
@@ -1209,7 +1289,10 @@ mod tests {
             for (name, dsp) in &dsps[1..] {
                 fx.reset();
                 fx.call(dsp, c, bd);
-                assert!(fx.plane() == want, "{name} differs from scalar at {bits} bits, case {i}");
+                assert!(
+                    fx.plane() == want,
+                    "{name} differs from scalar at {bits} bits, case {i}"
+                );
             }
         }
     }
@@ -1258,10 +1341,19 @@ mod tests {
                     let mut tmp = [0; TMP_STRIDE * TMP_STRIDE];
                     padding::<BD>(
                         &mut tmp,
-                        WithOffset { data: &fx.comp, offset: BY * STRIDE + BX },
+                        WithOffset {
+                            data: &fx.comp,
+                            offset: BY * STRIDE + BX,
+                        },
                         &fx.left,
-                        WithOffset { data: &fx.top, offset: BX },
-                        WithOffset { data: PicOrBuf::Pic(&fx.comp), offset: (BY + h) * STRIDE + BX },
+                        WithOffset {
+                            data: &fx.top,
+                            offset: BX,
+                        },
+                        WithOffset {
+                            data: PicOrBuf::Pic(&fx.comp),
+                            offset: (BY + h) * STRIDE + BX,
+                        },
                         w,
                         h,
                         c.edges,
