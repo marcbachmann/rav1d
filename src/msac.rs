@@ -457,6 +457,13 @@ fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_s
     val as u8
 }
 
+/// Whether [`I16x8`] is vector instructions that need no runtime check here.
+const MSAC_SIMD: bool = cfg!(any(
+    target_feature = "sse2",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128"),
+));
+
 #[cfg_attr(
     all(
         not(rav1d_rust_simd = "msac"),
@@ -471,11 +478,7 @@ fn decode_symbol_adapt<const LANES: usize>(
     cdf: &mut [u16],
     n_symbols: u8,
 ) -> u8 {
-    if cfg!(any(
-        target_feature = "sse2",
-        target_arch = "aarch64",
-        all(target_arch = "wasm32", target_feature = "simd128"),
-    )) {
+    if MSAC_SIMD {
         rav1d_msac_decode_symbol_adapt_simd::<LANES>(s, cdf, n_symbols)
     } else {
         rav1d_msac_decode_symbol_adapt_rust(s, cdf, n_symbols)
@@ -642,6 +645,74 @@ fn rav1d_msac_decode_hi_tok_rust(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
             }
         }
     }
+    tok
+}
+
+/// [`rav1d_msac_decode_hi_tok_rust`] as one loop over its up to four symbols, with the CDF in a
+/// register and the decoder state in locals, as in the asm.
+#[cfg_attr(
+    all(
+        not(rav1d_rust_simd = "msac"),
+        feature = "asm",
+        any(target_feature = "sse2", target_feature = "neon")
+    ),
+    allow(dead_code)
+)]
+#[inline(always)]
+fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
+    let update = s.allow_update_cdf();
+    let zero = I16x8::splat(0);
+    let ones = I16x8::splat(-1);
+    let min_probs = I16x8::load(&EC_MIN_PROBS[15 - 3..]);
+    let count_lane = I16x8::load(&COUNT_LANE[15 - 3..]);
+    let mut cdfv = I16x8::load_u16_lo(cdf);
+    let mut count = cdf[3];
+    let (mut dif, mut rng) = (s.dif, s.rng);
+    let mut tok = 3;
+    loop {
+        let c = I16x8::splat((dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
+        let r = I16x8::splat((rng & 0xff00) as u16 as i16);
+        let p = cdfv.and(I16x8::splat(-64));
+        let v = p.add(p).mulhi_u(r).add(min_probs);
+        let mut bounds = [0; 10];
+        bounds[0] = rng as u16 as i16;
+        v.store(&mut bounds[1..]);
+        let at_or_past = v.sub_sat_u(c).eq(zero);
+        let val = at_or_past.first_set() as usize & 3;
+        if update {
+            let rate = 5 + (count >> 4) as u32;
+            let count_step = I16x8::splat(((count >> rate) + (count < 32) as u16) as i16);
+            let step = ones.avg_u(at_or_past).sub(cdfv).shr_s_by(rate);
+            cdfv = cdfv
+                .sub(at_or_past)
+                .add(step)
+                .add(count_step.and(count_lane));
+            count += (count < 32) as u16;
+        }
+        let u = bounds[val] as u16 as c_uint;
+        let v = bounds[val + 1] as u16 as c_uint;
+        dif = dif.wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16));
+        rng = u - v;
+        let d = 15 ^ (31 ^ clz(rng));
+        dif <<= d;
+        rng <<= d;
+        let cnt = s.cnt;
+        s.cnt = cnt - d;
+        if (cnt as u32) < (d as u32) {
+            s.dif = dif;
+            ctx_refill(s);
+            dif = s.dif;
+        }
+        tok += val as u8;
+        if val < 3 || tok == 15 {
+            break;
+        }
+    }
+    if update {
+        cdfv.store_u16_lo(cdf);
+    }
+    s.dif = dif;
+    s.rng = rng;
     tok
 }
 
@@ -822,7 +893,11 @@ pub fn rav1d_msac_decode_hi_tok(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
                 dav1d_msac_decode_hi_tok_neon(&mut s.asm, cdf.as_mut_ptr())
             } as u8;
         } else {
-            ret = rav1d_msac_decode_hi_tok_rust(s, cdf);
+            ret = if MSAC_SIMD {
+                rav1d_msac_decode_hi_tok_simd(s, cdf)
+            } else {
+                rav1d_msac_decode_hi_tok_rust(s, cdf)
+            };
         }
     }
     debug_assert!(ret < 16);
@@ -913,6 +988,30 @@ mod tests {
     }
 
     #[test]
+    fn hi_tok_loop_matches_four_symbols() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for round in 0..3000 {
+            let data: Vec<u8> = (0..rng.below(80)).map(|_| rng.next() as u8).collect();
+            let update = round % 5 != 0;
+            let (mut a, mut b) = (context(&data, update), context(&data, update));
+            for i in 0..200 {
+                let mut cdf: [u16; 4] = random_cdf(&mut rng, 3, false)[..4].try_into().unwrap();
+                if rng.below(2) == 0 {
+                    // Mostly the last symbol, so the token runs on to 15.
+                    cdf[..3].copy_from_slice(&[32767, 32766, 32765]);
+                }
+                let (mut ca, mut cb) = (cdf, cdf);
+                let ta = rav1d_msac_decode_hi_tok_rust(&mut a, &mut ca);
+                let tb = rav1d_msac_decode_hi_tok_simd(&mut b, &mut cb);
+                let at = format!("round {round} token {i}: cdf {cdf:?}");
+                assert_eq!(ta, tb, "{at}");
+                assert_eq!(ca, cb, "{at}");
+                assert_eq!(state(&a), state(&b), "{at}");
+            }
+        }
+    }
+
+    #[test]
     fn refill_in_one_load_matches_bytes() {
         let mut rng = Rng(7);
         for round in 0..100_000 {
@@ -992,16 +1091,20 @@ mod tests {
         let cdfs: Vec<[u16; 4]> = (0..64)
             .map(|_| random_cdf(&mut rng, 3, false)[..4].try_into().unwrap())
             .collect();
-        for (dispatched, name) in [(false, "rust simd"), (true, "dispatched (asm if built)")] {
+        for (kind, name) in [
+            (0, "rust 4 calls"),
+            (1, "rust loop"),
+            (2, "dispatched (asm if built)"),
+        ] {
             time(&format!("hi_tok {name}"), SYMBOLS, || {
                 let mut s = context(&data, true);
                 let mut cdfs = cdfs.clone();
                 for i in 0..SYMBOLS {
                     let cdf = &mut cdfs[i % 64];
-                    black_box(if dispatched {
-                        rav1d_msac_decode_hi_tok(&mut s, cdf)
-                    } else {
-                        rav1d_msac_decode_hi_tok_rust(&mut s, cdf)
+                    black_box(match kind {
+                        0 => rav1d_msac_decode_hi_tok_rust(&mut s, cdf),
+                        1 => rav1d_msac_decode_hi_tok_simd(&mut s, cdf),
+                        _ => rav1d_msac_decode_hi_tok(&mut s, cdf),
                     });
                 }
             });
