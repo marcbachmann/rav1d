@@ -51,6 +51,35 @@ impl I16x8 {
             self.xor(m).sub(m)
         }
     }
+
+    /// `v[i]` lane `j` becomes `v[j]` lane `i`: three rounds of interleaves, 24 shuffles.
+    #[inline(always)]
+    pub fn transpose8x8(v: &mut [Self; 8]) {
+        let a = [
+            v[0].zip_lo16(v[1]),
+            v[0].zip_hi16(v[1]),
+            v[2].zip_lo16(v[3]),
+            v[2].zip_hi16(v[3]),
+            v[4].zip_lo16(v[5]),
+            v[4].zip_hi16(v[5]),
+            v[6].zip_lo16(v[7]),
+            v[6].zip_hi16(v[7]),
+        ];
+        let b = [
+            a[0].zip_lo32(a[2]),
+            a[0].zip_hi32(a[2]),
+            a[1].zip_lo32(a[3]),
+            a[1].zip_hi32(a[3]),
+            a[4].zip_lo32(a[6]),
+            a[4].zip_hi32(a[6]),
+            a[5].zip_lo32(a[7]),
+            a[5].zip_hi32(a[7]),
+        ];
+        for i in 0..4 {
+            v[2 * i] = b[i].zip_lo64(b[i + 4]);
+            v[2 * i + 1] = b[i].zip_hi64(b[i + 4]);
+        }
+    }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -242,6 +271,76 @@ mod imp {
         pub fn first_set2(self, o: Self) -> u32 {
             (unsafe { _mm_movemask_epi8(_mm_packs_epi16(self.0, o.0)) } as u32 | 1 << 16)
                 .trailing_zeros()
+        }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            Self(unsafe { _mm_adds_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub_sat(self, o: Self) -> Self {
+            Self(unsafe { _mm_subs_epi16(self.0, o.0) })
+        }
+
+        /// `(a * b + 0x4000) >> 15`: a product in Q15 with rounding.
+        #[inline(always)]
+        pub fn mulhrs(self, o: Self) -> Self {
+            Self(unsafe { _mm_mulhrs_epi16(self.0, o.0) })
+        }
+
+        /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
+        /// in 32 bits, each result saturated to `i16`.
+        #[inline(always)]
+        pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+            let pair =
+                |lo: i16, hi: i16| unsafe { _mm_set1_epi32(lo as u16 as i32 | (hi as i32) << 16) };
+            let (k1, k2, rnd) = (pair(c1, c2.wrapping_neg()), pair(c2, c1), unsafe {
+                _mm_set1_epi32(2048)
+            });
+            let (lo, hi) = unsafe {
+                (
+                    _mm_unpacklo_epi16(self.0, o.0),
+                    _mm_unpackhi_epi16(self.0, o.0),
+                )
+            };
+            let mul = |k| unsafe {
+                _mm_packs_epi32(
+                    _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(lo, k), rnd)),
+                    _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(hi, k), rnd)),
+                )
+            };
+            (Self(mul(k1)), Self(mul(k2)))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpacklo_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpackhi_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpacklo_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpackhi_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpacklo_epi64(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpackhi_epi64(self.0, o.0) })
         }
     }
 }
@@ -451,6 +550,82 @@ mod imp {
             };
             nibbles.trailing_zeros() / 4
         }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            Self(unsafe { vqaddq_s16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub_sat(self, o: Self) -> Self {
+            Self(unsafe { vqsubq_s16(self.0, o.0) })
+        }
+
+        /// `(a * b + 0x4000) >> 15`: a product in Q15 with rounding.
+        #[inline(always)]
+        pub fn mulhrs(self, o: Self) -> Self {
+            Self(unsafe { vqrdmulhq_s16(self.0, o.0) })
+        }
+
+        /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
+        /// in 32 bits, each result saturated to `i16`.
+        #[inline(always)]
+        pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+            unsafe {
+                let (a_lo, a_hi) = (vget_low_s16(self.0), vget_high_s16(self.0));
+                let (b_lo, b_hi) = (vget_low_s16(o.0), vget_high_s16(o.0));
+                let (c1, c2) = (vdup_n_s16(c1), vdup_n_s16(c2));
+                let first = vcombine_s16(
+                    vqrshrn_n_s32::<12>(vmlsl_s16(vmull_s16(a_lo, c1), b_lo, c2)),
+                    vqrshrn_n_s32::<12>(vmlsl_s16(vmull_s16(a_hi, c1), b_hi, c2)),
+                );
+                let second = vcombine_s16(
+                    vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_lo, c2), b_lo, c1)),
+                    vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_hi, c2), b_hi, c1)),
+                );
+                (Self(first), Self(second))
+            }
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(unsafe { vzip1q_s16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(unsafe { vzip2q_s16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(unsafe {
+                vreinterpretq_s16_s32(vzip1q_s32(
+                    vreinterpretq_s32_s16(self.0),
+                    vreinterpretq_s32_s16(o.0),
+                ))
+            })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(unsafe {
+                vreinterpretq_s16_s32(vzip2q_s32(
+                    vreinterpretq_s32_s16(self.0),
+                    vreinterpretq_s32_s16(o.0),
+                ))
+            })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(unsafe { vcombine_s16(vget_low_s16(self.0), vget_low_s16(o.0)) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(unsafe { vcombine_s16(vget_high_s16(self.0), vget_high_s16(o.0)) })
+        }
     }
 }
 
@@ -653,6 +828,91 @@ mod imp {
         pub fn first_set2(self, o: Self) -> u32 {
             (i8x16_bitmask(i8x16_narrow_i16x8(self.0, o.0)) as u32 | 1 << 16).trailing_zeros()
         }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            Self(i16x8_add_sat(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn sub_sat(self, o: Self) -> Self {
+            Self(i16x8_sub_sat(self.0, o.0))
+        }
+
+        /// `(a * b + 0x4000) >> 15`: a product in Q15 with rounding.
+        #[inline(always)]
+        pub fn mulhrs(self, o: Self) -> Self {
+            Self(i16x8_q15mulr_sat(self.0, o.0))
+        }
+
+        /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
+        /// in 32 bits, each result saturated to `i16`.
+        #[inline(always)]
+        pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+            let (c1, c2, rnd) = (i16x8_splat(c1), i16x8_splat(c2), i32x4_splat(2048));
+            let first = |lo: bool| {
+                let (a, b) = if lo {
+                    (
+                        i32x4_extmul_low_i16x8(self.0, c1),
+                        i32x4_extmul_low_i16x8(o.0, c2),
+                    )
+                } else {
+                    (
+                        i32x4_extmul_high_i16x8(self.0, c1),
+                        i32x4_extmul_high_i16x8(o.0, c2),
+                    )
+                };
+                i32x4_shr(i32x4_add(i32x4_sub(a, b), rnd), 12)
+            };
+            let second = |lo: bool| {
+                let (a, b) = if lo {
+                    (
+                        i32x4_extmul_low_i16x8(self.0, c2),
+                        i32x4_extmul_low_i16x8(o.0, c1),
+                    )
+                } else {
+                    (
+                        i32x4_extmul_high_i16x8(self.0, c2),
+                        i32x4_extmul_high_i16x8(o.0, c1),
+                    )
+                };
+                i32x4_shr(i32x4_add(i32x4_add(a, b), rnd), 12)
+            };
+            (
+                Self(i16x8_narrow_i32x4(first(true), first(false))),
+                Self(i16x8_narrow_i32x4(second(true), second(false))),
+            )
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(i32x4_shuffle::<0, 4, 1, 5>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(i32x4_shuffle::<2, 6, 3, 7>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(i64x2_shuffle::<0, 2>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(i64x2_shuffle::<1, 3>(self.0, o.0))
+        }
     }
 }
 
@@ -848,6 +1108,68 @@ mod imp {
                 .chain(&o.0)
                 .position(|&m| m != 0)
                 .unwrap_or(16) as u32
+        }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            self.zip(o, i16::saturating_add)
+        }
+
+        #[inline(always)]
+        pub fn sub_sat(self, o: Self) -> Self {
+            self.zip(o, i16::saturating_sub)
+        }
+
+        /// `(a * b + 0x4000) >> 15`: a product in Q15 with rounding.
+        #[inline(always)]
+        pub fn mulhrs(self, o: Self) -> Self {
+            self.zip(o, |a, b| ((a as i32 * b as i32 + 0x4000) >> 15) as i16)
+        }
+
+        /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
+        /// in 32 bits, each result saturated to `i16`.
+        #[inline(always)]
+        pub fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+            let (c1, c2) = (c1 as i32, c2 as i32);
+            let sat = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            (
+                self.zip(o, |a, b| sat(a as i32 * c1 - b as i32 * c2 + 2048 >> 12)),
+                self.zip(o, |a, b| sat(a as i32 * c2 + b as i32 * c1 + 2048 >> 12)),
+            )
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(std::array::from_fn(|i| [self.0, o.0][i & 1][i >> 1]))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(std::array::from_fn(|i| [self.0, o.0][i & 1][4 + (i >> 1)]))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(std::array::from_fn(|i| {
+                [self.0, o.0][i >> 1 & 1][(i >> 2) * 2 + (i & 1)]
+            }))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(std::array::from_fn(|i| {
+                [self.0, o.0][i >> 1 & 1][4 + (i >> 2) * 2 + (i & 1)]
+            }))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(std::array::from_fn(|i| [self.0, o.0][i >> 2][i & 3]))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(std::array::from_fn(|i| [self.0, o.0][i >> 2][4 + (i & 3)]))
         }
     }
 }

@@ -126,6 +126,7 @@ mod ipred_prepare;
 mod iter;
 mod itx;
 mod itx_1d;
+mod itx_simd;
 pub(crate) mod levels;
 mod lf_apply;
 mod lf_mask;

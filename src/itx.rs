@@ -27,6 +27,7 @@ use crate::itx_1d::{
     rav1d_inv_identity16_1d_c, rav1d_inv_identity32_1d_c, rav1d_inv_identity4_1d_c,
     rav1d_inv_identity8_1d_c,
 };
+use crate::itx_simd;
 use crate::levels::{
     TxfmSize, TxfmType, ADST_ADST, ADST_DCT, ADST_FLIPADST, DCT_ADST, DCT_DCT, DCT_FLIPADST,
     FLIPADST_ADST, FLIPADST_DCT, FLIPADST_FLIPADST, H_ADST, H_DCT, H_FLIPADST, IDTX,
@@ -258,6 +259,39 @@ unsafe extern "C" fn inv_txfm_add_c_erased<
     let coeff = unsafe { slice::from_raw_parts_mut(coeff.cast(), coeff_len.into()) };
     let bd = BD::from_c(bitdepth_max);
     inv_txfm_add_rust::<W, H, TYPE, BD>(dst, coeff, eob, bd)
+}
+
+/// # Safety
+///
+/// Must be called by [`itxfm::Fn::call`] at 8 bpc, on x86 once the CPU flags hold SSE41.
+#[deny(unsafe_op_in_unsafe_fn)]
+#[allow(unused_unsafe)]
+unsafe extern "C" fn inv_txfm_add_simd_erased<
+    const W: usize,
+    const H: usize,
+    const TYPE: TxfmType,
+    BD: BitDepth,
+>(
+    _dst_ptr: *mut DynPixel,
+    _stride: isize,
+    coeff: *mut DynCoef,
+    eob: i32,
+    _bitdepth_max: i32,
+    coeff_len: u16,
+    dst: FFISafeRav1dPictureDataComponentOffset,
+) {
+    // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `itxfm::Fn::call`.
+    let dst = unsafe { FFISafe::from_with_offset(dst) };
+    // SAFETY: `fn itxfm::Fn::call` passes `coeff.len()` as `coeff_len`, and `BD::Coef` is `i16`
+    // at 8 bpc, the only depth this is chosen for.
+    let coeff = unsafe { slice::from_raw_parts_mut(coeff.cast::<i16>(), coeff_len.into()) };
+    // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+    unsafe {
+        match (W, H) {
+            (8, 8) => itx_simd::add_8x8::<BD, TYPE>(dst, coeff, eob),
+            _ => unreachable!(),
+        }
+    }
 }
 
 wrap_fn_ptr!(unsafe extern "C" fn itxfm(
@@ -741,6 +775,52 @@ impl Rav1dInvTxfmDSPContext {
         assign::<BD>(self)
     }
 
+    /// The 8 bpc sizes with Rust SIMD kernels; the rest keep the scalar `fn`s.
+    #[inline(always)]
+    const fn init_rust_simd<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if !flags.contains(CpuFlags::SSE41) {
+            return self;
+        }
+        let _ = flags;
+        if !crate::simd128::native() || BD::BITDEPTH != 8 {
+            return self;
+        }
+
+        macro_rules! assign {
+            ($w:literal, $h:literal, $($type:ident),*) => {{
+                let tx = TxfmSize::from_wh($w, $h) as usize;
+                $(
+                    self.itxfm_add[tx][$type as usize] =
+                        itxfm::Fn::new(inv_txfm_add_simd_erased::<$w, $h, $type, BD>);
+                )*
+            }};
+        }
+
+        assign!(
+            8,
+            8,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT,
+            V_ADST,
+            H_ADST,
+            V_FLIPADST,
+            H_FLIPADST
+        );
+        self
+    }
+
+    /// The Rust SIMD kernels stand in where there is no asm, or over it with `--cfg rav1d_rust_simd="itx"`.
     #[inline(always)]
     const fn init<BD: BitDepth>(self, flags: CpuFlags, bpc: u8) -> Self {
         #[cfg(all(feature = "asm", not(rav1d_rust_simd = "itx")))]
@@ -757,13 +837,177 @@ impl Rav1dInvTxfmDSPContext {
 
         #[allow(unreachable_code)] // Reachable on some #[cfg]s.
         {
-            let _ = flags;
             let _ = bpc;
-            self
+            self.init_rust_simd::<BD>(flags)
         }
     }
 
     pub const fn new<BD: BitDepth>(flags: CpuFlags, bpc: u8) -> Self {
         Self::default::<BD>().init::<BD>(flags, bpc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::AlignedVec64;
+    use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
+    use crate::include::common::bitdepth::BitDepth8;
+    use crate::include::dav1d::picture::Rav1dPictureDataComponent;
+    use crate::with_offset::WithOffset;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u32
+        }
+    }
+
+    const STRIDE: usize = 32;
+    const ROWS: usize = 16;
+
+    /// The block at (8, 4) of a random plane after `dsp`'s transform of `coeff`, and the coefficients it leaves.
+    fn run(
+        dsp: &Rav1dInvTxfmDSPContext,
+        tx: TxfmSize,
+        t: TxfmType,
+        orig: &[u8],
+        coeff: &[i16],
+        eob: i32,
+    ) -> (Vec<u8>, Vec<i16>) {
+        let mut buf = AlignedVec64::<u8>::new();
+        buf.resize(orig.len(), 0);
+        buf.as_mut_slice().copy_from_slice(orig);
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+        let mut coeff = coeff.to_vec();
+        dsp.itxfm_add[tx as usize][t as usize].call::<BitDepth8>(
+            WithOffset {
+                data: &comp,
+                offset: 4 * STRIDE + 8,
+            },
+            &mut coeff,
+            eob,
+            BitDepth8::from_c(255),
+        );
+        drop(comp);
+        (buf.as_slice().to_vec(), coeff)
+    }
+
+    /// Every type of a size on random coefficients and pixels, against the scalar transform;
+    /// `eob` 0 takes the DC path.
+    fn simd_matches_scalar(tx: TxfmSize, w: usize, h: usize) {
+        rav1d_init_cpu();
+        let scalar = Rav1dInvTxfmDSPContext::default::<BitDepth8>();
+        let simd = Rav1dInvTxfmDSPContext::default::<BitDepth8>()
+            .init_rust_simd::<BitDepth8>(rav1d_get_cpu_flags());
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for t in 0..N_TX_TYPES_PLUS_LL as TxfmType - 1 {
+            if *scalar.itxfm_add[tx as usize][t as usize].get() as usize
+                == *itxfm::Fn::DEFAULT.get() as usize
+            {
+                continue;
+            }
+            for round in 0..200 {
+                let eob = if round < 2 {
+                    round
+                } else {
+                    (rng.next() % (w * h) as u32) as i32
+                };
+                let mut coeff = vec![0i16; w * h];
+                let n = if eob == 0 { 1 } else { eob as usize + 1 };
+                let range = if round % 3 == 0 { 4096 } else { 512 };
+                for c in coeff.iter_mut().take(n) {
+                    if rng.next() % 2 == 0 {
+                        *c = (rng.next() % (2 * range) as u32) as i16 - range as i16;
+                    }
+                }
+                coeff[0] = (rng.next() % (2 * range) as u32) as i16 - range as i16;
+                let orig: Vec<u8> = (0..STRIDE * ROWS).map(|_| rng.next() as u8).collect();
+                let want = run(&scalar, tx, t, &orig, &coeff, eob);
+                let got = run(&simd, tx, t, &orig, &coeff, eob);
+                assert_eq!(got, want, "{w}x{h} type {t} eob {eob}");
+            }
+        }
+    }
+
+    #[test]
+    fn simd_8x8_matches_scalar() {
+        simd_matches_scalar(TxfmSize::S8x8, 8, 8);
+    }
+
+    /// ns per call of a size's DCT_DCT and ADST_ADST with a full block, scalar, Rust SIMD and asm.
+    #[test]
+    #[ignore]
+    fn time_itx() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        rav1d_init_cpu();
+        let flags = rav1d_get_cpu_flags();
+        #[allow(unused_mut)]
+        let mut dsps = vec![
+            ("scalar", Rav1dInvTxfmDSPContext::default::<BitDepth8>()),
+            (
+                "rust simd",
+                Rav1dInvTxfmDSPContext::default::<BitDepth8>().init_rust_simd::<BitDepth8>(flags),
+            ),
+        ];
+        #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+        dsps.push((
+            "asm",
+            Rav1dInvTxfmDSPContext::default::<BitDepth8>().init_x86::<BitDepth8>(flags, 8),
+        ));
+        #[cfg(all(feature = "asm", target_arch = "aarch64"))]
+        dsps.push((
+            "asm",
+            Rav1dInvTxfmDSPContext::default::<BitDepth8>().init_arm::<BitDepth8>(flags, 8),
+        ));
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut buf = AlignedVec64::<u8>::new();
+        buf.resize(STRIDE * ROWS, 0);
+        for b in buf.as_mut_slice() {
+            *b = rng.next() as u8;
+        }
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+        for (tx, w, h) in [(TxfmSize::S8x8, 8, 8)] {
+            for t in [DCT_DCT, ADST_ADST] {
+                let coeff: Vec<i16> = (0..w * h)
+                    .map(|_| (rng.next() % 1024) as i16 - 512)
+                    .collect();
+                let eob = (w * h - 1) as i32;
+                let mut line = format!("{w}x{h} type {t:2}:");
+                for (name, dsp) in &dsps {
+                    let f = &dsp.itxfm_add[tx as usize][t as usize];
+                    // The asm loads the coefficients aligned, as the decoder's buffers are.
+                    let mut c = AlignedVec64::<i16>::new();
+                    c.resize(coeff.len(), 0);
+                    let c = c.as_mut_slice();
+                    let mut best = f64::MAX;
+                    for _ in 0..20 {
+                        let n = 2000;
+                        let start = Instant::now();
+                        for _ in 0..n {
+                            c.copy_from_slice(&coeff);
+                            f.call::<BitDepth8>(
+                                WithOffset {
+                                    data: &comp,
+                                    offset: 4 * STRIDE + 8,
+                                },
+                                black_box(&mut *c),
+                                eob,
+                                BitDepth8::from_c(255),
+                            );
+                        }
+                        best = best.min(start.elapsed().as_nanos() as f64 / n as f64);
+                    }
+                    line += &format!("  {name} {best:6.1} ns");
+                }
+                println!("{line}");
+            }
+        }
     }
 }
