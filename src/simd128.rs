@@ -73,7 +73,6 @@ pub trait Lanes: Copy {
     fn select(m: Self, a: Self, b: Self) -> Self;
     fn and(self, o: Self) -> Self;
     fn eq(self, o: Self) -> Self;
-    fn or(self, o: Self) -> Self;
     /// Whether any lane is set.
     fn any(self) -> bool;
     /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
@@ -131,10 +130,6 @@ macro_rules! forward_lanes {
             #[inline(always)]
             fn any(self) -> bool {
                 <$t>::any(self)
-            }
-            #[inline(always)]
-            fn or(self, o: Self) -> Self {
-                <$t>::or(self, o)
             }
             #[inline(always)]
             fn sub(self, o: Self) -> Self {
