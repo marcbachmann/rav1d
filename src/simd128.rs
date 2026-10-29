@@ -90,6 +90,12 @@ mod imp {
             Self(unsafe { _mm_set1_epi16(v) })
         }
 
+        /// `v` in the low four lanes, the others unspecified: one shuffle fewer.
+        #[inline(always)]
+        pub fn splat_lo(v: i16) -> Self {
+            Self(unsafe { _mm_shufflelo_epi16::<0>(_mm_cvtsi32_si128(v as i32)) })
+        }
+
         /// Bytes `b[..8]` zero-extended.
         #[inline(always)]
         pub fn from_u8x8(b: &[u8]) -> Self {
@@ -277,6 +283,12 @@ mod imp {
         #[inline(always)]
         pub fn splat(v: i16) -> Self {
             Self(unsafe { vdupq_n_s16(v) })
+        }
+
+        /// `v` in the low four lanes, the others unspecified.
+        #[inline(always)]
+        pub fn splat_lo(v: i16) -> Self {
+            Self::splat(v)
         }
 
         /// Bytes `b[..8]` zero-extended.
@@ -469,6 +481,12 @@ mod imp {
         #[inline(always)]
         pub fn splat(v: i16) -> Self {
             Self(i16x8_splat(v))
+        }
+
+        /// `v` in the low four lanes, the others unspecified.
+        #[inline(always)]
+        pub fn splat_lo(v: i16) -> Self {
+            Self::splat(v)
         }
 
         /// Bytes `b[..8]` zero-extended.
@@ -669,6 +687,12 @@ mod imp {
         #[inline(always)]
         pub fn splat(v: i16) -> Self {
             Self([v; 8])
+        }
+
+        /// `v` in the low four lanes, the others unspecified.
+        #[inline(always)]
+        pub fn splat_lo(v: i16) -> Self {
+            Self::splat(v)
         }
 
         /// Bytes `b[..8]` zero-extended.

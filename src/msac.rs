@@ -360,7 +360,7 @@ fn ctx_norm_by(s: &mut MsacContext, dif: EcWin, rng: c_uint, d: c_int) {
 fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
     let r = s.rng;
     let dif = s.dif;
-    assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
+    debug_assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
     let (bit, dif, v) = split_at(dif, r, (r >> 8 << 7) + EC_MIN_PROB);
     // Half of an `r` of at least 0x8000 is at least 0x3ffc, so the shift is 0, 1 or 2, read off
     // the top bits without a bit scan, as in the asm.
@@ -377,7 +377,7 @@ fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
 fn rav1d_msac_decode_bool_rust(s: &mut MsacContext, f: c_uint) -> bool {
     let r = s.rng;
     let dif = s.dif;
-    assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
+    debug_assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
     let v = ((r >> 8) * (f >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
     let (bit, dif, v) = split_at(dif, r, v);
     ctx_norm(s, dif, v);
@@ -515,8 +515,13 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
 ) -> u8 {
     let n = n_symbols as usize;
     assert!(n < LANES);
-    let c = I16x8::splat((s.dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
-    let r = I16x8::splat((s.rng & 0xff00) as u16 as i16);
+    let splat = if LANES == 4 {
+        I16x8::splat_lo
+    } else {
+        I16x8::splat
+    };
+    let c = splat((s.dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
+    let r = splat((s.rng & 0xff00) as u16 as i16);
     let zero = I16x8::splat(0);
     let (mut cdfs, mut at_or_past) = ([zero; 2], [zero; 2]);
     // `rng`, then the bounds: the symbol's bounds are `[val]` and `[val + 1]`.
@@ -670,8 +675,8 @@ fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
     let (mut dif, mut rng) = (s.dif, s.rng);
     let mut tok = 3;
     loop {
-        let c = I16x8::splat((dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
-        let r = I16x8::splat((rng & 0xff00) as u16 as i16);
+        let c = I16x8::splat_lo((dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
+        let r = I16x8::splat_lo((rng & 0xff00) as u16 as i16);
         let p = cdfv.and(I16x8::splat(-64));
         let v = p.add(p).mulhi_u(r).add(min_probs);
         let mut bounds = [0; 10];
