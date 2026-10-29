@@ -678,6 +678,22 @@ mod imp {
             Self(unsafe { _mm_loadl_epi64(s[..4].as_ptr().cast()) })
         }
 
+        /// `(v[0] * k[0] + .. + v[7] * k[7] + rnd) >> S` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd8<const S: i32>(v: [Self; 8], k: [i16; 8], rnd: i32) -> Self {
+            unsafe {
+                let mut lo = _mm_set1_epi32(rnd);
+                let mut hi = lo;
+                for i in (0..8).step_by(2) {
+                    let k = _mm_set1_epi32(k[i] as u16 as i32 | (k[i + 1] as i32) << 16);
+                    let (a, b) = (v[i].0, v[i + 1].0);
+                    lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), k));
+                    hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), k));
+                }
+                Self(_mm_packs_epi32(_mm_srai_epi32::<S>(lo), _mm_srai_epi32::<S>(hi)))
+            }
+        }
+
         /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.
         #[inline(always)]
         pub fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
@@ -1022,6 +1038,23 @@ mod imp {
             Self(unsafe { vcombine_s16(vld1_s16(s[..4].as_ptr()), vdup_n_s16(0)) })
         }
 
+        /// `(v[0] * k[0] + .. + v[7] * k[7] + rnd) >> S` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd8<const S: i32>(v: [Self; 8], k: [i16; 8], rnd: i32) -> Self {
+            unsafe {
+                let mut lo = vdupq_n_s32(rnd);
+                let mut hi = lo;
+                for i in 0..8 {
+                    lo = vmlal_n_s16(lo, vget_low_s16(v[i].0), k[i]);
+                    hi = vmlal_high_n_s16(hi, v[i].0, k[i]);
+                }
+                Self(vcombine_s16(
+                    vqmovn_s32(vshrq_n_s32::<S>(lo)),
+                    vqmovn_s32(vshrq_n_s32::<S>(hi)),
+                ))
+            }
+        }
+
         /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.
         #[inline(always)]
         pub fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
@@ -1359,6 +1392,22 @@ mod imp {
         pub fn load_lo(s: &[i16]) -> Self {
             let s = &s[..4];
             Self(i16x8(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+
+        /// `(v[0] * k[0] + .. + v[7] * k[7] + rnd) >> S` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd8<const S: i32>(v: [Self; 8], k: [i16; 8], rnd: i32) -> Self {
+            let mut lo = i32x4_splat(rnd);
+            let mut hi = lo;
+            for i in 0..8 {
+                let k = i16x8_splat(k[i]);
+                lo = i32x4_add(lo, i32x4_extmul_low_i16x8(v[i].0, k));
+                hi = i32x4_add(hi, i32x4_extmul_high_i16x8(v[i].0, k));
+            }
+            Self(i16x8_narrow_i32x4(
+                i32x4_shr(lo, S as u32),
+                i32x4_shr(hi, S as u32),
+            ))
         }
 
         /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.
@@ -1701,6 +1750,18 @@ mod imp {
         #[inline(always)]
         pub fn load_lo(s: &[i16]) -> Self {
             Self([s[0], s[1], s[2], s[3], 0, 0, 0, 0])
+        }
+
+        /// `(v[0] * k[0] + .. + v[7] * k[7] + rnd) >> S` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd8<const S: i32>(v: [Self; 8], k: [i16; 8], rnd: i32) -> Self {
+            Self(std::array::from_fn(|l| {
+                let mut s = rnd;
+                for i in 0..8 {
+                    s += v[i].0[l] as i32 * k[i] as i32;
+                }
+                (s >> S).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+            }))
         }
 
         /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12` in 32 bits, saturated to `i16`.

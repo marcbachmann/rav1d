@@ -3394,6 +3394,144 @@ mod neon_erased {
     }
 }
 
+/// The 8 bpc filters on [`I16x8`].
+mod rust_simd {
+    use super::*;
+    use crate::simd128::I16x8;
+
+    const ROWS: usize = 64 + 3 + 3;
+    /// A unit is at most 256 wide, the last of a row up to half as wide again.
+    const MAX_W: usize = 256 * 3 / 2;
+
+    #[inline(always)]
+    fn px8(row: &[u8], i: usize) -> I16x8 {
+        I16x8::from_u8x8(&row[i..])
+    }
+
+    /// One row of 7 taps across, clipped to 13 bits, 8 pixels at a time with 32-bit sums. The
+    /// 128 of the centre tap is folded back into its coefficient.
+    #[inline(always)]
+    fn wiener_h(out: &mut [i16; MAX_W + 8], t: &[u8], w: usize, k: [i16; 8]) {
+        let zero = I16x8::splat(0);
+        let max = I16x8::splat((1 << 13) - 1);
+        for i in (0..w).step_by(8) {
+            let v = [
+                px8(t, i),
+                px8(t, i + 1),
+                px8(t, i + 2),
+                px8(t, i + 3),
+                px8(t, i + 4),
+                px8(t, i + 5),
+                px8(t, i + 6),
+                zero,
+            ];
+            I16x8::madd8::<3>(v, k, (1 << 14) + 4)
+                .max(zero)
+                .min(max)
+                .store(&mut out[i..]);
+        }
+    }
+
+    /// Wiener over the padded `tmp`: rows across into a ring of the 7 the taps down read.
+    #[inline(always)]
+    fn wiener(
+        mut dst: impl FnMut(usize, &[u8]),
+        tmp: &[u8; ROWS * REST_UNIT_STRIDE],
+        w: usize,
+        h: usize,
+        filter: &[[i16; 8]; 2],
+    ) {
+        let mut kh = filter[0];
+        kh[3] += 128;
+        kh[7] = 0;
+        let mut kv = filter[1];
+        kv[7] = 0;
+        let zero = I16x8::splat(0);
+        let mut ring = [[0i16; MAX_W + 8]; 8];
+        let t = |r: usize| &tmp[r * REST_UNIT_STRIDE..][..REST_UNIT_STRIDE];
+        for r in 0..6 {
+            wiener_h(&mut ring[r], t(r), w, kh);
+        }
+        for j in 0..h {
+            wiener_h(&mut ring[(j + 6) % 8], t(j + 6), w, kh);
+            let mut row = [0u8; MAX_W + 8];
+            for i in (0..w).step_by(8) {
+                let r = |k: usize| &ring[(j + k) % 8][i..];
+                let v = [
+                    I16x8::load(r(0)),
+                    I16x8::load(r(1)),
+                    I16x8::load(r(2)),
+                    I16x8::load(r(3)),
+                    I16x8::load(r(4)),
+                    I16x8::load(r(5)),
+                    I16x8::load(r(6)),
+                    zero,
+                ];
+                let p = I16x8::madd8::<11>(v, kv, (1 << 10) - (1 << 18)).pack_u8();
+                row[i..i + 8].copy_from_slice(&p);
+            }
+            dst(j, &row[..w]);
+        }
+    }
+
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn wiener_128<BD: BitDepth>(
+        p: Rav1dPictureDataComponentOffset,
+        left: &[LeftPixelRow<BD::Pixel>],
+        lpf: &DisjointMut<AlignedVec64<u8>>,
+        lpf_off: isize,
+        w: usize,
+        h: usize,
+        params: &LooprestorationParams,
+        edges: LrEdgeFlags,
+    ) {
+        let mut tmp = [0.into(); ROWS * REST_UNIT_STRIDE];
+        padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
+        let tmp: &[u8; ROWS * REST_UNIT_STRIDE] = tmp.as_bytes().try_into().unwrap();
+        let stride = p.pixel_stride::<BD>();
+        let store = |j: usize, row: &[u8]| {
+            let p = p + j as isize * stride;
+            p.slice_mut::<BD>(row.len()).as_bytes_mut().copy_from_slice(row);
+        };
+        wiener(store, tmp, w, h, &params.filter);
+    }
+
+    /// # Safety
+    ///
+    /// Must be called by [`loop_restoration_filter::Fn::call`] at 8 bpc, on x86 once the CPU
+    /// flags hold SSE41.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn wiener_erased<BD: BitDepth>(
+        _p_ptr: *mut DynPixel,
+        _stride: ptrdiff_t,
+        left: *const LeftPixelRow<DynPixel>,
+        lpf_ptr: *const DynPixel,
+        w: c_int,
+        h: c_int,
+        params: &LooprestorationParams,
+        edges: LrEdgeFlags,
+        _bitdepth_max: c_int,
+        p: FFISafeRav1dPictureDataComponentOffset,
+        lpf: *const FFISafe<DisjointMut<AlignedVec64<u8>>>,
+    ) {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `loop_restoration_filter::Fn::call`.
+        let p = unsafe { FFISafe::from_with_offset(p) };
+        let left = left.cast();
+        // SAFETY: Was passed as `FFISafe::new(_)` in `loop_restoration_filter::Fn::call`.
+        let lpf = unsafe { FFISafe::get(lpf) };
+        let lpf_off = reconstruct_lpf_offset::<BD>(lpf, lpf_ptr.cast());
+        let (w, h) = (w as usize, h as usize);
+        // SAFETY: Length sliced in `loop_restoration_filter::Fn::call`.
+        let left = unsafe { slice::from_raw_parts(left, h) };
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe { wiener_128::<BD>(p, left, lpf, lpf_off, w, h, params, edges) }
+    }
+}
+
 impl Rav1dLoopRestorationDSPContext {
     pub const fn default<BD: BitDepth>() -> Self {
         Self {
@@ -3537,13 +3675,235 @@ impl Rav1dLoopRestorationDSPContext {
 
         #[allow(unreachable_code)] // Reachable on some #[cfg]s.
         {
-            let _ = flags;
             let _ = bpc;
-            self
+            self.init_rust_simd::<BD>(flags)
         }
+    }
+
+    /// The Rust SIMD filters at 8 bpc; they stand in where there is no asm, or over it with
+    /// `--cfg rav1d_rust_simd="looprestoration"`.
+    #[inline(always)]
+    const fn init_rust_simd<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if !flags.contains(CpuFlags::SSE41) {
+            return self;
+        }
+        let _ = flags;
+        if !crate::simd128::native() || BD::BITDEPTH != 8 {
+            return self;
+        }
+        let wiener = loop_restoration_filter::Fn::new(rust_simd::wiener_erased::<BD>);
+        self.wiener = [wiener; 2];
+        self
     }
 
     pub const fn new<BD: BitDepth>(flags: CpuFlags, bpc: u8) -> Self {
         Self::default::<BD>().init::<BD>(flags, bpc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::AlignedVec64;
+    use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
+    use crate::include::common::bitdepth::BitDepth8;
+    use crate::include::dav1d::picture::Rav1dPictureDataComponent;
+    use crate::with_offset::WithOffset;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u32
+        }
+
+        fn range(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() % (hi - lo + 1) as u32) as i32
+        }
+    }
+
+    const STRIDE: usize = 512;
+    const ROWS: usize = 72;
+    /// The unit's top-left, past the 3 columns the filters read to its left.
+    const AT: usize = 4 * STRIDE + 64;
+
+    fn rust() -> Rav1dLoopRestorationDSPContext {
+        rav1d_init_cpu();
+        let flags = rav1d_get_cpu_flags();
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(flags.contains(CpuFlags::SSE41), "the SIMD filters need SSE4.1");
+        Rav1dLoopRestorationDSPContext::default::<BitDepth8>().init_rust_simd::<BitDepth8>(flags)
+    }
+
+    /// Pixels near a base with some outliers, the way decoded planes look.
+    fn plane(rng: &mut Rng, n: usize) -> Vec<u8> {
+        let base = rng.range(0, 255);
+        (0..n)
+            .map(|_| match rng.next() % 8 {
+                0 => rng.next() as u8,
+                _ => (base + rng.range(-12, 12)).clamp(0, 255) as u8,
+            })
+            .collect()
+    }
+
+    /// Coefficients in the ranges the bitstream codes.
+    fn wiener_params(rng: &mut Rng, five: bool) -> LooprestorationParams {
+        let mut params = LooprestorationParams::default();
+        for (f, centre) in [(0, 0), (1, 128)] {
+            let k = [
+                if five { 0 } else { rng.range(-5, 10) },
+                rng.range(-23, 8),
+                rng.range(-17, 46),
+            ]
+            .map(|k| k as i16);
+            let filter = &mut params.filter[f];
+            filter[..3].copy_from_slice(&k);
+            filter[4] = k[2];
+            filter[5] = k[1];
+            filter[6] = k[0];
+            filter[3] = centre - (k[0] + k[1] + k[2]) * 2;
+        }
+        params
+    }
+
+    struct Unit {
+        pic: Vec<u8>,
+        lpf: Vec<u8>,
+        left: Vec<LeftPixelRow<u8>>,
+    }
+
+    impl Unit {
+        fn new(rng: &mut Rng) -> Self {
+            let pic = plane(rng, STRIDE * ROWS);
+            let lpf = plane(rng, STRIDE * 12);
+            let left = plane(rng, 4 * 64).chunks_exact(4).map(|c| c.try_into().unwrap()).collect();
+            Self { pic, lpf, left }
+        }
+
+        /// The plane after `f` filters a `w`x`h` unit at [`AT`].
+        fn run(
+            &self,
+            f: &loop_restoration_filter::Fn,
+            w: usize,
+            h: usize,
+            params: &LooprestorationParams,
+            edges: LrEdgeFlags,
+        ) -> Vec<u8> {
+            let mut buf = AlignedVec64::<u8>::new();
+            buf.resize(self.pic.len(), 0);
+            buf.as_mut_slice().copy_from_slice(&self.pic);
+            let mut lpf = AlignedVec64::<u8>::new();
+            lpf.resize(self.lpf.len(), 0);
+            lpf.as_mut_slice().copy_from_slice(&self.lpf);
+            let lpf = DisjointMut::new(lpf);
+            let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+            let dst = WithOffset {
+                data: &comp,
+                offset: AT,
+            };
+            let bd = BitDepth8::from_c(255);
+            f.call::<BitDepth8>(dst, &self.left, &lpf, 64, w as c_int, h as c_int, params, edges, bd);
+            drop(comp);
+            buf.as_slice().to_vec()
+        }
+    }
+
+    #[test]
+    fn wiener_matches_scalar() {
+        let scalar = Rav1dLoopRestorationDSPContext::default::<BitDepth8>();
+        let rust = rust();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..300 {
+            let unit = Unit::new(&mut rng);
+            let five = round % 2 == 1;
+            let params = wiener_params(&mut rng, five);
+            let w = match round % 5 {
+                0 => 384,
+                1 => 64,
+                _ => rng.range(1, 384) as usize,
+            };
+            let h = match round % 3 {
+                0 => 64,
+                _ => rng.range(1, 64) as usize,
+            };
+            let edges = LrEdgeFlags::from_bits_truncate(rng.next() as u8);
+            let f = five as usize;
+            let want = unit.run(&scalar.wiener[f], w, h, &params, edges);
+            let got = unit.run(&rust.wiener[f], w, h, &params, edges);
+            assert_eq!(got, want, "{w}x{h} edges {:#x} round {round}", edges.bits());
+        }
+    }
+
+    /// Best of 20 batches, in ns per call.
+    fn ns(n: usize, mut f: impl FnMut()) -> f64 {
+        use std::time::Instant;
+
+        let mut best = f64::MAX;
+        for _ in 0..20 {
+            let start = Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            best = best.min(start.elapsed().as_nanos() as f64 / n as f64);
+        }
+        best
+    }
+
+    /// ns per call of a 64-row stripe, scalar, Rust and asm.
+    #[test]
+    #[ignore]
+    fn time_lr() {
+        rav1d_init_cpu();
+        let flags = rav1d_get_cpu_flags();
+        #[allow(unused_mut)]
+        let mut dsps = vec![
+            ("scalar", Rav1dLoopRestorationDSPContext::default::<BitDepth8>()),
+            ("rust", rust()),
+        ];
+        #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
+        dsps.push((
+            "asm",
+            Rav1dLoopRestorationDSPContext::default::<BitDepth8>().init_x86::<BitDepth8>(flags, 8),
+        ));
+        #[cfg(all(feature = "asm", target_arch = "aarch64"))]
+        dsps.push((
+            "asm",
+            Rav1dLoopRestorationDSPContext::default::<BitDepth8>().init_arm::<BitDepth8>(flags, 8),
+        ));
+        let _ = flags;
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let unit = Unit::new(&mut rng);
+        let mut buf = AlignedVec64::<u8>::new();
+        buf.resize(unit.pic.len(), 0);
+        buf.as_mut_slice().copy_from_slice(&unit.pic);
+        let mut lpf = AlignedVec64::<u8>::new();
+        lpf.resize(unit.lpf.len(), 0);
+        lpf.as_mut_slice().copy_from_slice(&unit.lpf);
+        let lpf = DisjointMut::new(lpf);
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+        let dst = WithOffset {
+            data: &comp,
+            offset: AT,
+        };
+        let bd = BitDepth8::from_c(255);
+        let edges = LrEdgeFlags::all();
+        for (name, five) in [("wiener7", false), ("wiener5", true)] {
+            let params = wiener_params(&mut rng, five);
+            for w in [64, 128, 256, 384] {
+                let mut line = format!("{name} {w}x64:");
+                for (dsp_name, dsp) in &dsps {
+                    let f = &dsp.wiener[five as usize];
+                    let best = ns(20, || {
+                        f.call::<BitDepth8>(dst, &unit.left, &lpf, 64, w, 64, &params, edges, bd);
+                    });
+                    line += &format!("  {dsp_name} {best:7.0} ns");
+                }
+                println!("{line}");
+            }
+        }
     }
 }
