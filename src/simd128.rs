@@ -927,8 +927,10 @@ mod imp {
             Self(unsafe { vandq_s16(self.0, o.0) })
         }
 
-        /// The high halves of the unsigned products.
+        /// The high halves of the unsigned products. Unused on aarch64, where msac scales with
+        /// a doubling multiply instead.
         #[inline(always)]
+        #[allow(dead_code)]
         pub fn mulhi_u(self, o: Self) -> Self {
             let (a, b) = (u(self.0), u(o.0));
             let lo = unsafe { vmull_u16(vget_low_u16(a), vget_low_u16(b)) };

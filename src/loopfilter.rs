@@ -282,7 +282,7 @@ fn loop_filter<BD: BitDepth>(
 /// its result, as the C's branches would. Along a vertical edge the lines are rows, turned into
 /// lanes by an 8x8 transpose; along a horizontal one they are columns, loaded as they lie.
 mod rust_simd {
-    use zerocopy::AsBytes;
+    use zerocopy::{AsBytes, FromBytes};
 
     use super::*;
     #[cfg(target_arch = "x86_64")]
@@ -301,7 +301,12 @@ mod rust_simd {
         /// of two lines eight apart.
         fn load_rows(a: &[u8], b: &[u8]) -> Self;
         fn store_rows(self, a: &mut [u8], b: &mut [u8]);
+        /// `s[..N]`: sixteen-bit pixels, or a lane's thresholds.
         fn load_i16(s: &[i16]) -> Self;
+        fn store_i16(self, d: &mut [i16]);
+        /// [`Px::load_rows`] for sixteen-bit pixels.
+        fn load_rows16(a: &[i16], b: &[i16]) -> Self;
+        fn store_rows16(self, a: &mut [i16], b: &mut [i16]);
     }
 
     impl Px for I16x8 {
@@ -325,6 +330,18 @@ mod rust_simd {
         #[inline(always)]
         fn load_i16(s: &[i16]) -> Self {
             I16x8::load(s)
+        }
+        #[inline(always)]
+        fn store_i16(self, d: &mut [i16]) {
+            self.store(d)
+        }
+        #[inline(always)]
+        fn load_rows16(a: &[i16], _: &[i16]) -> Self {
+            I16x8::load(a)
+        }
+        #[inline(always)]
+        fn store_rows16(self, a: &mut [i16], _: &mut [i16]) {
+            self.store(a)
         }
     }
 
@@ -353,6 +370,30 @@ mod rust_simd {
         fn load_i16(s: &[i16]) -> Self {
             I16x16::load(s)
         }
+        #[inline(always)]
+        fn store_i16(self, d: &mut [i16]) {
+            self.store(d)
+        }
+        #[inline(always)]
+        fn load_rows16(a: &[i16], b: &[i16]) -> Self {
+            I16x16::from_halves(I16x8::load(a), I16x8::load(b))
+        }
+        #[inline(always)]
+        fn store_rows16(self, a: &mut [i16], b: &mut [i16]) {
+            self.lo().store(a);
+            self.hi().store(b);
+        }
+    }
+
+    /// A picture row's sixteen-bit pixels as lanes.
+    #[inline(always)]
+    fn px16(b: &[u8]) -> &[i16] {
+        FromBytes::slice_from(b).unwrap()
+    }
+
+    #[inline(always)]
+    fn px16_mut(b: &mut [u8]) -> &mut [i16] {
+        FromBytes::mut_slice_from(b).unwrap()
     }
 
     /// A group's thresholds and filter-length masks, per lane.
@@ -366,6 +407,12 @@ mod rust_simd {
         gt4: V,
         gt6: V,
         wd16: V,
+        /// The flat test's limit, the narrow filter's clip range and the pixel maximum, scaled to
+        /// the bit depth.
+        flat: V,
+        lo: V,
+        hi: V,
+        max: V,
     }
 
     #[inline(always)]
@@ -501,7 +548,7 @@ mod rust_simd {
         let hev = le(absdiff(p1, p0), p.h)
             .and(le(absdiff(q1, q0), p.h))
             .eq(zero);
-        let (lo, hi) = (V::splat(-128), V::splat(127));
+        let (lo, hi) = (p.lo, p.hi);
         let f = p1.sub(q1).max(lo).min(hi).and(hev);
         let d = q0.sub(p0);
         let f = d.add(d).add(d).add(f).max(lo).min(hi);
@@ -516,12 +563,12 @@ mod rust_simd {
         if MAX < 6 {
             return;
         }
-        let mut flat_in = le(absdiff(p2, p0), one)
-            .and(le(absdiff(p1, p0), one))
-            .and(le(absdiff(q1, q0), one))
-            .and(le(absdiff(q2, q0), one));
+        let mut flat_in = le(absdiff(p2, p0), p.flat)
+            .and(le(absdiff(p1, p0), p.flat))
+            .and(le(absdiff(q1, q0), p.flat))
+            .and(le(absdiff(q2, q0), p.flat));
         if MAX > 6 {
-            let c = le(absdiff(p3, p0), one).and(le(absdiff(q3, q0), one));
+            let c = le(absdiff(p3, p0), p.flat).and(le(absdiff(q3, q0), p.flat));
             flat_in = flat_in.and(V::select(p.gt6, c, ones));
         }
         let flat_in = flat_in.and(fm);
@@ -546,12 +593,12 @@ mod rust_simd {
             px[k] = V::select(m, out[k], px[k]);
         }
         if MAX == 16 && flat_in.and(p.wd16).any() {
-            let flat_out = le(absdiff(p6, p0), one)
-                .and(le(absdiff(p5, p0), one))
-                .and(le(absdiff(p4, p0), one))
-                .and(le(absdiff(q4, q0), one))
-                .and(le(absdiff(q5, q0), one))
-                .and(le(absdiff(q6, q0), one));
+            let flat_out = le(absdiff(p6, p0), p.flat)
+                .and(le(absdiff(p5, p0), p.flat))
+                .and(le(absdiff(p4, p0), p.flat))
+                .and(le(absdiff(q4, q0), p.flat))
+                .and(le(absdiff(q5, q0), p.flat))
+                .and(le(absdiff(q6, q0), p.flat));
             let m = flat_in.and(flat_out).and(p.wd16);
             flat16(&orig, &mut out);
             for k in 1..=12 {
@@ -570,6 +617,47 @@ mod rust_simd {
         }
     }
 
+    /// Eight pixels from `a`, and on sixteen lanes eight from `b` in the high half.
+    #[inline(always)]
+    fn load_rows<BD: BitDepth, V: Px>(
+        a: Rav1dPictureDataComponentOffset,
+        b: Rav1dPictureDataComponentOffset,
+    ) -> V {
+        let a = a.slice::<BD>(8);
+        let a = a.as_bytes();
+        match (V::N, BD::BITDEPTH) {
+            (8, 8) => V::load_rows(a, &[]),
+            (8, _) => V::load_rows16(px16(a), &[]),
+            (_, 8) => V::load_rows(a, b.slice::<BD>(8).as_bytes()),
+            _ => V::load_rows16(px16(a), px16(b.slice::<BD>(8).as_bytes())),
+        }
+    }
+
+    /// [`load_rows`] back, sixteen-bit pixels clipped to `max`.
+    #[inline(always)]
+    fn store_rows<BD: BitDepth, V: Px>(
+        v: V,
+        a: Rav1dPictureDataComponentOffset,
+        b: Rav1dPictureDataComponentOffset,
+        max: V,
+    ) {
+        let mut a = a.slice_mut::<BD>(8);
+        let a = a.as_bytes_mut();
+        if BD::BITDEPTH == 8 {
+            return if V::N == 8 {
+                v.store_rows(a, &mut [])
+            } else {
+                v.store_rows(a, b.slice_mut::<BD>(8).as_bytes_mut())
+            };
+        }
+        let v = v.max(V::splat(0)).min(max);
+        if V::N == 8 {
+            v.store_rows16(px16_mut(a), &mut [])
+        } else {
+            v.store_rows16(px16_mut(a), px16_mut(b.slice_mut::<BD>(8).as_bytes_mut()))
+        }
+    }
+
     /// One group along a horizontal edge: lanes are the columns from `dst`.
     #[inline(always)]
     fn group_v<BD: BitDepth, V: Px, const MAX: usize>(
@@ -580,14 +668,25 @@ mod rust_simd {
         let r = reach(MAX) as isize;
         let mut px = [V::splat(0); 14];
         for k in -r..r {
-            let row = dst + k * stride;
-            px[(7 + k) as usize] = V::load_px(row.slice::<BD>(V::N).as_bytes());
+            let row = (dst + k * stride).slice::<BD>(V::N);
+            px[(7 + k) as usize] = if BD::BITDEPTH == 8 {
+                V::load_px(row.as_bytes())
+            } else {
+                V::load_i16(px16(row.as_bytes()))
+            };
         }
         filter::<V, MAX>(&mut px, p);
         let w = if MAX == 16 { 6 } else { r.min(3) };
         for k in -w..w {
-            let row = dst + k * stride;
-            px[(7 + k) as usize].store_px(row.slice_mut::<BD>(V::N).as_bytes_mut());
+            let mut row = (dst + k * stride).slice_mut::<BD>(V::N);
+            let v = px[(7 + k) as usize];
+            if BD::BITDEPTH == 8 {
+                v.store_px(row.as_bytes_mut());
+            } else {
+                v.max(V::splat(0))
+                    .min(p.max)
+                    .store_i16(px16_mut(row.as_bytes_mut()));
+            }
         }
     }
 
@@ -605,12 +704,8 @@ mod rust_simd {
             let x = x0 + 8 * w as isize;
             for (r, v) in win.iter_mut().enumerate() {
                 let a = dst + (r as isize * stride + x);
-                *v = if V::N == 8 {
-                    V::load_rows(a.slice::<BD>(8).as_bytes(), &[])
-                } else {
-                    let b = dst + ((r + 8) as isize * stride + x);
-                    V::load_rows(a.slice::<BD>(8).as_bytes(), b.slice::<BD>(8).as_bytes())
-                };
+                let b = dst + ((r + 8) as isize * stride + x);
+                *v = load_rows::<BD, V>(a, b);
             }
             transpose8x8(win);
         }
@@ -632,17 +727,10 @@ mod rust_simd {
         for (w, win) in win.iter_mut().enumerate().take(n) {
             let x = x0 + 8 * w as isize;
             transpose8x8(win);
-            for (r, v) in win.iter().enumerate() {
+            for (r, &v) in win.iter().enumerate() {
                 let a = dst + (r as isize * stride + x);
-                if V::N == 8 {
-                    v.store_rows(&mut *a.slice_mut::<BD>(8).as_bytes_mut(), &mut [])
-                } else {
-                    let b = dst + ((r + 8) as isize * stride + x);
-                    v.store_rows(
-                        &mut *a.slice_mut::<BD>(8).as_bytes_mut(),
-                        &mut *b.slice_mut::<BD>(8).as_bytes_mut(),
-                    )
-                }
+                let b = dst + ((r + 8) as isize * stride + x);
+                store_rows::<BD, V>(v, a, b, p.max);
             }
         }
     }
@@ -713,10 +801,11 @@ mod rust_simd {
                 let (e, i, h) = (lut.0.e[l as usize], lut.0.i[l as usize], l >> 4);
                 scalar[j] = Some((e, i, h, wd));
                 max = max.max(wd);
+                let s = bd.bitdepth() - 8;
                 let flags = [
-                    e as i16,
-                    i as i16,
-                    h as i16,
+                    (e as i16) << s,
+                    (i as i16) << s,
+                    (h as i16) << s,
                     -1,
                     -((wd > 4) as i16),
                     -((wd > 6) as i16),
@@ -735,6 +824,7 @@ mod rust_simd {
                 }
             } else if max != 0 {
                 let [e, i, h, active, gt4, gt6, wd16] = lanes.map(|l| V::load_i16(&l));
+                let s = bd.bitdepth() - 8;
                 let p = Params {
                     e,
                     i,
@@ -743,6 +833,10 @@ mod rust_simd {
                     gt4,
                     gt6,
                     wd16,
+                    flat: V::splat(1 << s),
+                    lo: V::splat(-128 << s),
+                    hi: V::splat((128 << s) - 1),
+                    max: V::splat(bd.bitdepth_max().as_::<i16>()),
                 };
                 match (matches!(hv, super::HV::H), max) {
                     (true, 4) => group_h::<BD, V, 4>(dst, p),
@@ -820,6 +914,12 @@ mod rust_simd {
         let lvl = unsafe { FFISafe::from_with_offset(lvl) };
         let b4_stride = b4_stride as usize;
         let bd = BD::from_c(bitdepth_max);
+        // Above 10 bits the flat filters' sums leave `i16`.
+        if bitdepth_max > 1023 {
+            return loop_filter_sb128_rust::<BD, { HV }, { YUV }>(
+                dst, vmask, lvl, b4_stride, lut, wh, bd,
+            );
+        }
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86, and AVX2 before `WIDE` is;
         // elsewhere it is safe.
         unsafe {
@@ -1028,7 +1128,7 @@ impl Rav1dLoopFilterDSPContext {
         #[cfg(not(target_arch = "x86_64"))]
         let avx2 = false;
         let _ = flags;
-        if !crate::simd128::native() || BD::BITDEPTH != 8 {
+        if !crate::simd128::native() {
             return self;
         }
         let lf = &mut self.loop_filter_sb;
@@ -1076,7 +1176,7 @@ mod tests {
     use super::*;
     use crate::align::AlignedVec64;
     use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
-    use crate::include::common::bitdepth::BitDepth8;
+    use crate::include::common::bitdepth::{BitDepth16, BitDepth8};
     use crate::include::dav1d::picture::Rav1dPictureDataComponent;
     use crate::lf_mask::rav1d_calc_eih;
 
@@ -1097,19 +1197,20 @@ mod tests {
 
     /// The plane after `f` filters one edge: vertical at column 32 from row 8, or horizontal at
     /// row 32 from column 0, `wh` segments long.
-    fn run(
+    fn run<BD: BitDepth>(
         f: &loopfilter_sb::Fn,
         hv: HV,
-        orig: &[u8],
+        orig: &[BD::Pixel],
         mask: &[u32; 3],
         lvl: &DisjointMut<AlignedVec2<u8>>,
         lut: &Align16<Av1FilterLUT>,
         wh: usize,
-    ) -> Vec<u8> {
-        let mut buf = AlignedVec64::<u8>::new();
-        buf.resize(orig.len(), 0);
+        bitdepth_max: c_int,
+    ) -> Vec<BD::Pixel> {
+        let mut buf = AlignedVec64::<BD::Pixel>::new();
+        buf.resize(orig.len(), 0.into());
         buf.as_mut_slice().copy_from_slice(orig);
-        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), STRIDE);
         let offset = match hv {
             HV::H => 8 * STRIDE + 32,
             HV::V => 32 * STRIDE,
@@ -1122,7 +1223,7 @@ mod tests {
             data: lvl,
             offset: 8 * B4_STRIDE,
         };
-        let dst_ptr = dst.as_mut_ptr::<BitDepth8>().cast();
+        let dst_ptr = dst.as_mut_ptr::<BD>().cast();
         let lvl_ptr = lvl.data.as_mut_ptr().wrapping_add(lvl.offset).cast();
         // SAFETY: The arguments are what `loopfilter_sb::Fn::call` passes.
         unsafe {
@@ -1134,7 +1235,7 @@ mod tests {
                 B4_STRIDE as isize,
                 lut,
                 wh as c_int,
-                255,
+                bitdepth_max,
                 dst.into_ffi_safe(),
                 lvl.into_ffi_safe(),
             )
@@ -1143,26 +1244,26 @@ mod tests {
         buf.as_slice().to_vec()
     }
 
-    /// Mostly smooth areas a step apart at the edges, so the flat filters fire, with noise.
-    fn plane(rng: &mut Rng) -> Vec<u8> {
+    /// Mostly smooth areas a step apart at the edges, so the flat filters fire, with noise; the
+    /// values and steps scaled to the bit depth.
+    fn plane<BD: BitDepth>(rng: &mut Rng, bitdepth_max: c_int) -> Vec<BD::Pixel> {
+        let scale = (bitdepth_max + 1) / 256;
         let base = [rng.next() % 256, rng.next() % 256];
-        let noise = [1, 2, 4, 16][rng.next() as usize % 4];
+        let noise = [1, 2, 4, 16][rng.next() as usize % 4] * scale as u32;
         (0..STRIDE * ROWS)
             .map(|i| {
                 let (y, x) = (i / STRIDE, i % STRIDE);
                 let side = ((x / 4 + y / 4) & 1) as usize;
-                let v = base[side] as i32 + (rng.next() % noise) as i32 - noise as i32 / 2;
-                v.clamp(0, 255) as u8
+                let v = base[side] as i32 * scale + (rng.next() % noise) as i32 - noise as i32 / 2;
+                v.clamp(0, bitdepth_max).as_::<BD::Pixel>()
             })
             .collect()
     }
 
-    fn contexts() -> Vec<(&'static str, Rav1dLoopFilterDSPContext)> {
+    fn contexts<BD: BitDepth>() -> Vec<(&'static str, Rav1dLoopFilterDSPContext)> {
         rav1d_init_cpu();
         let flags = rav1d_get_cpu_flags();
-        let ctx = |flags| {
-            Rav1dLoopFilterDSPContext::default::<BitDepth8>().init_rust_simd::<BitDepth8>(flags)
-        };
+        let ctx = |flags| Rav1dLoopFilterDSPContext::default::<BD>().init_rust_simd::<BD>(flags);
         #[allow(unused_mut)]
         let mut out = vec![("rust simd", ctx(flags))];
         #[cfg(target_arch = "x86_64")]
@@ -1177,10 +1278,21 @@ mod tests {
 
     #[test]
     fn simd_matches_scalar() {
-        let scalar = Rav1dLoopFilterDSPContext::default::<BitDepth8>();
-        let simds = contexts();
+        matches_scalar::<BitDepth8>(255, 3000);
+    }
+
+    /// 12 bits takes the scalar filter, which this checks is wired in.
+    #[test]
+    fn simd_matches_scalar_16bpc() {
+        matches_scalar::<BitDepth16>(1023, 3000);
+        matches_scalar::<BitDepth16>(4095, 300);
+    }
+
+    fn matches_scalar<BD: BitDepth>(bitdepth_max: c_int, rounds: usize) {
+        let scalar = Rav1dLoopFilterDSPContext::default::<BD>();
+        let simds = contexts::<BD>();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        for round in 0..3000 {
+        for round in 0..rounds {
             let mut lut = Align16(Av1FilterLUT::default());
             rav1d_calc_eih(&mut lut.0, (rng.next() % 8) as u8);
             let mut lvl = AlignedVec2::<u8>::new();
@@ -1196,7 +1308,7 @@ mod tests {
             let wh = 1 + rng.next() as usize % 32;
             let valid = if wh == 32 { u32::MAX } else { (1 << wh) - 1 };
             let mask = [rng.next() & valid, rng.next() & valid, rng.next() & valid];
-            let orig = plane(&mut rng);
+            let orig = plane::<BD>(&mut rng, bitdepth_max);
             for (hv, name) in [(HV::H, "h"), (HV::V, "v")] {
                 for yuv in [YUV::Y, YUV::UV] {
                     let pick = |c: &Rav1dLoopFilterDSPContext| {
@@ -1209,13 +1321,14 @@ mod tests {
                             HV::V => c.v,
                         }
                     };
-                    let want = run(&pick(&scalar), hv, &orig, &mask, &lvl, &lut, wh);
+                    let want = run::<BD>(&pick(&scalar), hv, &orig, &mask, &lvl, &lut, wh, bitdepth_max);
                     for (simd_name, simd) in &simds {
-                        let got = run(&pick(simd), hv, &orig, &mask, &lvl, &lut, wh);
+                        let got =
+                            run::<BD>(&pick(simd), hv, &orig, &mask, &lvl, &lut, wh, bitdepth_max);
                         let first = got.iter().zip(&want).position(|(a, b)| a != b);
                         assert!(
                             first.is_none(),
-                            "round {round} {name} {} {simd_name}: first difference at row {}, column {}",
+                            "{bitdepth_max} round {round} {name} {} {simd_name}: first difference at row {}, column {}",
                             yuv as usize,
                             first.unwrap() / STRIDE,
                             first.unwrap() % STRIDE,
