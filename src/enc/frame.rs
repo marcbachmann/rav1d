@@ -486,6 +486,8 @@ pub struct Encoder<D: Decide> {
     pub cnn_prune: u8,
     /// The CNN's outputs for the superblock being searched, when it lies wholly in the picture.
     cnn: Option<Box<Cnn>>,
+    /// 16 × 16 × the variance of each whole 4×4 luma area of the superblock, -1 past the picture.
+    var4: [i64; 256],
     /// The last source luma row of the superblock row above, for the CNN.
     src_above: Vec<u8>,
     /// Levels the residual search tries one step nearer zero, from the last coefficient back,
@@ -661,6 +663,7 @@ impl<D: Decide> Encoder<D> {
             variance_boost: false,
             cnn_prune: 0,
             cnn: None,
+            var4: [-1; 256],
             src_above: Vec::new(),
             rdoq: 0,
             ssim_reference: None,
@@ -1710,13 +1713,26 @@ impl<D: Decide> Encoder<D> {
     /// 0.5) over a quarter of it beside a hard edge (a 4×4 area of variance over 16), or smooth
     /// throughout (every 4×4 area under 16), as gradients are.
     fn graphic_block(&self, x: i32, y: i32, n4: usize) -> bool {
-        let w = cmp::min(n4 * 4, (self.seq.width as usize).saturating_sub(x as usize * 4)) & !3;
-        let h = cmp::min(n4 * 4, (self.seq.height as usize).saturating_sub(y as usize * 4)) & !3;
+        let (x0, y0) = ((x & 15) as usize, (y & 15) as usize);
+        let (mut flat, mut most, mut all) = (0, 0i64, 0);
+        for row in self.var4[y0 * 16..].chunks(16).take(n4) {
+            for &v in row[x0..x0 + n4].iter().filter(|&&v| v >= 0) {
+                flat += (v < 128) as usize;
+                most = most.max(v);
+                all += 1;
+            }
+        }
+        all > 0 && (most < 4096 || flat * 4 >= all)
+    }
+
+    fn var4_of(&self, x: i32, y: i32) -> [i64; 256] {
+        let mut out = [-1; 256];
+        let w = cmp::min(64, (self.seq.width as usize).saturating_sub(x as usize * 4)) & !3;
+        let h = cmp::min(64, (self.seq.height as usize).saturating_sub(y as usize * 4)) & !3;
         if w == 0 || h == 0 {
-            return false;
+            return out;
         }
         let px = self.source(0, x, y, w, h);
-        let (mut flat, mut most) = (0, 0i64);
         for by in (0..h).step_by(4) {
             for bx in (0..w).step_by(4) {
                 let (mut s, mut q) = (0i64, 0i64);
@@ -1726,13 +1742,10 @@ impl<D: Decide> Encoder<D> {
                         q += p as i64 * p as i64;
                     }
                 }
-                // 16 × 16 × the variance.
-                let v = 16 * q - s * s;
-                flat += (v < 128) as usize;
-                most = most.max(v);
+                out[by / 4 * 16 + bx / 4] = 16 * q - s * s;
             }
         }
-        most < 4096 || flat * 64 >= w * h
+        out
     }
 
     /// Which of four activity classes a 16×16 luma block at `(x, y)` (in 4-pixel units) belongs
@@ -2047,6 +2060,9 @@ impl<D: Decide> Encoder<D> {
         self.dry = true;
         self.counter = Counter::default();
         self.cnn = (self.cnn_prune != 0 && x + 16 <= self.bw && y + 16 <= self.bh).then(|| Box::new(self.cnn_of(x)));
+        if self.graphic_guard {
+            self.var4 = self.var4_of(x, y);
+        }
         self.pick_partition(ti, BlockLevel::Bl64x64, x, y, EdgeIndex::root());
         self.estimated += self.counter.bits as u64;
         self.estimated_sse += self.sse(x, y, 16, 16, 0..self.planes);
