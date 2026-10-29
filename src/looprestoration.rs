@@ -3397,7 +3397,7 @@ mod neon_erased {
 /// The 8 bpc filters on [`I16x8`].
 mod rust_simd {
     use super::*;
-    use crate::simd128::I16x8;
+    use crate::simd128::{I16x8, I32x4};
 
     const ROWS: usize = 64 + 3 + 3;
     /// A unit is at most 256 wide, the last of a row up to half as wide again.
@@ -3529,6 +3529,343 @@ mod rust_simd {
         let left = unsafe { slice::from_raw_parts(left, h) };
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
         unsafe { wiener_128::<BD>(p, left, lpf, lpf_off, w, h, params, edges) }
+    }
+
+    /// Columns of the self-guided rows: the unit's `w` and one either side, in whole vectors.
+    const SGR_W: usize = MAX_W + 16;
+
+    /// One row of 16-bit sums (or `b`) and their 32-bit companions: sums of squares (or `a`).
+    #[derive(Clone, Copy)]
+    struct SgrRow {
+        s: [i16; SGR_W],
+        q: [i32; SGR_W],
+    }
+
+    const SGR_ROW: SgrRow = SgrRow {
+        s: [0; SGR_W],
+        q: [0; SGR_W],
+    };
+
+    #[inline(always)]
+    fn ld32(q: &[i32; SGR_W], i: usize) -> [I32x4; 2] {
+        [I32x4::load(&q[i..]), I32x4::load(&q[i + 4..])]
+    }
+
+    #[inline(always)]
+    fn ld16(s: &[i16; SGR_W], i: usize) -> I16x8 {
+        I16x8::load(&s[i..])
+    }
+
+    #[inline(always)]
+    fn add32(a: [I32x4; 2], b: [I32x4; 2]) -> [I32x4; 2] {
+        [a[0].add(b[0]), a[1].add(b[1])]
+    }
+
+    /// The 3- and 5-wide sums across one padded row, of pixels and of their squares, centred on
+    /// columns -1..=w at index 0.
+    #[inline(always)]
+    fn sgr_box_h<const THREE: bool, const FIVE: bool>(
+        h3: &mut SgrRow,
+        h5: &mut SgrRow,
+        t: &[u8],
+        w: usize,
+    ) {
+        for i in (0..w + 2).step_by(8) {
+            let (v1, v2, v3) = (px8(t, i + 1), px8(t, i + 2), px8(t, i + 3));
+            let s = v1.add(v2).add(v3);
+            // Squares of bytes fit 16 bits unsigned.
+            let q = v3.mul(v3).addw_u(v1.mul(v1).addl_u(v2.mul(v2)));
+            if THREE {
+                s.store(&mut h3.s[i..]);
+                q[0].store(&mut h3.q[i..]);
+                q[1].store(&mut h3.q[i + 4..]);
+            }
+            if FIVE {
+                let (v0, v4) = (px8(t, i), px8(t, i + 4));
+                let s = s.add(v0).add(v4);
+                let q = v4.mul(v4).addw_u(v0.mul(v0).addw_u(q));
+                s.store(&mut h5.s[i..]);
+                q[0].store(&mut h5.q[i..]);
+                q[1].store(&mut h5.q[i + 4..]);
+            }
+        }
+    }
+
+    /// `dav1d_sgr_x_by_x[z]` for `z` in 0..=255 (or more): a 64-entry lookup, then the steps of
+    /// the table's flat tail.
+    #[inline(always)]
+    fn x_by_x(z: I16x8) -> I16x8 {
+        let lut: &[u8; 64] = dav1d_sgr_x_by_x.0[..64].try_into().unwrap();
+        let mut x = z
+            .lookup64(lut)
+            .add(z.gt(I16x8::splat(63)).and(I16x8::splat(4)));
+        for k in [72, 101, 169, 254] {
+            x = x.add(z.gt(I16x8::splat(k)));
+        }
+        x
+    }
+
+    /// `a` and `b` of one row from the box sums of the rows `h` (3 or 5 of them), with `b` as
+    /// `x` and `a` as `x * sum * one_by_x` the way [`selfguided_filter`] inverts them.
+    #[inline(always)]
+    fn sgr_ab<const N: i32>(ab: &mut SgrRow, h: &[&SgrRow], w: usize, s: u32) {
+        let one_by_x = I32x4::splat(if N == 25 { 164 } else { 455 });
+        let n = I32x4::splat(N);
+        let s = I32x4::splat(s as i32);
+        let zero = I32x4::splat(0);
+        let (rnd19, rnd11) = (I32x4::splat(1 << 19), I32x4::splat(1 << 11));
+        for i in (0..w + 2).step_by(8) {
+            let mut sum = I16x8::load(&h[0].s[i..]);
+            let mut sq = ld32(&h[0].q, i);
+            for r in &h[1..] {
+                sum = sum.add(I16x8::load(&r.s[i..]));
+                sq = add32(sq, ld32(&r.q, i));
+            }
+            let sum2 = sum.mul_wide(sum);
+            let mut z = [zero; 2];
+            for k in 0..2 {
+                let p = sq[k].mul(n).sub(sum2[k]).max(zero);
+                // `p * s` stays below 2^32: the product is exact as unsigned.
+                z[k] = p.mul(s).add(rnd19).shr_u::<20>();
+            }
+            let x = x_by_x(I32x4::pack(z[0], z[1]));
+            let xs = x.mul_wide(sum);
+            for k in 0..2 {
+                let a = xs[k].mul(one_by_x).add(rnd11).shr_s::<12>();
+                a.store(&mut ab.q[i + 4 * k..]);
+            }
+            x.store(&mut ab.s[i..]);
+        }
+    }
+
+    /// The rows of 3x3 `a` and `b` across: `h` sums 3, `g` is `3 * h` plus the centre. The
+    /// neighbours of 3x3, 4 for the cross and 3 for the corners, are `g` above and below plus
+    /// `4 * h` of the row itself.
+    #[inline(always)]
+    fn sgr_h3(g: &mut SgrRow, h: &mut SgrRow, ab: &SgrRow, w: usize) {
+        for x in (0..w).step_by(8) {
+            let c = ld16(&ab.s, x + 1);
+            let all = ld16(&ab.s, x).add(ld16(&ab.s, x + 2)).add(c);
+            all.store(&mut h.s[x..]);
+            all.mul(I16x8::splat(3)).add(c).store(&mut g.s[x..]);
+            let c = ld32(&ab.q, x + 1);
+            let all = add32(add32(ld32(&ab.q, x), ld32(&ab.q, x + 2)), c);
+            for k in 0..2 {
+                all[k].store(&mut h.q[x + 4 * k..]);
+                let v = all[k].shl::<1>().add(all[k]).add(c[k]);
+                v.store(&mut g.q[x + 4 * k..]);
+            }
+        }
+    }
+
+    /// The rows of 5x5 `a` and `b` across, weighted 6 for the centre and 5 either side: the
+    /// even output rows add two of them, the odd ones take one.
+    #[inline(always)]
+    fn sgr_h65(f: &mut SgrRow, ab: &SgrRow, w: usize) {
+        for x in (0..w).step_by(8) {
+            let c = ld16(&ab.s, x + 1);
+            let all = ld16(&ab.s, x).add(ld16(&ab.s, x + 2)).add(c);
+            all.mul(I16x8::splat(5)).add(c).store(&mut f.s[x..]);
+            let c = ld32(&ab.q, x + 1);
+            let all = add32(add32(ld32(&ab.q, x), ld32(&ab.q, x + 2)), c);
+            for k in 0..2 {
+                let v = all[k].shl::<2>().add(all[k]).add(c[k]);
+                v.store(&mut f.q[x + 4 * k..]);
+            }
+        }
+    }
+
+    /// `b - a * px` from the weighted neighbours `nb` of `b` and `na` of `a`, rounded off by
+    /// `S` bits.
+    #[inline(always)]
+    fn sgr_f<const S: i32>(nb: I16x8, na: [I32x4; 2], px: I16x8) -> [I32x4; 2] {
+        let bx = nb.mul_wide(px);
+        let rnd = I32x4::splat(1 << (S - 1));
+        [
+            na[0].sub(bx[0]).add(rnd).shr_s::<S>(),
+            na[1].sub(bx[1]).add(rnd).shr_s::<S>(),
+        ]
+    }
+
+    /// Box sums across the padded rows `*next..=to`, into their slots of the ring.
+    #[inline(always)]
+    fn sgr_fill<const THREE: bool, const FIVE: bool>(
+        h3: &mut [SgrRow; 5],
+        h5: &mut [SgrRow; 5],
+        tmp: &[u8],
+        w: usize,
+        next: &mut isize,
+        to: isize,
+    ) {
+        while *next <= to {
+            let y = (*next + 3) as usize;
+            sgr_box_h::<THREE, FIVE>(
+                &mut h3[y % 5],
+                &mut h5[y % 5],
+                &tmp[y * REST_UNIT_STRIDE..],
+                w,
+            );
+            *next += 1;
+        }
+    }
+
+    /// The self-guided filter over the padded `tmp`, streaming: the box sums of each row
+    /// across into a ring, `a` and `b` of the rows the output needs (every other one for 5x5)
+    /// summed across into the weighted rows of another, then each output row from those
+    /// weighted onto its pixels.
+    #[inline(always)]
+    fn sgr<const THREE: bool, const FIVE: bool>(
+        mut dst: impl FnMut(usize, &[u8]),
+        tmp: &[u8],
+        w: usize,
+        h: usize,
+        sgr: &LooprestorationParamsSgr,
+    ) {
+        let mut h3 = [SGR_ROW; 5];
+        let mut h5 = [SGR_ROW; 5];
+        let mut ab3 = SGR_ROW;
+        let mut g3 = [SGR_ROW; 3];
+        let mut h3m = [SGR_ROW; 3];
+        let mut ab5 = SGR_ROW;
+        let mut f5 = [SGR_ROW; 2];
+        // Box sums are ready for the rows before `next`.
+        let mut next = if FIVE { -3 } else { -2 };
+        let slot = |y: isize| (y + 3) as usize % 5;
+        let ab3_at = |y: isize| (y + 1) as usize % 3;
+        let ab5_at = |y: isize| (y + 1) as usize / 2 % 2;
+        if THREE {
+            sgr_fill::<THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, 1);
+            for y in -1..=0 {
+                let rows = [&h3[slot(y - 1)], &h3[slot(y)], &h3[slot(y + 1)]];
+                sgr_ab::<9>(&mut ab3, &rows, w, sgr.s1);
+                sgr_h3(&mut g3[ab3_at(y)], &mut h3m[ab3_at(y)], &ab3, w);
+            }
+        }
+        if FIVE {
+            sgr_fill::<THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, 1);
+            let rows = [
+                &h5[slot(-3)],
+                &h5[slot(-2)],
+                &h5[slot(-1)],
+                &h5[slot(0)],
+                &h5[slot(1)],
+            ];
+            sgr_ab::<25>(&mut ab5, &rows, w, sgr.s0);
+            sgr_h65(&mut f5[ab5_at(-1)], &ab5, w);
+        }
+        let (w0, w1) = (I32x4::splat(sgr.w0 as i32), I32x4::splat(sgr.w1 as i32));
+        let rnd = I32x4::splat(1 << 10);
+        let mut row = [0u8; MAX_W + 8];
+        for j in 0..h {
+            let y = j as isize;
+            if THREE {
+                sgr_fill::<THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, y + 2);
+                let rows = [&h3[slot(y)], &h3[slot(y + 1)], &h3[slot(y + 2)]];
+                sgr_ab::<9>(&mut ab3, &rows, w, sgr.s1);
+                sgr_h3(&mut g3[ab3_at(y + 1)], &mut h3m[ab3_at(y + 1)], &ab3, w);
+            }
+            if FIVE && j % 2 == 0 {
+                sgr_fill::<THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, y + 3);
+                let rows = [
+                    &h5[slot(y - 1)],
+                    &h5[slot(y)],
+                    &h5[slot(y + 1)],
+                    &h5[slot(y + 2)],
+                    &h5[slot(y + 3)],
+                ];
+                sgr_ab::<25>(&mut ab5, &rows, w, sgr.s0);
+                sgr_h65(&mut f5[ab5_at(y + 1)], &ab5, w);
+            }
+            let src = &tmp[(y + 3) as usize * REST_UNIT_STRIDE..];
+            for x in (0..w).step_by(8) {
+                let px = px8(src, x + 3);
+                let mut v = [I32x4::splat(0); 2];
+                if FIVE {
+                    let d = if j % 2 == 0 {
+                        let (u, d) = (&f5[ab5_at(y - 1)], &f5[ab5_at(y + 1)]);
+                        let nb = ld16(&u.s, x).add(ld16(&d.s, x));
+                        sgr_f::<9>(nb, add32(ld32(&u.q, x), ld32(&d.q, x)), px)
+                    } else {
+                        let m = &f5[ab5_at(y)];
+                        sgr_f::<8>(ld16(&m.s, x), ld32(&m.q, x), px)
+                    };
+                    v = [d[0].mul(w0), d[1].mul(w0)];
+                }
+                if THREE {
+                    let (u, m, d) = (&g3[ab3_at(y - 1)], &h3m[ab3_at(y)], &g3[ab3_at(y + 1)]);
+                    let nb = ld16(&u.s, x)
+                        .add(ld16(&d.s, x))
+                        .add(ld16(&m.s, x).mul(I16x8::splat(4)));
+                    let (gu, hm, gd) = (ld32(&u.q, x), ld32(&m.q, x), ld32(&d.q, x));
+                    let na = add32(add32(gu, gd), [hm[0].shl::<2>(), hm[1].shl::<2>()]);
+                    let d = sgr_f::<9>(nb, na, px);
+                    v = add32(v, [d[0].mul(w1), d[1].mul(w1)]);
+                }
+                let v = I32x4::pack(v[0].add(rnd).shr_s::<11>(), v[1].add(rnd).shr_s::<11>());
+                row[x..x + 8].copy_from_slice(&px.add(v).pack_u8());
+            }
+            dst(j, &row[..w]);
+        }
+    }
+
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn sgr_128<BD: BitDepth, const THREE: bool, const FIVE: bool>(
+        p: Rav1dPictureDataComponentOffset,
+        left: &[LeftPixelRow<BD::Pixel>],
+        lpf: &DisjointMut<AlignedVec64<u8>>,
+        lpf_off: isize,
+        w: usize,
+        h: usize,
+        params: &LooprestorationParams,
+        edges: LrEdgeFlags,
+    ) {
+        // A row more than `padding` fills, for the loads past the last one's right edge.
+        let mut tmp = [0.into(); (ROWS + 1) * REST_UNIT_STRIDE];
+        let padded = (&mut tmp[..ROWS * REST_UNIT_STRIDE]).try_into().unwrap();
+        padding::<BD>(padded, p, left, lpf, lpf_off, w, h, edges);
+        let stride = p.pixel_stride::<BD>();
+        let store = |j: usize, row: &[u8]| {
+            let p = p + j as isize * stride;
+            p.slice_mut::<BD>(row.len())
+                .as_bytes_mut()
+                .copy_from_slice(row);
+        };
+        sgr::<THREE, FIVE>(store, tmp.as_bytes(), w, h, params.sgr());
+    }
+
+    /// # Safety
+    ///
+    /// Must be called by [`loop_restoration_filter::Fn::call`] at 8 bpc, on x86 once the CPU
+    /// flags hold SSE41.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn sgr_erased<BD: BitDepth, const THREE: bool, const FIVE: bool>(
+        _p_ptr: *mut DynPixel,
+        _stride: ptrdiff_t,
+        left: *const LeftPixelRow<DynPixel>,
+        lpf_ptr: *const DynPixel,
+        w: c_int,
+        h: c_int,
+        params: &LooprestorationParams,
+        edges: LrEdgeFlags,
+        _bitdepth_max: c_int,
+        p: FFISafeRav1dPictureDataComponentOffset,
+        lpf: *const FFISafe<DisjointMut<AlignedVec64<u8>>>,
+    ) {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `loop_restoration_filter::Fn::call`.
+        let p = unsafe { FFISafe::from_with_offset(p) };
+        let left = left.cast();
+        // SAFETY: Was passed as `FFISafe::new(_)` in `loop_restoration_filter::Fn::call`.
+        let lpf = unsafe { FFISafe::get(lpf) };
+        let lpf_off = reconstruct_lpf_offset::<BD>(lpf, lpf_ptr.cast());
+        let (w, h) = (w as usize, h as usize);
+        // SAFETY: Length sliced in `loop_restoration_filter::Fn::call`.
+        let left = unsafe { slice::from_raw_parts(left, h) };
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe { sgr_128::<BD, THREE, FIVE>(p, left, lpf, lpf_off, w, h, params, edges) }
     }
 }
 
@@ -3694,6 +4031,11 @@ impl Rav1dLoopRestorationDSPContext {
         }
         let wiener = loop_restoration_filter::Fn::new(rust_simd::wiener_erased::<BD>);
         self.wiener = [wiener; 2];
+        self.sgr = [
+            loop_restoration_filter::Fn::new(rust_simd::sgr_erased::<BD, false, true>),
+            loop_restoration_filter::Fn::new(rust_simd::sgr_erased::<BD, true, false>),
+            loop_restoration_filter::Fn::new(rust_simd::sgr_erased::<BD, true, true>),
+        ];
         self
     }
 
@@ -3770,6 +4112,29 @@ mod tests {
         params
     }
 
+    /// `sgr[mode]`'s parameters: a strength pair from the table that selects it, and weights
+    /// in the ranges the bitstream codes.
+    fn sgr_params(rng: &mut Rng, mode: usize) -> LooprestorationParams {
+        use crate::tables::DAV1D_SGR_PARAMS;
+
+        let idx = match mode {
+            0 => rng.range(14, 15),
+            1 => rng.range(10, 13),
+            _ => rng.range(0, 9),
+        };
+        let [s0, s1] = DAV1D_SGR_PARAMS.0[idx as usize];
+        let w0 = if s0 != 0 { rng.range(-96, 31) } else { 0 };
+        let w1 = if s1 != 0 { rng.range(-32, 95) } else { 95 };
+        let mut params = LooprestorationParams::default();
+        *params.sgr_mut() = LooprestorationParamsSgr {
+            s0: s0 as u32,
+            s1: s1 as u32,
+            w0: w0 as i16,
+            w1: (128 - w0 - w1) as i16,
+        };
+        params
+    }
+
     struct Unit {
         pic: Vec<u8>,
         lpf: Vec<u8>,
@@ -3838,6 +4203,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sgr_matches_scalar() {
+        let scalar = Rav1dLoopRestorationDSPContext::default::<BitDepth8>();
+        let rust = rust();
+        let mut rng = Rng(0x6a09_e667_f3bc_c908);
+        for w in 1..=384 {
+            for mode in 0..3 {
+                let mut unit = Unit::new(&mut rng);
+                // Flat, full-range noise and 0/255 stripes: `z` at 0, mid-table and past 255.
+                match rng.next() % 6 {
+                    0 => unit.pic.fill(rng.next() as u8),
+                    1 => unit.pic.iter_mut().for_each(|p| *p = rng.next() as u8),
+                    2 => unit
+                        .pic
+                        .iter_mut()
+                        .enumerate()
+                        .for_each(|(i, p)| *p = (i & 1) as u8 * 255),
+                    _ => {}
+                }
+                let params = sgr_params(&mut rng, mode);
+                let h = match rng.next() % 3 {
+                    0 => 64,
+                    _ => rng.range(1, 64) as usize,
+                };
+                let edges = LrEdgeFlags::from_bits_truncate(rng.next() as u8);
+                let want = unit.run(&scalar.sgr[mode], w, h, &params, edges);
+                let got = unit.run(&rust.sgr[mode], w, h, &params, edges);
+                assert_eq!(got, want, "mode {mode} {w}x{h} edges {:#x}", edges.bits());
+            }
+        }
+    }
+
     /// Best of 20 batches, in ns per call.
     fn ns(n: usize, mut f: impl FnMut()) -> f64 {
         use std::time::Instant;
@@ -3897,6 +4294,27 @@ mod tests {
                 let mut line = format!("{name} {w}x64:");
                 for (dsp_name, dsp) in &dsps {
                     let f = &dsp.wiener[five as usize];
+                    let best = ns(20, || {
+                        f.call::<BitDepth8>(dst, &unit.left, &lpf, 64, w, 64, &params, edges, bd);
+                    });
+                    line += &format!("  {dsp_name} {best:7.0} ns");
+                }
+                println!("{line}");
+            }
+        }
+        for w in [64, 384] {
+            let mut tmp = [0u8; (64 + 3 + 3) * REST_UNIT_STRIDE];
+            let best = ns(20, || {
+                padding::<BitDepth8>(&mut tmp, dst, &unit.left, &lpf, 64, w, 64, edges);
+            });
+            println!("padding {w}x64:  {best:7.0} ns");
+        }
+        for (name, mode) in [("sgr5", 0), ("sgr3", 1), ("sgrmix", 2)] {
+            let params = sgr_params(&mut rng, mode);
+            for w in [64, 128, 256, 384] {
+                let mut line = format!("{name} {w}x64:");
+                for (dsp_name, dsp) in &dsps {
+                    let f = &dsp.sgr[mode];
                     let best = ns(20, || {
                         f.call::<BitDepth8>(dst, &unit.left, &lpf, 64, w, 64, &params, edges, bd);
                     });

@@ -1,6 +1,6 @@
 //! Eight `i16` lanes on SSE4.1, NEON and wasm `simd128`, with a scalar stand-in elsewhere: the
 //! one source the Rust SIMD kernels are written in. Each backend maps an operation to one or two
-//! instructions; the kernels never name a target.
+//! instructions; the kernels never name a target. [`I32x4`] holds the sums that outgrow 16 bits.
 //!
 //! On x86 the methods are `#[inline(always)]` so that they compile into a kernel entered through
 //! `#[target_feature(enable = "sse4.1")]`, which is only chosen once the CPU flags hold SSE41.
@@ -18,6 +18,10 @@ pub const fn native() -> bool {
 
 #[derive(Clone, Copy)]
 pub struct I16x8(imp::Inner);
+
+/// Four `i32` lanes, for the sums that outgrow [`I16x8`]: widened from it and packed back.
+#[derive(Clone, Copy)]
+pub struct I32x4(imp::Inner32);
 
 impl I16x8 {
     /// Bytes `b[..4]` zero-extended into the low four lanes.
@@ -451,9 +455,141 @@ mod imp {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    use super::I16x8;
+    use super::{I16x8, I32x4};
 
     pub type Inner = __m128i;
+
+    pub type Inner32 = __m128i;
+
+    // SAFETY (every `unsafe` here): SSE4.1 holds where these are compiled in (see the module
+    // docs), and loads and stores go through bounds-checked slices of 4 lanes.
+    impl I32x4 {
+        #[inline(always)]
+        pub fn load(s: &[i32]) -> Self {
+            Self(unsafe { _mm_loadu_si128(s[..4].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [i32]) {
+            unsafe { _mm_storeu_si128(d[..4].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn splat(v: i32) -> Self {
+            Self(unsafe { _mm_set1_epi32(v) })
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(unsafe { _mm_add_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            Self(unsafe { _mm_sub_epi32(self.0, o.0) })
+        }
+
+        /// The low 32 bits of the products.
+        #[inline(always)]
+        pub fn mul(self, o: Self) -> Self {
+            Self(unsafe { _mm_mullo_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(unsafe { _mm_max_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn shl<const N: i32>(self) -> Self {
+            Self(unsafe { _mm_slli_epi32::<N>(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn shr_s<const N: i32>(self) -> Self {
+            Self(unsafe { _mm_srai_epi32::<N>(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(unsafe { _mm_srli_epi32::<N>(self.0) })
+        }
+
+        /// `lo` then `hi` saturated to `i16`.
+        #[inline(always)]
+        pub fn pack(lo: Self, hi: Self) -> I16x8 {
+            I16x8(unsafe { _mm_packs_epi32(lo.0, hi.0) })
+        }
+    }
+
+    impl I16x8 {
+        /// The lanes of `self` and `o` as `u16`, summed into 32 bits: low four lanes, then high.
+        #[inline(always)]
+        pub fn addl_u(self, o: Self) -> [I32x4; 2] {
+            unsafe {
+                let z = _mm_setzero_si128();
+                let (a, b) = (self.0, o.0);
+                [
+                    I32x4(_mm_add_epi32(
+                        _mm_unpacklo_epi16(a, z),
+                        _mm_unpacklo_epi16(b, z),
+                    )),
+                    I32x4(_mm_add_epi32(
+                        _mm_unpackhi_epi16(a, z),
+                        _mm_unpackhi_epi16(b, z),
+                    )),
+                ]
+            }
+        }
+
+        /// The lanes as `u16` added onto `acc`'s low four, then high four.
+        #[inline(always)]
+        pub fn addw_u(self, acc: [I32x4; 2]) -> [I32x4; 2] {
+            unsafe {
+                let z = _mm_setzero_si128();
+                [
+                    I32x4(_mm_add_epi32(acc[0].0, _mm_unpacklo_epi16(self.0, z))),
+                    I32x4(_mm_add_epi32(acc[1].0, _mm_unpackhi_epi16(self.0, z))),
+                ]
+            }
+        }
+
+        /// The full products, low four lanes then high four.
+        #[inline(always)]
+        pub fn mul_wide(self, o: Self) -> [I32x4; 2] {
+            unsafe {
+                let (lo, hi) = (_mm_mullo_epi16(self.0, o.0), _mm_mulhi_epi16(self.0, o.0));
+                [
+                    I32x4(_mm_unpacklo_epi16(lo, hi)),
+                    I32x4(_mm_unpackhi_epi16(lo, hi)),
+                ]
+            }
+        }
+
+        #[inline(always)]
+        pub fn gt(self, o: Self) -> Self {
+            Self(unsafe { _mm_cmpgt_epi16(self.0, o.0) })
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for those up to 255.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            unsafe {
+                let i = _mm_packus_epi16(self.0, self.0);
+                let mut r = _mm_setzero_si128();
+                for k in 0..4 {
+                    let t = _mm_loadu_si128(t[16 * k..].as_ptr().cast());
+                    // Indices outside this 16 saturate to the top bit, which zeroes them.
+                    let ik = _mm_adds_epu8(
+                        _mm_sub_epi8(i, _mm_set1_epi8(16 * k as i8)),
+                        _mm_set1_epi8(0x70),
+                    );
+                    r = _mm_or_si128(r, _mm_shuffle_epi8(t, ik));
+                }
+                Self(_mm_cvtepu8_epi16(r))
+            }
+        }
+    }
 
     // SAFETY (every `unsafe` here): SSE4.1, or SSE2 from `load_u16` on, holds where these are
     // compiled in (see the module docs), and loads and stores go through bounds-checked slices of 8 or 4 lanes.
@@ -772,9 +908,128 @@ mod imp {
 mod imp {
     use std::arch::aarch64::*;
 
-    use super::I16x8;
+    use super::{I16x8, I32x4};
 
     pub type Inner = int16x8_t;
+
+    pub type Inner32 = int32x4_t;
+
+    // SAFETY (every `unsafe` here): NEON is part of aarch64, and loads and stores go through
+    // bounds-checked slices of 4 lanes.
+    impl I32x4 {
+        #[inline(always)]
+        pub fn load(s: &[i32]) -> Self {
+            Self(unsafe { vld1q_s32(s[..4].as_ptr()) })
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [i32]) {
+            unsafe { vst1q_s32(d[..4].as_mut_ptr(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn splat(v: i32) -> Self {
+            Self(unsafe { vdupq_n_s32(v) })
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(unsafe { vaddq_s32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            Self(unsafe { vsubq_s32(self.0, o.0) })
+        }
+
+        /// The low 32 bits of the products.
+        #[inline(always)]
+        pub fn mul(self, o: Self) -> Self {
+            Self(unsafe { vmulq_s32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(unsafe { vmaxq_s32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn shl<const N: i32>(self) -> Self {
+            Self(unsafe { vshlq_n_s32::<N>(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn shr_s<const N: i32>(self) -> Self {
+            Self(unsafe { vshrq_n_s32::<N>(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(unsafe { vreinterpretq_s32_u32(vshrq_n_u32::<N>(vreinterpretq_u32_s32(self.0))) })
+        }
+
+        /// `lo` then `hi` saturated to `i16`.
+        #[inline(always)]
+        pub fn pack(lo: Self, hi: Self) -> I16x8 {
+            I16x8(unsafe { vqmovn_high_s32(vqmovn_s32(lo.0), hi.0) })
+        }
+    }
+
+    impl I16x8 {
+        /// The lanes of `self` and `o` as `u16`, summed into 32 bits: low four lanes, then high.
+        #[inline(always)]
+        pub fn addl_u(self, o: Self) -> [I32x4; 2] {
+            unsafe {
+                let (a, b) = (u(self.0), u(o.0));
+                [
+                    I32x4(vreinterpretq_s32_u32(vaddl_u16(
+                        vget_low_u16(a),
+                        vget_low_u16(b),
+                    ))),
+                    I32x4(vreinterpretq_s32_u32(vaddl_high_u16(a, b))),
+                ]
+            }
+        }
+
+        /// The lanes as `u16` added onto `acc`'s low four, then high four.
+        #[inline(always)]
+        pub fn addw_u(self, acc: [I32x4; 2]) -> [I32x4; 2] {
+            unsafe {
+                let a = u(self.0);
+                let lo = vaddw_u16(vreinterpretq_u32_s32(acc[0].0), vget_low_u16(a));
+                let hi = vaddw_high_u16(vreinterpretq_u32_s32(acc[1].0), a);
+                [
+                    I32x4(vreinterpretq_s32_u32(lo)),
+                    I32x4(vreinterpretq_s32_u32(hi)),
+                ]
+            }
+        }
+
+        /// The full products, low four lanes then high four.
+        #[inline(always)]
+        pub fn mul_wide(self, o: Self) -> [I32x4; 2] {
+            unsafe {
+                [
+                    I32x4(vmull_s16(vget_low_s16(self.0), vget_low_s16(o.0))),
+                    I32x4(vmull_high_s16(self.0, o.0)),
+                ]
+            }
+        }
+
+        #[inline(always)]
+        pub fn gt(self, o: Self) -> Self {
+            Self(s(unsafe { vcgtq_s16(self.0, o.0) }))
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for those up to 255.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            unsafe {
+                let t = vld1q_u8_x4(t.as_ptr());
+                Self(s(vmovl_u8(vqtbl4_u8(t, vqmovun_s16(self.0)))))
+            }
+        }
+    }
 
     #[inline(always)]
     fn u(v: int16x8_t) -> uint16x8_t {
@@ -1155,9 +1410,127 @@ mod imp {
 mod imp {
     use std::arch::wasm32::*;
 
-    use super::I16x8;
+    use super::{I16x8, I32x4};
 
     pub type Inner = v128;
+
+    pub type Inner32 = v128;
+
+    impl I32x4 {
+        #[inline(always)]
+        pub fn load(s: &[i32]) -> Self {
+            // SAFETY: 4 lanes are in bounds; the load takes unaligned pointers.
+            Self(unsafe { v128_load(s[..4].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [i32]) {
+            // SAFETY: 4 lanes are in bounds; the store takes unaligned pointers.
+            unsafe { v128_store(d[..4].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn splat(v: i32) -> Self {
+            Self(i32x4_splat(v))
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(i32x4_add(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            Self(i32x4_sub(self.0, o.0))
+        }
+
+        /// The low 32 bits of the products.
+        #[inline(always)]
+        pub fn mul(self, o: Self) -> Self {
+            Self(i32x4_mul(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(i32x4_max(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn shl<const N: i32>(self) -> Self {
+            Self(i32x4_shl(self.0, N as u32))
+        }
+
+        #[inline(always)]
+        pub fn shr_s<const N: i32>(self) -> Self {
+            Self(i32x4_shr(self.0, N as u32))
+        }
+
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(u32x4_shr(self.0, N as u32))
+        }
+
+        /// `lo` then `hi` saturated to `i16`.
+        #[inline(always)]
+        pub fn pack(lo: Self, hi: Self) -> I16x8 {
+            I16x8(i16x8_narrow_i32x4(lo.0, hi.0))
+        }
+    }
+
+    impl I16x8 {
+        /// The lanes of `self` and `o` as `u16`, summed into 32 bits: low four lanes, then high.
+        #[inline(always)]
+        pub fn addl_u(self, o: Self) -> [I32x4; 2] {
+            let (a, b) = (self.0, o.0);
+            [
+                I32x4(i32x4_add(
+                    u32x4_extend_low_u16x8(a),
+                    u32x4_extend_low_u16x8(b),
+                )),
+                I32x4(i32x4_add(
+                    u32x4_extend_high_u16x8(a),
+                    u32x4_extend_high_u16x8(b),
+                )),
+            ]
+        }
+
+        /// The lanes as `u16` added onto `acc`'s low four, then high four.
+        #[inline(always)]
+        pub fn addw_u(self, acc: [I32x4; 2]) -> [I32x4; 2] {
+            [
+                I32x4(i32x4_add(acc[0].0, u32x4_extend_low_u16x8(self.0))),
+                I32x4(i32x4_add(acc[1].0, u32x4_extend_high_u16x8(self.0))),
+            ]
+        }
+
+        /// The full products, low four lanes then high four.
+        #[inline(always)]
+        pub fn mul_wide(self, o: Self) -> [I32x4; 2] {
+            [
+                I32x4(i32x4_extmul_low_i16x8(self.0, o.0)),
+                I32x4(i32x4_extmul_high_i16x8(self.0, o.0)),
+            ]
+        }
+
+        #[inline(always)]
+        pub fn gt(self, o: Self) -> Self {
+            Self(i16x8_gt(self.0, o.0))
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for those up to 255.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            let i = u8x16_narrow_i16x8(self.0, self.0);
+            let mut r = u8x16_splat(0);
+            for k in 0..4 {
+                // SAFETY: 16 bytes are in bounds; the load takes unaligned pointers.
+                let t = unsafe { v128_load(t[16 * k..].as_ptr().cast()) };
+                // Indices outside this 16 wrap to 16 or more, which the swizzle zeroes.
+                r = v128_or(r, i8x16_swizzle(t, u8x16_sub(i, u8x16_splat(16 * k as u8))));
+            }
+            Self(u16x8_extend_low_u8x16(r))
+        }
+    }
 
     impl I16x8 {
         #[inline(always)]
@@ -1517,9 +1890,120 @@ mod imp {
     all(target_arch = "wasm32", target_feature = "simd128"),
 )))]
 mod imp {
-    use super::I16x8;
+    use super::{I16x8, I32x4};
 
     pub type Inner = [i16; 8];
+
+    pub type Inner32 = [i32; 4];
+
+    impl I32x4 {
+        #[inline(always)]
+        fn zip(self, o: Self, f: impl Fn(i32, i32) -> i32) -> Self {
+            Self(std::array::from_fn(|i| f(self.0[i], o.0[i])))
+        }
+
+        #[inline(always)]
+        pub fn load(s: &[i32]) -> Self {
+            Self(s[..4].try_into().unwrap())
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [i32]) {
+            d[..4].copy_from_slice(&self.0);
+        }
+
+        #[inline(always)]
+        pub fn splat(v: i32) -> Self {
+            Self([v; 4])
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            self.zip(o, i32::wrapping_add)
+        }
+
+        #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            self.zip(o, i32::wrapping_sub)
+        }
+
+        /// The low 32 bits of the products.
+        #[inline(always)]
+        pub fn mul(self, o: Self) -> Self {
+            self.zip(o, i32::wrapping_mul)
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            self.zip(o, i32::max)
+        }
+
+        #[inline(always)]
+        pub fn shl<const N: i32>(self) -> Self {
+            Self(self.0.map(|v| v << N))
+        }
+
+        #[inline(always)]
+        pub fn shr_s<const N: i32>(self) -> Self {
+            Self(self.0.map(|v| v >> N))
+        }
+
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(self.0.map(|v| (v as u32 >> N) as i32))
+        }
+
+        /// `lo` then `hi` saturated to `i16`.
+        #[inline(always)]
+        pub fn pack(lo: Self, hi: Self) -> I16x8 {
+            I16x8(std::array::from_fn(|i| {
+                [lo.0, hi.0][i >> 2][i & 3].clamp(i16::MIN as i32, i16::MAX as i32) as i16
+            }))
+        }
+    }
+
+    impl I16x8 {
+        /// The lanes of `self` and `o` as `u16`, summed into 32 bits: low four lanes, then high.
+        #[inline(always)]
+        pub fn addl_u(self, o: Self) -> [I32x4; 2] {
+            let v = |i: usize| self.0[i] as u16 as i32 + o.0[i] as u16 as i32;
+            [
+                I32x4(std::array::from_fn(v)),
+                I32x4(std::array::from_fn(|i| v(i + 4))),
+            ]
+        }
+
+        /// The lanes as `u16` added onto `acc`'s low four, then high four.
+        #[inline(always)]
+        pub fn addw_u(self, acc: [I32x4; 2]) -> [I32x4; 2] {
+            let v = |k: usize, i: usize| acc[k].0[i].wrapping_add(self.0[4 * k + i] as u16 as i32);
+            [
+                I32x4(std::array::from_fn(|i| v(0, i))),
+                I32x4(std::array::from_fn(|i| v(1, i))),
+            ]
+        }
+
+        /// The full products, low four lanes then high four.
+        #[inline(always)]
+        pub fn mul_wide(self, o: Self) -> [I32x4; 2] {
+            let p = |i: usize| self.0[i] as i32 * o.0[i] as i32;
+            [
+                I32x4(std::array::from_fn(p)),
+                I32x4(std::array::from_fn(|i| p(i + 4))),
+            ]
+        }
+
+        #[inline(always)]
+        pub fn gt(self, o: Self) -> Self {
+            self.zip(o, |a, b| -((a > b) as i16))
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for those up to 255.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            Self(self.0.map(|v| t.get(v as usize).map_or(0, |&x| x as i16)))
+        }
+    }
 
     impl I16x8 {
         #[inline(always)]
