@@ -89,6 +89,7 @@ pub mod align;
 pub(crate) mod c_arc;
 pub(crate) mod c_box;
 mod cdef;
+mod simd128;
 mod cdef_apply;
 mod cdf;
 mod const_fn;

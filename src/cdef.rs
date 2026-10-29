@@ -512,6 +512,247 @@ fn cdef_find_dir_rust<BD: BitDepth>(
     best_dir as c_int
 }
 
+/// [`cdef_filter_block_rust`] eight `i16` lanes at a time: a row of an 8-wide block or two rows
+/// of a 4-wide one.
+mod rust_simd {
+    use std::mem;
+
+    use zerocopy::AsBytes;
+
+    use super::*;
+    use crate::include::common::bitdepth::BPC;
+    use crate::simd128::I16x8;
+
+    /// `constrain` as dav1d's asm has it: padding (`i16::MIN`) gives a difference of at least
+    /// 28673 as `u16`, which every shift leaves above the threshold, so it adds nothing.
+    #[inline(always)]
+    fn constrain(diff: I16x8, threshold: I16x8, shift: u32) -> I16x8 {
+        let adiff = diff.abs();
+        threshold
+            .sub_sat_u(adiff.shr_u(shift))
+            .min_u(adiff)
+            .with_sign_of(diff)
+    }
+
+    /// `PRI` and `SEC` say which strengths are not 0, so each of the three cases is its own loop.
+    #[inline(always)]
+    fn filter<BD: BitDepth, const W: usize, const PRI: bool, const SEC: bool>(
+        tmp: &[i16; TMP_STRIDE * TMP_STRIDE],
+        dst: Rav1dPictureDataComponentOffset,
+        h: usize,
+        pri_strength: c_int,
+        sec_strength: c_int,
+        dir: usize,
+        damping: c_int,
+        bd: BD,
+    ) {
+        let rows = if W == 8 { 1 } else { 2 };
+        let pri = I16x8::splat(pri_strength as i16);
+        let sec = I16x8::splat(sec_strength as i16);
+        let pri_tap = 4 - (pri_strength >> (bd.bitdepth() - 8) & 1);
+        let pri_taps = [I16x8::splat(pri_tap as i16), I16x8::splat((pri_tap & 3 | 2) as i16)];
+        let pri_shift = cmp::max(0, damping - (pri_strength | 1).ilog2() as c_int) as u32;
+        let sec_shift = (damping - (sec_strength | 1).ilog2() as c_int) as u32;
+        let round = I16x8::splat(8);
+        for y in (0..h).step_by(rows) {
+            let base = 2 * TMP_STRIDE + 2 + y * TMP_STRIDE;
+            let at = |off: isize| {
+                let i = base.wrapping_add_signed(off);
+                if W == 8 {
+                    I16x8::load(&tmp[i..])
+                } else {
+                    I16x8::load_halves(&tmp[i..], &tmp[i + TMP_STRIDE..])
+                }
+            };
+            let px = at(0);
+            let mut sum = I16x8::splat(0);
+            let (mut min, mut max) = (px, px);
+            for k in 0..2 {
+                if PRI {
+                    let off = DAV1D_CDEF_DIRECTIONS[dir + 2][k] as isize;
+                    let (p0, p1) = (at(off), at(-off));
+                    let c = constrain(p0.sub(px), pri, pri_shift).add(constrain(p1.sub(px), pri, pri_shift));
+                    sum = sum.add(c.mul(pri_taps[k]));
+                    min = min.min_u(p0).min_u(p1);
+                    max = max.max(p0).max(p1);
+                }
+                if SEC {
+                    let off2 = DAV1D_CDEF_DIRECTIONS[dir + 4][k] as isize;
+                    let off3 = DAV1D_CDEF_DIRECTIONS[dir + 0][k] as isize;
+                    let (s0, s1, s2, s3) = (at(off2), at(-off2), at(off3), at(-off3));
+                    let mut c = constrain(s0.sub(px), sec, sec_shift)
+                        .add(constrain(s1.sub(px), sec, sec_shift))
+                        .add(constrain(s2.sub(px), sec, sec_shift))
+                        .add(constrain(s3.sub(px), sec, sec_shift));
+                    if k == 0 {
+                        c = c.add(c);
+                    }
+                    sum = sum.add(c);
+                    min = min.min_u(s0).min_u(s1).min_u(s2).min_u(s3);
+                    max = max.max(s0).max(s1).max(s2).max(s3);
+                }
+            }
+            let mut out = px.add(sum.add(sum.shr_s::<15>()).add(round).shr_s::<4>());
+            if PRI && SEC {
+                out = out.min(max).max(min);
+            }
+            let n = W * mem::size_of::<BD::Pixel>();
+            let mut bytes = [0; 16];
+            match BD::BPC {
+                BPC::BPC8 => bytes[..8].copy_from_slice(&out.pack_u8()),
+                BPC::BPC16 => bytes.copy_from_slice(out.to_array().as_bytes()),
+            }
+            for r in 0..rows {
+                let dst = dst + ((y + r) as isize * dst.pixel_stride::<BD>());
+                dst.slice_mut::<BD>(W).as_bytes_mut().copy_from_slice(&bytes[r * n..][..n]);
+            }
+        }
+    }
+
+    /// The block's `W` pixels at `px` into `row[..W]`.
+    #[inline(always)]
+    fn center<BD: BitDepth, const W: usize>(row: &mut [i16], px: &[BD::Pixel]) {
+        let b = px[..W].as_bytes();
+        let v = match (BD::BPC, W) {
+            (BPC::BPC8, 8) => I16x8::from_u8x8(b),
+            (BPC::BPC8, _) => I16x8::from_u8x4(b),
+            (BPC::BPC16, 8) => I16x8::from_bytes(b),
+            (BPC::BPC16, _) => I16x8::from_bytes_half(b),
+        };
+        if W == 8 {
+            v.store(row)
+        } else {
+            v.store_lo(row)
+        }
+    }
+
+    /// [`super::padding`] a row at a time, the block's pixels of each in one load.
+    #[inline(always)]
+    fn padding<BD: BitDepth, const W: usize, const H: usize>(
+        tmp: &mut [i16; TMP_STRIDE * TMP_STRIDE],
+        src: Rav1dPictureDataComponentOffset,
+        left: &[LeftPixelRow2px<BD::Pixel>; 8],
+        top: CdefTop,
+        bottom: CdefBottom,
+        edges: CdefEdgeFlags,
+    ) {
+        const NONE: i16 = i16::MIN;
+        let stride = src.pixel_stride::<BD>();
+        let has_left = edges.contains(CdefEdgeFlags::HAVE_LEFT);
+        let has_right = edges.contains(CdefEdgeFlags::HAVE_RIGHT);
+        let x_start = if has_left { 0 } else { 2 };
+        let x_end = if has_right { W + 4 } else { W + 2 };
+        let px = |p: BD::Pixel| p.as_::<i16>();
+        // `line[0]` is column `x_start` of a padded row above or below the block.
+        let outer = |row: &mut [i16], line: &[BD::Pixel]| {
+            row[..2].copy_from_slice(&if has_left { [px(line[0]), px(line[1])] } else { [NONE; 2] });
+            center::<BD, W>(&mut row[2..], &line[2 - x_start..]);
+            let r = W + 2 - x_start;
+            row[W + 2..W + 4].copy_from_slice(&if has_right { [px(line[r]), px(line[r + 1])] } else { [NONE; 2] });
+        };
+
+        if edges.contains(CdefEdgeFlags::HAVE_TOP) {
+            for i in 0..2 {
+                let top = top - 2_usize + i as isize * stride;
+                let line = &*top.data.slice_as::<_, BD::Pixel>((top.offset + x_start.., ..x_end - x_start));
+                outer(&mut tmp[i * TMP_STRIDE..], line);
+            }
+        } else {
+            tmp[..2 * TMP_STRIDE].fill(NONE);
+        }
+        for y in 0..H {
+            let row = &mut tmp[(y + 2) * TMP_STRIDE..];
+            let line = &*(src + y as isize * stride).slice::<BD>(x_end - 2);
+            row[..2].copy_from_slice(&if has_left { left[y].map(px) } else { [NONE; 2] });
+            center::<BD, W>(&mut row[2..], line);
+            row[W + 2..W + 4].copy_from_slice(&if has_right { [px(line[W]), px(line[W + 1])] } else { [NONE; 2] });
+        }
+        if edges.contains(CdefEdgeFlags::HAVE_BOTTOM) {
+            for i in 0..2 {
+                let bottom = bottom.clone() - 2_usize + i as isize * stride;
+                let range = (bottom.offset + x_start.., ..x_end - x_start);
+                let line = match bottom.data {
+                    PicOrBuf::Pic(pic) => &*pic.slice::<BD, _>(range),
+                    PicOrBuf::Buf(buf) => &*buf.slice_as(range),
+                };
+                outer(&mut tmp[(H + 2 + i) * TMP_STRIDE..], line);
+            }
+        } else {
+            tmp[(H + 2) * TMP_STRIDE..(H + 4) * TMP_STRIDE].fill(NONE);
+        }
+    }
+
+    #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), target_feature(enable = "sse4.1"))]
+    fn filter_block<BD: BitDepth, const W: usize, const H: usize>(
+        dst: Rav1dPictureDataComponentOffset,
+        left: &[LeftPixelRow2px<BD::Pixel>; 8],
+        top: CdefTop,
+        bottom: CdefBottom,
+        pri_strength: c_int,
+        sec_strength: c_int,
+        dir: c_int,
+        damping: c_int,
+        edges: CdefEdgeFlags,
+        bd: BD,
+    ) {
+        let mut tmp = [0; TMP_STRIDE * TMP_STRIDE];
+        padding::<BD, W, H>(&mut tmp, dst, left, top, bottom, edges);
+        let dir = dir as usize;
+        match (pri_strength != 0, sec_strength != 0) {
+            (true, true) => filter::<BD, W, true, true>(&tmp, dst, H, pri_strength, sec_strength, dir, damping, bd),
+            (true, false) => filter::<BD, W, true, false>(&tmp, dst, H, pri_strength, sec_strength, dir, damping, bd),
+            _ => filter::<BD, W, false, true>(&tmp, dst, H, pri_strength, sec_strength, dir, damping, bd),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Must be called by [`cdef::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn cdef_filter_block_simd_erased<BD: BitDepth, const W: usize, const H: usize>(
+        _dst_ptr: *mut DynPixel,
+        _stride: ptrdiff_t,
+        left: *const [LeftPixelRow2px<DynPixel>; 8],
+        _top_ptr: *const DynPixel,
+        _bottom_ptr: *const DynPixel,
+        pri_strength: c_int,
+        sec_strength: c_int,
+        dir: c_int,
+        damping: c_int,
+        edges: CdefEdgeFlags,
+        bitdepth_max: c_int,
+        dst: FFISafeRav1dPictureDataComponentOffset,
+        top: WithOffset<*const FFISafe<DisjointMut<AlignedVec64<u8>>>>,
+        bottom: WithOffset<*const FFISafe<PicOrBuf<'_, AlignedVec64<u8>>>>,
+    ) {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `cdef::Fn::call`.
+        let dst = unsafe { FFISafe::from_with_offset(dst) };
+        // SAFETY: Reverse of cast in `cdef::Fn::call`.
+        let left = unsafe { &*left.cast() };
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `cdef::Fn::call`.
+        let top = unsafe { FFISafe::from_with_offset(top) };
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `cdef::Fn::call`.
+        let bottom = unsafe { FFISafe::from_with_offset(bottom) };
+        let bd = BD::from_c(bitdepth_max);
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe {
+            filter_block::<BD, W, H>(
+                dst,
+                left,
+                top,
+                bottom.map(|bot| *bot),
+                pri_strength,
+                sec_strength,
+                dir,
+                damping,
+                edges,
+                bd,
+            )
+        }
+    }
+}
+
 #[deny(unsafe_op_in_unsafe_fn)]
 #[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
 mod neon {
@@ -758,7 +999,7 @@ impl Rav1dCdefDSPContext {
     }
 
     #[inline(always)]
-    const fn init<BD: BitDepth>(self, flags: CpuFlags) -> Self {
+    const fn init_asm<BD: BitDepth>(self, flags: CpuFlags) -> Self {
         #[cfg(feature = "asm")]
         {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -778,7 +1019,271 @@ impl Rav1dCdefDSPContext {
         }
     }
 
+    #[inline(always)]
+    const fn init_rust_simd<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
+        use self::rust_simd::cdef_filter_block_simd_erased;
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if !flags.contains(CpuFlags::SSE41) {
+            return self;
+        }
+        let _ = flags;
+        if !crate::simd128::native() {
+            return self;
+        }
+
+        self.fb = [
+            cdef::Fn::new(cdef_filter_block_simd_erased::<BD, 8, 8>),
+            cdef::Fn::new(cdef_filter_block_simd_erased::<BD, 4, 8>),
+            cdef::Fn::new(cdef_filter_block_simd_erased::<BD, 4, 4>),
+        ];
+        self
+    }
+
+    /// The Rust SIMD kernels stand in where there is no asm, or over it with `--cfg rav1d_rust_simd`.
+    #[inline(always)]
+    const fn init<BD: BitDepth>(self, flags: CpuFlags) -> Self {
+        let this = self.init_asm::<BD>(flags);
+        if cfg!(any(not(feature = "asm"), rav1d_rust_simd)) {
+            this.init_rust_simd::<BD>(flags)
+        } else {
+            this
+        }
+    }
+
     pub const fn new<BD: BitDepth>(flags: CpuFlags) -> Self {
         Self::default::<BD>().init::<BD>(flags)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
+    use crate::include::common::bitdepth::{BitDepth16, BitDepth8};
+    use crate::include::dav1d::picture::Rav1dPictureDataComponent;
+
+    const STRIDE: usize = 64;
+    const ROWS: usize = 32;
+    const BX: usize = 16;
+    const BY: usize = 8;
+    const SIZES: [(usize, usize); 3] = [(8, 8), (4, 8), (4, 4)];
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u32
+        }
+
+        /// Mostly a smooth area with small noise, one in four a jump anywhere in range.
+        fn pixel(&mut self, bits: u8) -> c_int {
+            let max = (1 << bits) - 1;
+            if self.next() % 4 == 0 {
+                return (self.next() % (max as u32 + 1)) as c_int;
+            }
+            let mid = 1 << (bits - 1);
+            (mid + ((self.next() % 41) as c_int - 20 << (bits - 8))).clamp(0, max)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Case {
+        size: usize,
+        pri: c_int,
+        sec: u8,
+        dir: c_int,
+        damping: u8,
+        edges: CdefEdgeFlags,
+    }
+
+    /// Every edge set, direction and size with the strengths and dampings `cdef_apply` passes.
+    fn cases(bits: u8) -> Vec<Case> {
+        let s = bits - 8;
+        let mut out = Vec::new();
+        for edges in 0..16 {
+            for dir in 0..8 {
+                for size in 0..3 {
+                    for pri in 0..16 {
+                        for sec in [0, 1, 2, 4] {
+                            for damping in 2..=6 {
+                                if pri == 0 && sec == 0 {
+                                    continue;
+                                }
+                                out.push(Case {
+                                    size,
+                                    pri: pri << s,
+                                    sec: sec << s,
+                                    dir,
+                                    damping: damping + s,
+                                    edges: CdefEdgeFlags::from_bits_truncate(edges),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    struct Fixture<BD: BitDepth> {
+        orig: Vec<BD::Pixel>,
+        comp: Rav1dPictureDataComponent,
+        _buf: AlignedVec64<BD::Pixel>,
+        top: DisjointMut<AlignedVec64<u8>>,
+        left: [LeftPixelRow2px<BD::Pixel>; 8],
+    }
+
+    impl<BD: BitDepth> Fixture<BD> {
+        fn new(rng: &mut Rng, bits: u8) -> Self {
+            let px = |rng: &mut Rng| rng.pixel(bits).as_::<BD::Pixel>();
+            let orig: Vec<BD::Pixel> = (0..STRIDE * ROWS).map(|_| px(rng)).collect();
+            let mut buf = AlignedVec64::<BD::Pixel>::new();
+            buf.resize(STRIDE * ROWS, 0.as_::<BD::Pixel>());
+            buf.as_mut_slice().copy_from_slice(&orig);
+            let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), STRIDE);
+            let n = std::mem::size_of::<BD::Pixel>();
+            let bytes: Vec<u8> = (0..2 * STRIDE)
+                .flat_map(|_| (rng.pixel(bits) as u16).to_le_bytes().into_iter().take(n))
+                .collect();
+            let mut top = AlignedVec64::<u8>::new();
+            top.resize(bytes.len(), 0);
+            top.as_mut_slice().copy_from_slice(&bytes);
+            let left = [[0; 2]; 8].map(|r: [u8; 2]| r.map(|_| px(rng)));
+            Self { orig, comp, _buf: buf, top: DisjointMut::new(top), left }
+        }
+
+        fn reset(&self) {
+            self.comp.slice_mut::<BD, _>((0.., ..STRIDE * ROWS)).copy_from_slice(&self.orig);
+        }
+
+        fn plane(&self) -> Vec<BD::Pixel> {
+            self.comp.slice::<BD, _>((0.., ..STRIDE * ROWS)).to_vec()
+        }
+
+        fn call(&self, dsp: &Rav1dCdefDSPContext, c: Case, bd: BD) {
+            let h = SIZES[c.size].1;
+            dsp.fb[c.size].call::<BD>(
+                WithOffset { data: &self.comp, offset: BY * STRIDE + BX },
+                &self.left,
+                WithOffset { data: &self.top, offset: BX },
+                WithOffset { data: PicOrBuf::Pic(&self.comp), offset: (BY + h) * STRIDE + BX },
+                c.pri,
+                c.sec,
+                c.dir,
+                c.damping,
+                c.edges,
+                bd,
+            );
+        }
+    }
+
+    fn contexts<BD: BitDepth>() -> [(&'static str, Rav1dCdefDSPContext); 3] {
+        rav1d_init_cpu();
+        let flags = rav1d_get_cpu_flags();
+        [
+            ("scalar", Rav1dCdefDSPContext::default::<BD>()),
+            ("rust simd", Rav1dCdefDSPContext::default::<BD>().init_rust_simd::<BD>(flags)),
+            ("asm", Rav1dCdefDSPContext::default::<BD>().init_asm::<BD>(flags)),
+        ]
+    }
+
+    fn matches_scalar<BD: BitDepth>(bits: u8) {
+        let bd = BD::from_c((1 << bits) - 1);
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let dsps = contexts::<BD>();
+        for (i, c) in cases(bits).into_iter().enumerate() {
+            if i % 512 == 0 {
+                rng.next();
+            }
+            let fx = Fixture::<BD>::new(&mut rng, bits);
+            fx.call(&dsps[0].1, c, bd);
+            let want = fx.plane();
+            for (name, dsp) in &dsps[1..] {
+                fx.reset();
+                fx.call(dsp, c, bd);
+                assert!(fx.plane() == want, "{name} differs from scalar at {bits} bits, case {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn rust_simd_and_asm_match_scalar_8bpc() {
+        matches_scalar::<BitDepth8>(8);
+    }
+
+    #[test]
+    fn rust_simd_and_asm_match_scalar_10bpc() {
+        matches_scalar::<BitDepth16>(10);
+    }
+
+    #[test]
+    fn rust_simd_and_asm_match_scalar_12bpc() {
+        matches_scalar::<BitDepth16>(12);
+    }
+
+    /// `cargo test --release --lib cdef::tests::time -- --ignored --nocapture`
+    fn time<BD: BitDepth>(bits: u8) {
+        let bd = BD::from_c((1 << bits) - 1);
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let fx = Fixture::<BD>::new(&mut rng, bits);
+        let all = cases(bits);
+        for size in 0..3 {
+            let cases: Vec<Case> = all.iter().copied().filter(|c| c.size == size).collect();
+            let mut line = format!("{bits:2}-bit {}x{}:", SIZES[size].0, SIZES[size].1);
+            for (name, dsp) in contexts::<BD>() {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    fx.reset();
+                    let start = Instant::now();
+                    for &c in &cases {
+                        fx.call(black_box(&dsp), c, bd);
+                    }
+                    best = best.min(start.elapsed().as_secs_f64() * 1e9 / cases.len() as f64);
+                }
+                line += &format!("  {name} {best:6.1} ns");
+            }
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let start = Instant::now();
+                for &c in &cases {
+                    let (w, h) = SIZES[c.size];
+                    let mut tmp = [0; TMP_STRIDE * TMP_STRIDE];
+                    padding::<BD>(
+                        &mut tmp,
+                        WithOffset { data: &fx.comp, offset: BY * STRIDE + BX },
+                        &fx.left,
+                        WithOffset { data: &fx.top, offset: BX },
+                        WithOffset { data: PicOrBuf::Pic(&fx.comp), offset: (BY + h) * STRIDE + BX },
+                        w,
+                        h,
+                        c.edges,
+                    );
+                    black_box(&tmp);
+                }
+                best = best.min(start.elapsed().as_secs_f64() * 1e9 / cases.len() as f64);
+            }
+            line += &format!("  (padding alone {best:6.1} ns)");
+            println!("{line}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn time_8bpc() {
+        time::<BitDepth8>(8);
+    }
+
+    #[test]
+    #[ignore]
+    fn time_10bpc() {
+        time::<BitDepth16>(10);
     }
 }
