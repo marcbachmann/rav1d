@@ -566,11 +566,20 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
         (bounds[val] as u16, bounds[val + 1] as u16)
     };
     // As the NEON asm: the pair shifted out of the packed lanes, without a trip through memory.
+    // From the 64-bit half holding lane `val`, as a variable 128-bit shift compiles to ~20
+    // instructions; `u` is that half moved up a lane under the lane below it, or `rng`.
     #[cfg(target_arch = "aarch64")]
     let (u, v) = if LANES <= 8 {
         let packed = vs[0].to_u128();
-        let with_rng = packed << 16 | s.rng as u16 as u128;
-        ((with_rng >> 16 * val) as u16, (packed >> 16 * val) as u16)
+        let (lo, hi) = (packed as u64, (packed >> 64) as u64);
+        let rng = s.rng as u16 as u64;
+        let (us, vs) = if val < 4 {
+            (lo << 16 | rng, lo)
+        } else {
+            (hi << 16 | lo >> 48, hi)
+        };
+        let shift = 16 * (val & 3);
+        ((us >> shift) as u16, (vs >> shift) as u16)
     } else {
         bound_pair()
     };
