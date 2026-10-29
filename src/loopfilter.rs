@@ -276,13 +276,561 @@ fn loop_filter<BD: BitDepth>(
     }
 }
 
-#[derive(FromRepr)]
+/// [`loop_filter_sb128_rust`] eight lines of an edge at a time for 8 bpc, sixteen on AVX2: two
+/// (four) 4-line segments, each with its own levels and filter length. Every lane takes the
+/// narrow filter and the flat filters the group's longest length needs, and masks per lane pick
+/// its result, as the C's branches would. Along a vertical edge the lines are rows, turned into
+/// lanes by an 8x8 transpose; along a horizontal one they are columns, loaded as they lie.
+mod rust_simd {
+    use zerocopy::AsBytes;
+
+    use super::*;
+    #[cfg(target_arch = "x86_64")]
+    use crate::simd128::I16x16;
+    use crate::simd128::{transpose8x8, I16x8, Lanes};
+
+    /// A lane type with its pixel loads and stores.
+    pub trait Px: Lanes {
+        /// Lines per vector.
+        const N: usize;
+        /// Bytes `b[..N]` zero-extended.
+        fn load_px(b: &[u8]) -> Self;
+        /// The lanes saturated into `d[..N]`.
+        fn store_px(self, d: &mut [u8]);
+        /// Eight bytes of `a`, and on sixteen lanes eight of `b` in the high half: a row window
+        /// of two lines eight apart.
+        fn load_rows(a: &[u8], b: &[u8]) -> Self;
+        fn store_rows(self, a: &mut [u8], b: &mut [u8]);
+        fn load_i16(s: &[i16]) -> Self;
+    }
+
+    impl Px for I16x8 {
+        const N: usize = 8;
+        #[inline(always)]
+        fn load_px(b: &[u8]) -> Self {
+            I16x8::from_u8x8(b)
+        }
+        #[inline(always)]
+        fn store_px(self, d: &mut [u8]) {
+            d[..8].copy_from_slice(&self.pack_u8());
+        }
+        #[inline(always)]
+        fn load_rows(a: &[u8], _: &[u8]) -> Self {
+            I16x8::from_u8x8(a)
+        }
+        #[inline(always)]
+        fn store_rows(self, a: &mut [u8], _: &mut [u8]) {
+            a[..8].copy_from_slice(&self.pack_u8());
+        }
+        #[inline(always)]
+        fn load_i16(s: &[i16]) -> Self {
+            I16x8::load(s)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl Px for I16x16 {
+        const N: usize = 16;
+        #[inline(always)]
+        fn load_px(b: &[u8]) -> Self {
+            I16x16::from_u8x16(b)
+        }
+        #[inline(always)]
+        fn store_px(self, d: &mut [u8]) {
+            d[..16].copy_from_slice(&self.pack_u8());
+        }
+        #[inline(always)]
+        fn load_rows(a: &[u8], b: &[u8]) -> Self {
+            I16x16::from_halves(I16x8::from_u8x8(a), I16x8::from_u8x8(b))
+        }
+        #[inline(always)]
+        fn store_rows(self, a: &mut [u8], b: &mut [u8]) {
+            let px = self.pack_u8();
+            a[..8].copy_from_slice(&px[..8]);
+            b[..8].copy_from_slice(&px[8..]);
+        }
+        #[inline(always)]
+        fn load_i16(s: &[i16]) -> Self {
+            I16x16::load(s)
+        }
+    }
+
+    /// A group's thresholds and filter-length masks, per lane.
+    #[derive(Clone, Copy)]
+    struct Params<V> {
+        e: V,
+        i: V,
+        h: V,
+        active: V,
+        /// Filter length above 4 (6, 8 or 16), above 6, and 16.
+        gt4: V,
+        gt6: V,
+        wd16: V,
+    }
+
+    #[inline(always)]
+    fn le<V: Lanes>(a: V, b: V) -> V {
+        a.max(b).eq(b)
+    }
+
+    #[inline(always)]
+    fn absdiff<V: Lanes>(a: V, b: V) -> V {
+        a.sub(b).abs()
+    }
+
+    /// Generated from `loop_filter`'s flat16 branch: one running sum, a term in and out per output.
+    #[inline(always)]
+    fn flat16<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
+        let rnd = V::splat(8);
+        let mut s = px[0]
+            .add(px[0])
+            .add(px[0])
+            .add(px[0])
+            .add(px[0])
+            .add(px[0])
+            .add(px[0])
+            .add(px[1])
+            .add(px[1])
+            .add(px[2])
+            .add(px[2])
+            .add(px[3])
+            .add(px[4])
+            .add(px[5])
+            .add(px[6])
+            .add(px[7]);
+        out[1] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[0]).sub(px[0]).add(px[3]).add(px[8]);
+        out[2] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[0]).sub(px[1]).add(px[4]).add(px[9]);
+        out[3] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[0]).sub(px[2]).add(px[5]).add(px[10]);
+        out[4] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[0]).sub(px[3]).add(px[6]).add(px[11]);
+        out[5] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[0]).sub(px[4]).add(px[7]).add(px[12]);
+        out[6] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[0]).sub(px[5]).add(px[8]).add(px[13]);
+        out[7] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[1]).sub(px[6]).add(px[9]).add(px[13]);
+        out[8] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[2]).sub(px[7]).add(px[10]).add(px[13]);
+        out[9] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[3]).sub(px[8]).add(px[11]).add(px[13]);
+        out[10] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[4]).sub(px[9]).add(px[12]).add(px[13]);
+        out[11] = s.add(rnd).shr_s::<4>();
+        s = s.sub(px[5]).sub(px[10]).add(px[13]).add(px[13]);
+        out[12] = s.add(rnd).shr_s::<4>();
+    }
+
+    /// Generated from `loop_filter`'s flat8 branch: one running sum, a term in and out per output.
+    #[inline(always)]
+    fn flat8<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
+        let rnd = V::splat(4);
+        let mut s = px[3]
+            .add(px[3])
+            .add(px[3])
+            .add(px[4])
+            .add(px[4])
+            .add(px[5])
+            .add(px[6])
+            .add(px[7]);
+        out[4] = s.add(rnd).shr_s::<3>();
+        s = s.sub(px[3]).sub(px[4]).add(px[5]).add(px[8]);
+        out[5] = s.add(rnd).shr_s::<3>();
+        s = s.sub(px[3]).sub(px[5]).add(px[6]).add(px[9]);
+        out[6] = s.add(rnd).shr_s::<3>();
+        s = s.sub(px[3]).sub(px[6]).add(px[7]).add(px[10]);
+        out[7] = s.add(rnd).shr_s::<3>();
+        s = s.sub(px[4]).sub(px[7]).add(px[8]).add(px[10]);
+        out[8] = s.add(rnd).shr_s::<3>();
+        s = s.sub(px[5]).sub(px[8]).add(px[9]).add(px[10]);
+        out[9] = s.add(rnd).shr_s::<3>();
+    }
+
+    /// Generated from `loop_filter`'s flat6 branch: one running sum, a term in and out per output.
+    #[inline(always)]
+    fn flat6<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
+        let rnd = V::splat(4);
+        let mut s = px[4]
+            .add(px[4])
+            .add(px[4])
+            .add(px[5])
+            .add(px[5])
+            .add(px[6])
+            .add(px[6])
+            .add(px[7]);
+        out[5] = s.add(rnd).shr_s::<3>();
+        s = s.sub(px[4]).sub(px[4]).add(px[7]).add(px[8]);
+        out[6] = s.add(rnd).shr_s::<3>();
+        s = s.sub(px[4]).sub(px[5]).add(px[8]).add(px[9]);
+        out[7] = s.add(rnd).shr_s::<3>();
+        s = s.sub(px[5]).sub(px[6]).add(px[9]).add(px[9]);
+        out[8] = s.add(rnd).shr_s::<3>();
+    }
+
+    /// `px[7 + k]` is the pixel at offset `k` across the edge, `-7..=6`; `MAX` is the group's
+    /// longest filter, and lanes of a shorter one ignore what it adds.
+    #[inline(always)]
+    fn filter<V: Lanes, const MAX: usize>(px: &mut [V; 14], p: Params<V>) {
+        let orig = *px;
+        let [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6] = orig;
+        let (zero, ones, one) = (V::splat(0), V::splat(-1), V::splat(1));
+        let mut fm = le(absdiff(p1, p0), p.i)
+            .and(le(absdiff(q1, q0), p.i))
+            .and(le(
+                absdiff(p0, q0)
+                    .add(absdiff(p0, q0))
+                    .add(absdiff(p1, q1).shr_s::<1>()),
+                p.e,
+            ))
+            .and(p.active);
+        if MAX > 4 {
+            let c = le(absdiff(p2, p1), p.i).and(le(absdiff(q2, q1), p.i));
+            fm = fm.and(V::select(p.gt4, c, ones));
+        }
+        if MAX > 6 {
+            let c = le(absdiff(p3, p2), p.i).and(le(absdiff(q3, q2), p.i));
+            fm = fm.and(V::select(p.gt6, c, ones));
+        }
+
+        let hev = le(absdiff(p1, p0), p.h)
+            .and(le(absdiff(q1, q0), p.h))
+            .eq(zero);
+        let (lo, hi) = (V::splat(-128), V::splat(127));
+        let f = p1.sub(q1).max(lo).min(hi).and(hev);
+        let d = q0.sub(p0);
+        let f = d.add(d).add(d).add(f).max(lo).min(hi);
+        let f1 = f.add(V::splat(4)).min(hi).shr_s::<3>();
+        let f2 = f.add(V::splat(3)).min(hi).shr_s::<3>();
+        let f3 = f1.add(one).shr_s::<1>().and(hev.eq(zero));
+        px[5] = V::select(fm, p1.add(f3), p1);
+        px[6] = V::select(fm, p0.add(f2), p0);
+        px[7] = V::select(fm, q0.sub(f1), q0);
+        px[8] = V::select(fm, q1.sub(f3), q1);
+
+        if MAX < 6 {
+            return;
+        }
+        let mut flat_in = le(absdiff(p2, p0), one)
+            .and(le(absdiff(p1, p0), one))
+            .and(le(absdiff(q1, q0), one))
+            .and(le(absdiff(q2, q0), one));
+        if MAX > 6 {
+            let c = le(absdiff(p3, p0), one).and(le(absdiff(q3, q0), one));
+            flat_in = flat_in.and(V::select(p.gt6, c, ones));
+        }
+        let flat_in = flat_in.and(fm);
+        let mut out = orig;
+        if MAX == 6 {
+            let m = flat_in.and(p.gt4);
+            flat6(&orig, &mut out);
+            for k in 5..=8 {
+                px[k] = V::select(m, out[k], px[k]);
+            }
+            return;
+        }
+        let m = flat_in.and(p.gt6);
+        flat8(&orig, &mut out);
+        for k in 4..=9 {
+            px[k] = V::select(m, out[k], px[k]);
+        }
+        if MAX == 16 {
+            let flat_out = le(absdiff(p6, p0), one)
+                .and(le(absdiff(p5, p0), one))
+                .and(le(absdiff(p4, p0), one))
+                .and(le(absdiff(q4, q0), one))
+                .and(le(absdiff(q5, q0), one))
+                .and(le(absdiff(q6, q0), one));
+            let m = flat_in.and(flat_out).and(p.wd16);
+            flat16(&orig, &mut out);
+            for k in 1..=12 {
+                px[k] = V::select(m, out[k], px[k]);
+            }
+        }
+    }
+
+    /// The pixels on each side of the edge the filter of length `max` reads.
+    const fn reach(max: usize) -> usize {
+        match max {
+            4 => 2,
+            6 => 3,
+            8 => 4,
+            _ => 7,
+        }
+    }
+
+    /// One group along a horizontal edge: lanes are the columns from `dst`.
+    #[inline(always)]
+    fn group_v<BD: BitDepth, V: Px, const MAX: usize>(
+        dst: Rav1dPictureDataComponentOffset,
+        p: Params<V>,
+    ) {
+        let stride = dst.pixel_stride::<BD>();
+        let r = reach(MAX) as isize;
+        let mut px = [V::splat(0); 14];
+        for k in -r..r {
+            let row = dst + k * stride;
+            px[(7 + k) as usize] = V::load_px(row.slice::<BD>(V::N).as_bytes());
+        }
+        filter::<V, MAX>(&mut px, p);
+        let w = if MAX == 16 { 6 } else { r.min(3) };
+        for k in -w..w {
+            let row = dst + k * stride;
+            px[(7 + k) as usize].store_px(row.slice_mut::<BD>(V::N).as_bytes_mut());
+        }
+    }
+
+    /// One group along a vertical edge: lanes are the rows from `dst`, turned into lanes in 8x8
+    /// blocks of the windows from 4 (or 8) pixels left of the edge.
+    #[inline(always)]
+    fn group_h<BD: BitDepth, V: Px, const MAX: usize>(
+        dst: Rav1dPictureDataComponentOffset,
+        p: Params<V>,
+    ) {
+        let stride = dst.pixel_stride::<BD>();
+        let (n, x0) = if MAX == 16 { (2, -8) } else { (1, -4) };
+        let mut win = [[V::splat(0); 8]; 2];
+        for (w, win) in win.iter_mut().enumerate().take(n) {
+            let x = x0 + 8 * w as isize;
+            for (r, v) in win.iter_mut().enumerate() {
+                let a = dst + (r as isize * stride + x);
+                *v = if V::N == 8 {
+                    V::load_rows(a.slice::<BD>(8).as_bytes(), &[])
+                } else {
+                    let b = dst + ((r + 8) as isize * stride + x);
+                    V::load_rows(a.slice::<BD>(8).as_bytes(), b.slice::<BD>(8).as_bytes())
+                };
+            }
+            transpose8x8(win);
+        }
+        // `px[7 + k]` is window column `k - x0`; -8 and 7 lie outside every filter's reach.
+        let mut px = [V::splat(0); 14];
+        for k in -7..7isize {
+            let c = (k - x0) as usize;
+            if c < 8 * n {
+                px[(7 + k) as usize] = win[c / 8][c % 8];
+            }
+        }
+        filter::<V, MAX>(&mut px, p);
+        for k in -7..7isize {
+            let c = (k - x0) as usize;
+            if c < 8 * n {
+                win[c / 8][c % 8] = px[(7 + k) as usize];
+            }
+        }
+        for (w, win) in win.iter_mut().enumerate().take(n) {
+            let x = x0 + 8 * w as isize;
+            transpose8x8(win);
+            for (r, v) in win.iter().enumerate() {
+                let a = dst + (r as isize * stride + x);
+                if V::N == 8 {
+                    v.store_rows(&mut *a.slice_mut::<BD>(8).as_bytes_mut(), &mut [])
+                } else {
+                    let b = dst + ((r + 8) as isize * stride + x);
+                    v.store_rows(
+                        &mut *a.slice_mut::<BD>(8).as_bytes_mut(),
+                        &mut *b.slice_mut::<BD>(8).as_bytes_mut(),
+                    )
+                }
+            }
+        }
+    }
+
+    /// [`loop_filter_sb128_rust`] a group of `V::N / 4` segments at a time; a group running past
+    /// the `wh` segments inside the picture takes the scalar filter, so no lane reads beyond it.
+    #[inline(always)]
+    fn filter_sb<BD: BitDepth, V: Px, const HV: usize, const YUV: usize>(
+        mut dst: Rav1dPictureDataComponentOffset,
+        vmask: &[u32; 3],
+        mut lvl: WithOffset<&DisjointMut<AlignedVec2<u8>>>,
+        b4_stride: usize,
+        lut: &Align16<Av1FilterLUT>,
+        wh: c_int,
+        bd: BD,
+    ) {
+        let hv = super::HV::from_repr(HV).unwrap();
+        let yuv = super::YUV::from_repr(YUV).unwrap();
+        let stride = dst.pixel_stride::<BD>();
+        let (stridea, strideb) = match hv {
+            super::HV::H => (stride, 1),
+            super::HV::V => (1, stride),
+        };
+        let (b4_stridea, b4_strideb) = match hv {
+            super::HV::H => (b4_stride, 1),
+            super::HV::V => (1, b4_stride),
+        };
+        let vm = match yuv {
+            super::YUV::Y => vmask[0] | vmask[1] | vmask[2],
+            super::YUV::UV => vmask[0] | vmask[1],
+        };
+        let segs = V::N / 4;
+        let mut s0 = 0;
+        while s0 < 32 && vm >> s0 != 0 {
+            let mut lanes = [[0i16; 16]; 7];
+            let mut scalar = [None; 4];
+            let mut max = 0;
+            for j in 0..segs {
+                let xy = 1u32 << (s0 + j);
+                if vm & xy == 0 {
+                    continue;
+                }
+                let at = lvl + 4 * b4_stridea * j;
+                let l = match *at.data.index(at.offset) {
+                    0 => {
+                        let at = at - 4 * b4_strideb;
+                        *at.data.index(at.offset)
+                    }
+                    l => l,
+                };
+                if l == 0 {
+                    continue;
+                }
+                let idx = match yuv {
+                    super::YUV::Y => {
+                        if vmask[2] & xy != 0 {
+                            2
+                        } else {
+                            (vmask[1] & xy != 0) as usize
+                        }
+                    }
+                    super::YUV::UV => (vmask[1] & xy != 0) as usize,
+                };
+                let wd = match yuv {
+                    super::YUV::Y => 4 << idx,
+                    super::YUV::UV => 4 + 2 * idx,
+                };
+                let (e, i, h) = (lut.0.e[l as usize], lut.0.i[l as usize], l >> 4);
+                scalar[j] = Some((e, i, h, wd));
+                max = max.max(wd);
+                let flags = [
+                    e as i16,
+                    i as i16,
+                    h as i16,
+                    -1,
+                    -((wd > 4) as i16),
+                    -((wd > 6) as i16),
+                    -((wd == 16) as i16),
+                ];
+                for (lane, flag) in lanes.iter_mut().zip(flags) {
+                    lane[4 * j..4 * j + 4].fill(flag);
+                }
+            }
+            if max != 0 && s0 + segs > wh as usize {
+                for (j, seg) in scalar.into_iter().enumerate() {
+                    if let Some((e, i, h, wd)) = seg {
+                        let dst = dst + (4 * j) as isize * stridea;
+                        loop_filter(dst, e, i, h, stridea, strideb, wd as c_int, bd);
+                    }
+                }
+            } else if max != 0 {
+                let [e, i, h, active, gt4, gt6, wd16] = lanes.map(|l| V::load_i16(&l));
+                let p = Params {
+                    e,
+                    i,
+                    h,
+                    active,
+                    gt4,
+                    gt6,
+                    wd16,
+                };
+                match (matches!(hv, super::HV::H), max) {
+                    (true, 4) => group_h::<BD, V, 4>(dst, p),
+                    (true, 6) => group_h::<BD, V, 6>(dst, p),
+                    (true, 8) => group_h::<BD, V, 8>(dst, p),
+                    (true, _) => group_h::<BD, V, 16>(dst, p),
+                    (false, 4) => group_v::<BD, V, 4>(dst, p),
+                    (false, 6) => group_v::<BD, V, 6>(dst, p),
+                    (false, 8) => group_v::<BD, V, 8>(dst, p),
+                    (false, _) => group_v::<BD, V, 16>(dst, p),
+                }
+            }
+            s0 += segs;
+            dst += (4 * segs) as isize * stridea;
+            lvl += 4 * segs * b4_stridea;
+        }
+    }
+
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn filter_sb_128<BD: BitDepth, const HV: usize, const YUV: usize>(
+        dst: Rav1dPictureDataComponentOffset,
+        vmask: &[u32; 3],
+        lvl: WithOffset<&DisjointMut<AlignedVec2<u8>>>,
+        b4_stride: usize,
+        lut: &Align16<Av1FilterLUT>,
+        wh: c_int,
+        bd: BD,
+    ) {
+        filter_sb::<BD, I16x8, { HV }, { YUV }>(dst, vmask, lvl, b4_stride, lut, wh, bd)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    fn filter_sb_avx2<BD: BitDepth, const HV: usize, const YUV: usize>(
+        dst: Rav1dPictureDataComponentOffset,
+        vmask: &[u32; 3],
+        lvl: WithOffset<&DisjointMut<AlignedVec2<u8>>>,
+        b4_stride: usize,
+        lut: &Align16<Av1FilterLUT>,
+        wh: c_int,
+        bd: BD,
+    ) {
+        filter_sb::<BD, I16x16, { HV }, { YUV }>(dst, vmask, lvl, b4_stride, lut, wh, bd)
+    }
+
+    /// # Safety
+    ///
+    /// Must be called by [`loopfilter_sb::Fn::call`] at 8 bpc, on x86 once the CPU flags hold
+    /// SSE41, and with `WIDE` once they hold AVX2.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn loop_filter_sb_simd_erased<
+        BD: BitDepth,
+        const HV: usize,
+        const YUV: usize,
+        const WIDE: bool,
+    >(
+        _dst_ptr: *mut DynPixel,
+        _stride: ptrdiff_t,
+        vmask: &[u32; 3],
+        _lvl_ptr: *const [u8; 4],
+        b4_stride: isize,
+        lut: &Align16<Av1FilterLUT>,
+        wh: c_int,
+        bitdepth_max: c_int,
+        dst: FFISafeRav1dPictureDataComponentOffset,
+        lvl: WithOffset<*const FFISafe<DisjointMut<AlignedVec2<u8>>>>,
+    ) {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `loopfilter_sb::Fn::call`.
+        let dst = unsafe { FFISafe::from_with_offset(dst) };
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `loopfilter_sb::Fn::call`.
+        let lvl = unsafe { FFISafe::from_with_offset(lvl) };
+        let b4_stride = b4_stride as usize;
+        let bd = BD::from_c(bitdepth_max);
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86, and AVX2 before `WIDE` is;
+        // elsewhere it is safe.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            if WIDE {
+                return filter_sb_avx2::<BD, { HV }, { YUV }>(
+                    dst, vmask, lvl, b4_stride, lut, wh, bd,
+                );
+            }
+            filter_sb_128::<BD, { HV }, { YUV }>(dst, vmask, lvl, b4_stride, lut, wh, bd)
+        }
+    }
+}
+
+#[derive(Clone, Copy, FromRepr)]
 enum HV {
     H,
     V,
 }
 
-#[derive(FromRepr)]
+#[derive(Clone, Copy, FromRepr)]
 enum YUV {
     Y,
     UV,
@@ -453,6 +1001,43 @@ impl Rav1dLoopFilterDSPContext {
         self
     }
 
+    /// The Rust SIMD filters at 8 bpc, on sixteen lanes once the CPU flags hold AVX2.
+    #[inline(always)]
+    const fn init_rust_simd<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
+        use HV::*;
+        use YUV::*;
+
+        use self::rust_simd::loop_filter_sb_simd_erased as f;
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if !flags.contains(CpuFlags::SSE41) {
+            return self;
+        }
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = flags.contains(CpuFlags::AVX2);
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx2 = false;
+        let _ = flags;
+        if !crate::simd128::native() || BD::BITDEPTH != 8 {
+            return self;
+        }
+        let lf = &mut self.loop_filter_sb;
+        if avx2 {
+            lf.y.h = loopfilter_sb::Fn::new(f::<BD, { H as _ }, { Y as _ }, true>);
+            lf.y.v = loopfilter_sb::Fn::new(f::<BD, { V as _ }, { Y as _ }, true>);
+            lf.uv.h = loopfilter_sb::Fn::new(f::<BD, { H as _ }, { UV as _ }, true>);
+            lf.uv.v = loopfilter_sb::Fn::new(f::<BD, { V as _ }, { UV as _ }, true>);
+        } else {
+            lf.y.h = loopfilter_sb::Fn::new(f::<BD, { H as _ }, { Y as _ }, false>);
+            lf.y.v = loopfilter_sb::Fn::new(f::<BD, { V as _ }, { Y as _ }, false>);
+            lf.uv.h = loopfilter_sb::Fn::new(f::<BD, { H as _ }, { UV as _ }, false>);
+            lf.uv.v = loopfilter_sb::Fn::new(f::<BD, { V as _ }, { UV as _ }, false>);
+        }
+        self
+    }
+
+    /// The Rust SIMD filters stand in where there is no asm, or over it with
+    /// `--cfg rav1d_rust_simd="loopfilter"`.
     #[inline(always)]
     const fn init<BD: BitDepth>(self, flags: CpuFlags) -> Self {
         #[cfg(all(feature = "asm", not(rav1d_rust_simd = "loopfilter")))]
@@ -468,13 +1053,166 @@ impl Rav1dLoopFilterDSPContext {
         }
 
         #[allow(unreachable_code)] // Reachable on some #[cfg]s.
-        {
-            let _ = flags;
-            self
-        }
+        self.init_rust_simd::<BD>(flags)
     }
 
     pub const fn new<BD: BitDepth>(flags: CpuFlags) -> Self {
         Self::default::<BD>().init::<BD>(flags)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::AlignedVec64;
+    use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
+    use crate::include::common::bitdepth::BitDepth8;
+    use crate::include::dav1d::picture::Rav1dPictureDataComponent;
+    use crate::lf_mask::rav1d_calc_eih;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u32
+        }
+    }
+
+    const STRIDE: usize = 128;
+    const ROWS: usize = 160;
+    const B4_STRIDE: usize = 40;
+
+    /// The plane after `f` filters one edge: vertical at column 32 from row 8, or horizontal at
+    /// row 32 from column 0, `wh` segments long.
+    fn run(
+        f: &loopfilter_sb::Fn,
+        hv: HV,
+        orig: &[u8],
+        mask: &[u32; 3],
+        lvl: &DisjointMut<AlignedVec2<u8>>,
+        lut: &Align16<Av1FilterLUT>,
+        wh: usize,
+    ) -> Vec<u8> {
+        let mut buf = AlignedVec64::<u8>::new();
+        buf.resize(orig.len(), 0);
+        buf.as_mut_slice().copy_from_slice(orig);
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+        let offset = match hv {
+            HV::H => 8 * STRIDE + 32,
+            HV::V => 32 * STRIDE,
+        };
+        let dst = WithOffset {
+            data: &comp,
+            offset,
+        };
+        let lvl = WithOffset {
+            data: lvl,
+            offset: 8 * B4_STRIDE,
+        };
+        let dst_ptr = dst.as_mut_ptr::<BitDepth8>().cast();
+        let lvl_ptr = lvl.data.as_mut_ptr().wrapping_add(lvl.offset).cast();
+        // SAFETY: The arguments are what `loopfilter_sb::Fn::call` passes.
+        unsafe {
+            f.get()(
+                dst_ptr,
+                dst.stride(),
+                mask,
+                lvl_ptr,
+                B4_STRIDE as isize,
+                lut,
+                wh as c_int,
+                255,
+                dst.into_ffi_safe(),
+                lvl.into_ffi_safe(),
+            )
+        };
+        drop(comp);
+        buf.as_slice().to_vec()
+    }
+
+    /// Mostly smooth areas a step apart at the edges, so the flat filters fire, with noise.
+    fn plane(rng: &mut Rng) -> Vec<u8> {
+        let base = [rng.next() % 256, rng.next() % 256];
+        let noise = [1, 2, 4, 16][rng.next() as usize % 4];
+        (0..STRIDE * ROWS)
+            .map(|i| {
+                let (y, x) = (i / STRIDE, i % STRIDE);
+                let side = ((x / 4 + y / 4) & 1) as usize;
+                let v = base[side] as i32 + (rng.next() % noise) as i32 - noise as i32 / 2;
+                v.clamp(0, 255) as u8
+            })
+            .collect()
+    }
+
+    fn contexts() -> Vec<(&'static str, Rav1dLoopFilterDSPContext)> {
+        rav1d_init_cpu();
+        let flags = rav1d_get_cpu_flags();
+        let ctx = |flags| {
+            Rav1dLoopFilterDSPContext::default::<BitDepth8>().init_rust_simd::<BitDepth8>(flags)
+        };
+        #[allow(unused_mut)]
+        let mut out = vec![("rust simd", ctx(flags))];
+        #[cfg(target_arch = "x86_64")]
+        if flags.contains(CpuFlags::AVX2) {
+            out.push((
+                "rust 128",
+                ctx(flags.difference(CpuFlags::AVX2 | CpuFlags::AVX512ICL)),
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn simd_matches_scalar() {
+        let scalar = Rav1dLoopFilterDSPContext::default::<BitDepth8>();
+        let simds = contexts();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..3000 {
+            let mut lut = Align16(Av1FilterLUT::default());
+            rav1d_calc_eih(&mut lut.0, (rng.next() % 8) as u8);
+            let mut lvl = AlignedVec2::<u8>::new();
+            lvl.resize(4 * B4_STRIDE * 48, 0);
+            for l in lvl.as_mut_slice() {
+                *l = if rng.next() % 5 == 0 {
+                    0
+                } else {
+                    (rng.next() % 64) as u8
+                };
+            }
+            let lvl = DisjointMut::new(lvl);
+            let wh = 1 + rng.next() as usize % 32;
+            let valid = if wh == 32 { u32::MAX } else { (1 << wh) - 1 };
+            let mask = [rng.next() & valid, rng.next() & valid, rng.next() & valid];
+            let orig = plane(&mut rng);
+            for (hv, name) in [(HV::H, "h"), (HV::V, "v")] {
+                for yuv in [YUV::Y, YUV::UV] {
+                    let pick = |c: &Rav1dLoopFilterDSPContext| {
+                        let c = match yuv {
+                            YUV::Y => &c.loop_filter_sb.y,
+                            YUV::UV => &c.loop_filter_sb.uv,
+                        };
+                        match hv {
+                            HV::H => c.h,
+                            HV::V => c.v,
+                        }
+                    };
+                    let want = run(&pick(&scalar), hv, &orig, &mask, &lvl, &lut, wh);
+                    for (simd_name, simd) in &simds {
+                        let got = run(&pick(simd), hv, &orig, &mask, &lvl, &lut, wh);
+                        let first = got.iter().zip(&want).position(|(a, b)| a != b);
+                        assert!(
+                            first.is_none(),
+                            "round {round} {name} {} {simd_name}: first difference at row {}, column {}",
+                            yuv as usize,
+                            first.unwrap() / STRIDE,
+                            first.unwrap() % STRIDE,
+                        );
+                    }
+                }
+            }
+        }
     }
 }

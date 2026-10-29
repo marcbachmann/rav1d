@@ -63,7 +63,14 @@ pub trait Lanes: Copy {
     fn mulhrs(self, o: Self) -> Self;
     /// The unsigned averages rounded up.
     fn avg_u(self, o: Self) -> Self;
-    fn shr_s1(self) -> Self;
+    fn shr_s<const N: i32>(self) -> Self;
+    fn add(self, o: Self) -> Self;
+    fn sub(self, o: Self) -> Self;
+    fn abs(self) -> Self;
+    fn min(self, o: Self) -> Self;
+    fn max(self, o: Self) -> Self;
+    /// `a` where `m` is set, `b` elsewhere; `m`'s lanes are all ones or all zeros.
+    fn select(m: Self, a: Self, b: Self) -> Self;
     fn and(self, o: Self) -> Self;
     fn eq(self, o: Self) -> Self;
     /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
@@ -111,8 +118,32 @@ macro_rules! forward_lanes {
                 <$t>::avg_u(self, o)
             }
             #[inline(always)]
-            fn shr_s1(self) -> Self {
-                <$t>::shr_s::<1>(self)
+            fn shr_s<const N: i32>(self) -> Self {
+                <$t>::shr_s::<N>(self)
+            }
+            #[inline(always)]
+            fn add(self, o: Self) -> Self {
+                <$t>::add(self, o)
+            }
+            #[inline(always)]
+            fn sub(self, o: Self) -> Self {
+                <$t>::sub(self, o)
+            }
+            #[inline(always)]
+            fn abs(self) -> Self {
+                <$t>::abs(self)
+            }
+            #[inline(always)]
+            fn min(self, o: Self) -> Self {
+                <$t>::min(self, o)
+            }
+            #[inline(always)]
+            fn max(self, o: Self) -> Self {
+                <$t>::max(self, o)
+            }
+            #[inline(always)]
+            fn select(m: Self, a: Self, b: Self) -> Self {
+                <$t>::select(m, a, b)
             }
             #[inline(always)]
             fn and(self, o: Self) -> Self {
@@ -260,6 +291,31 @@ mod wide {
         #[inline(always)]
         pub fn add(self, o: Self) -> Self {
             Self(unsafe { _mm256_add_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            Self(unsafe { _mm256_sub_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn abs(self) -> Self {
+            Self(unsafe { _mm256_abs_epi16(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn min(self, o: Self) -> Self {
+            Self(unsafe { _mm256_min_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(unsafe { _mm256_max_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(unsafe { _mm256_blendv_epi8(b.0, a.0, m.0) })
         }
 
         #[inline(always)]
@@ -560,6 +616,12 @@ mod imp {
         pub fn first_set2(self, o: Self) -> u32 {
             (unsafe { _mm_movemask_epi8(_mm_packs_epi16(self.0, o.0)) } as u32 | 1 << 16)
                 .trailing_zeros()
+        }
+
+        /// `self` where `m` is set, `o` elsewhere; `m`'s lanes are all ones or all zeros.
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(unsafe { _mm_blendv_epi8(b.0, a.0, m.0) })
         }
 
         #[inline(always)]
@@ -866,6 +928,12 @@ mod imp {
                 ))))
             };
             nibbles.trailing_zeros() / 4
+        }
+
+        /// `a` where `m` is set, `b` elsewhere; `m`'s lanes are all ones or all zeros.
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(unsafe { vbslq_s16(u(m.0), a.0, b.0) })
         }
 
         #[inline(always)]
@@ -1189,6 +1257,12 @@ mod imp {
             (i8x16_bitmask(i8x16_narrow_i16x8(self.0, o.0)) as u32 | 1 << 16).trailing_zeros()
         }
 
+        /// `a` where `m` is set, `b` elsewhere; `m`'s lanes are all ones or all zeros.
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(v128_bitselect(a.0, b.0, m.0))
+        }
+
         #[inline(always)]
         pub fn add_sat(self, o: Self) -> Self {
             Self(i16x8_add_sat(self.0, o.0))
@@ -1507,6 +1581,18 @@ mod imp {
                 .chain(&o.0)
                 .position(|&m| m != 0)
                 .unwrap_or(16) as u32
+        }
+
+        /// `a` where `m` is set, `b` elsewhere; `m`'s lanes are all ones or all zeros.
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(std::array::from_fn(|i| {
+                if m.0[i] != 0 {
+                    a.0[i]
+                } else {
+                    b.0[i]
+                }
+            }))
         }
 
         #[inline(always)]

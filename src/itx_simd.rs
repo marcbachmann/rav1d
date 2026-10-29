@@ -702,7 +702,7 @@ fn identity16<V: Lanes>(v: &mut [V; 16], shift: u32) {
         let term = x.mulhrs(k);
         *x = match shift {
             1 => x.add_sat(term.mulhrs(V::splat(16384))),
-            2 => x.avg_u(term.shr_s1()),
+            2 => x.avg_u(term.shr_s::<1>()),
             _ => x.add_sat(*x).add_sat(term),
         };
     }
