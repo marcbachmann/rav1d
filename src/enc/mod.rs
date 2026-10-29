@@ -144,10 +144,12 @@ pub struct Options {
     /// tried whatever None cost, and the prune applies the same. 0 tries them whenever Split
     /// wins.
     pub rect_ratio: f64,
-    /// `rect_ratio` applies per partition level only once 32 trials under it gained at most
-    /// 0.3% of the cost decided there, and one trial in 16 is still searched to keep that count
-    /// honest: content with long straight edges (a text page, a tile grid) gains from rect
-    /// partitions where a photo's few wins are marginal.
+    /// `rect_ratio` applies per partition level and activity class of the block only once 32
+    /// trials under it gained at most 5% of the cost decided there with wins over 2% of a block's
+    /// cost rarer than 1 in 4, and one trial in 16 is still searched to keep that count honest:
+    /// content with long straight edges (a text page, a tile grid) gains from rect partitions
+    /// where a photo's few wins are marginal. Per class at these bars a native photo codes
+    /// 3-5% faster at Q60-Q90 than at one count per level and a 0.3% bar, within 0.02 dB.
     pub rect_adaptive: bool,
     /// 16×16 blocks are no longer searched below 16×16 (8×8 splits and the rect partitions tried
     /// after them) once 32 such searches of the block's activity class gained at most 5% of the
