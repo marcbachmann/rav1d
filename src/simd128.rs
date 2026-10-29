@@ -73,6 +73,7 @@ pub trait Lanes: Copy {
     fn select(m: Self, a: Self, b: Self) -> Self;
     fn and(self, o: Self) -> Self;
     fn eq(self, o: Self) -> Self;
+    fn or(self, o: Self) -> Self;
     /// Whether any lane is set.
     fn any(self) -> bool;
     /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
@@ -130,6 +131,10 @@ macro_rules! forward_lanes {
             #[inline(always)]
             fn any(self) -> bool {
                 <$t>::any(self)
+            }
+            #[inline(always)]
+            fn or(self, o: Self) -> Self {
+                <$t>::or(self, o)
             }
             #[inline(always)]
             fn sub(self, o: Self) -> Self {
@@ -352,6 +357,11 @@ mod wide {
         #[inline(always)]
         pub fn and(self, o: Self) -> Self {
             Self(unsafe { _mm256_and_si256(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(unsafe { _mm256_or_si256(self.0, o.0) })
         }
 
         #[inline(always)]
@@ -620,6 +630,11 @@ mod imp {
         #[inline(always)]
         pub fn first_set(self) -> u32 {
             (unsafe { _mm_movemask_epi8(self.0) } as u32 | 1 << 16).trailing_zeros() / 2
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(unsafe { _mm_or_si128(self.0, o.0) })
         }
 
         /// Whether any lane is set.
@@ -954,6 +969,11 @@ mod imp {
             let v = unsafe { vreinterpretq_u64_s16(self.0) };
             let (lo, hi) = unsafe { (vgetq_lane_u64::<0>(v), vgetq_lane_u64::<1>(v)) };
             lo as u128 | (hi as u128) << 64
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(unsafe { vorrq_s16(self.0, o.0) })
         }
 
         /// Whether any lane is set.
@@ -1295,6 +1315,11 @@ mod imp {
             (i16x8_bitmask(self.0) as u32 | 1 << 8).trailing_zeros()
         }
 
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(v128_or(self.0, o.0))
+        }
+
         /// Whether any lane is set.
         #[inline(always)]
         pub fn any(self) -> bool {
@@ -1621,6 +1646,11 @@ mod imp {
         #[inline(always)]
         pub fn first_set(self) -> u32 {
             self.0.iter().position(|&m| m != 0).unwrap_or(8) as u32
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(std::array::from_fn(|i| self.0[i] | o.0[i]))
         }
 
         /// Whether any lane is set.

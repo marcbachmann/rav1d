@@ -854,6 +854,7 @@ fn add_block<
     }
     while y0 < h {
         let mut v = [zero; W];
+        let mut set = zero;
         for x in 0..w {
             let c = &mut coeff[x * ch + y0..];
             v[x] = if H == 4 {
@@ -865,9 +866,15 @@ fn add_block<
                 zero.store(c);
                 v
             };
+            set = set.or(v[x]);
             if rect {
                 v[x] = v[x].mulhrs(I16x8::splat(2896 * 8));
             }
+        }
+        // Rows past the last coefficient transform to zeros, which the groups already hold.
+        if !set.any() {
+            y0 += 8;
+            continue;
         }
         tx::<_, W, false>(&mut v, rows, shift, half);
         round(&mut v, round_mul(rows, W, shift), negated(rows, W));
@@ -923,13 +930,18 @@ mod wide {
     ) {
         let zero = I16x16::splat(0);
         let mut v = [zero; W];
+        let mut set = zero;
         for x in 0..w {
             let c = &mut coeff[x * ch + y0..];
             v[x] = I16x16::load(c);
             zero.store(c);
+            set = set.or(v[x]);
             if rect {
                 v[x] = v[x].mulhrs(I16x16::splat(2896 * 8));
             }
+        }
+        if !set.any() {
+            return;
         }
         tx::<_, W, false>(&mut v, rows, shift, half);
         round(&mut v, round_mul(rows, W, shift), negated(rows, W));
