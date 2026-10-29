@@ -2131,7 +2131,7 @@ impl<D: Decide> Encoder<D> {
         let split8 = self.split8_adaptive && level == 2 && halves == Halves::Both && none_allowed && split_allowed;
         // The block's own activity picks the counters it learns from: a flat region teaches
         // nothing about the edges and textures beside it.
-        let bucket = if split8 || self.rect_adaptive && self.rect_ratio > 0.0 { self.activity_bucket(x, y, n4) } else { 0 };
+        let bucket = if split8 || (self.rect_adaptive || self.graphic_guard) && self.rect_ratio > 0.0 { self.activity_bucket(x, y, n4) } else { 0 };
         let prune8 = split8 && {
             let seen = &mut self.split_seen[bucket];
             seen.0 += 1;
@@ -2164,8 +2164,10 @@ impl<D: Decide> Encoder<D> {
                 }
             }
             if matches!(bp, H | V) && halves == Halves::Both && self.rect >= 1 {
-                if split_cost < self.rect_ratio * none_cost && !(self.graphic_guard && !self.rect_adaptive && is_graphic(self)) {
-                    if !self.rect_adaptive {
+                // A drawn block takes the full search's learnt prune at its ratio instead.
+                let (ratio, adaptive) = if self.graphic_guard && !self.rect_adaptive && is_graphic(self) { (0.9, true) } else { (self.rect_ratio, self.rect_adaptive) };
+                if split_cost < ratio * none_cost {
+                    if !adaptive {
                         continue;
                     }
                     let seen = &mut self.rect_seen[level as usize][bucket];
