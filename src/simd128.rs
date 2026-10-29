@@ -918,6 +918,27 @@ mod imp {
             bytes.trailing_zeros() / 8
         }
 
+        /// The first set lane of a mask among the low four, 4 if none is.
+        #[inline(always)]
+        pub fn first_set_lo(self) -> u32 {
+            let lanes = unsafe { vgetq_lane_u64::<0>(vreinterpretq_u64_s16(self.0)) };
+            lanes.trailing_zeros() / 16
+        }
+
+        /// `(2 * self * o) >> 16`, saturated.
+        #[inline(always)]
+        pub fn qdmulh(self, o: Self) -> Self {
+            Self(unsafe { vqdmulhq_s16(self.0, o.0) })
+        }
+
+        /// The lanes as one little-endian integer.
+        #[inline(always)]
+        pub fn to_u128(self) -> u128 {
+            let v = unsafe { vreinterpretq_u64_s16(self.0) };
+            let (lo, hi) = unsafe { (vgetq_lane_u64::<0>(v), vgetq_lane_u64::<1>(v)) };
+            lo as u128 | (hi as u128) << 64
+        }
+
         /// The first set lane of the masks `self` then `o`, 16 if none is.
         #[inline(always)]
         pub fn first_set2(self, o: Self) -> u32 {

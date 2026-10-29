@@ -521,12 +521,13 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
         I16x8::splat
     };
     let c = splat((s.dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
+    #[cfg(not(target_arch = "aarch64"))]
     let r = splat((s.rng & 0xff00) as u16 as i16);
+    // `rng >> 8` less 128, the doubling multiply-high's operand.
+    #[cfg(target_arch = "aarch64")]
+    let r = splat((s.rng & 0x7f00) as u16 as i16);
     let zero = I16x8::splat(0);
-    let (mut cdfs, mut at_or_past) = ([zero; 2], [zero; 2]);
-    // `rng`, then the bounds: the symbol's bounds are `[val]` and `[val + 1]`.
-    let mut bounds = [0; 18];
-    bounds[0] = s.rng as u16 as i16;
+    let (mut cdfs, mut at_or_past, mut vs) = ([zero; 2], [zero; 2], [zero; 2]);
     for k in 0..LANES.div_ceil(8) {
         cdfs[k] = if LANES == 4 {
             I16x8::load_u16_lo(cdf)
@@ -535,22 +536,47 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
         };
         // (cdf >> 6 << 7) * (rng >> 8 << 8) >> 16 == (cdf >> 6) * (rng >> 8) >> 1
         let p = cdfs[k].and(I16x8::splat(-64));
-        let v = p
-            .add(p)
-            .mulhi_u(r)
-            .add(I16x8::load(&EC_MIN_PROBS[15 - n + 8 * k..]));
-        v.store(&mut bounds[1 + 8 * k..]);
-        at_or_past[k] = v.sub_sat_u(c).eq(zero);
+        #[cfg(not(target_arch = "aarch64"))]
+        let scaled = p.add(p).mulhi_u(r);
+        // As the NEON asm: with `p = (cdf >> 6) << 6`, `p * (rng >> 8) >> 7` is
+        // `p + (2 * p * ((rng >> 8) - 128 << 8) >> 16)`, one multiply.
+        #[cfg(target_arch = "aarch64")]
+        let scaled = p.add(p.qdmulh(r));
+        vs[k] = scaled.add(I16x8::load(&EC_MIN_PROBS[15 - n + 8 * k..]));
+        at_or_past[k] = vs[k].sub_sat_u(c).eq(zero);
     }
-    let val = if LANES > 8 {
-        at_or_past[0].first_set2(at_or_past[1])
-    } else {
-        at_or_past[0].first_set()
+    #[cfg(target_arch = "aarch64")]
+    let first_lo = |m: I16x8| m.first_set_lo();
+    #[cfg(not(target_arch = "aarch64"))]
+    let first_lo = |m: I16x8| m.first_set();
+    let val = match LANES {
+        4 => first_lo(at_or_past[0]),
+        8 => at_or_past[0].first_set(),
+        _ => at_or_past[0].first_set2(at_or_past[1]),
     } as usize;
     // At most `n_symbols`, as its lane always is at or past; the mask only drops the check.
     let val = val & 15;
-    let u = bounds[val] as u16 as c_uint;
-    let v = bounds[val + 1] as u16 as c_uint;
+    // The symbol's bounds are `[val]` and `[val + 1]` of `rng`, then the bounds.
+    let bound_pair = || {
+        let mut bounds = [0; 18];
+        bounds[0] = s.rng as u16 as i16;
+        for k in 0..LANES.div_ceil(8) {
+            vs[k].store(&mut bounds[1 + 8 * k..]);
+        }
+        (bounds[val] as u16, bounds[val + 1] as u16)
+    };
+    // As the NEON asm: the pair shifted out of the packed lanes, without a trip through memory.
+    #[cfg(target_arch = "aarch64")]
+    let (u, v) = if LANES <= 8 {
+        let packed = vs[0].to_u128();
+        let with_rng = packed << 16 | s.rng as u16 as u128;
+        ((with_rng >> 16 * val) as u16, (packed >> 16 * val) as u16)
+    } else {
+        bound_pair()
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let (u, v) = bound_pair();
+    let (u, v) = (u as c_uint, v as c_uint);
     ctx_norm(
         s,
         s.dif.wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
