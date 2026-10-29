@@ -288,7 +288,9 @@ unsafe extern "C" fn inv_txfm_add_simd_erased<
     // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
     unsafe {
         match (W, H) {
-            (8, 8) | (16, 16) => itx_simd::add::<BD, W, H, TYPE>(dst, coeff, eob),
+            (8, 8) | (16, 16) | (8, 16) | (16, 8) | (32, 32) => {
+                itx_simd::add::<BD, W, H, TYPE>(dst, coeff, eob)
+            }
             _ => unreachable!(),
         }
     }
@@ -833,6 +835,47 @@ impl Rav1dInvTxfmDSPContext {
             V_DCT,
             H_DCT
         );
+        assign!(
+            8,
+            16,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT,
+            V_ADST,
+            H_ADST,
+            V_FLIPADST,
+            H_FLIPADST
+        );
+        assign!(
+            16,
+            8,
+            DCT_DCT,
+            ADST_DCT,
+            DCT_ADST,
+            ADST_ADST,
+            FLIPADST_DCT,
+            DCT_FLIPADST,
+            FLIPADST_FLIPADST,
+            ADST_FLIPADST,
+            FLIPADST_ADST,
+            IDTX,
+            V_DCT,
+            H_DCT,
+            V_ADST,
+            H_ADST,
+            V_FLIPADST,
+            H_FLIPADST
+        );
+        assign!(32, 32, DCT_DCT, IDTX);
         self
     }
 
@@ -884,7 +927,7 @@ mod tests {
     }
 
     const STRIDE: usize = 64;
-    const ROWS: usize = 24;
+    const ROWS: usize = 40;
     /// A 16-wide block's rows are stored aligned by the asm, as the decoder lays them out.
     const BX: usize = 16;
 
@@ -938,9 +981,16 @@ mod tests {
                 let mut coeff = vec![0i16; w * h];
                 let n = if eob == 0 { 1 } else { eob as usize + 1 };
                 let range = if round % 3 == 0 { 4096 } else { 512 };
-                for c in coeff.iter_mut().take(n) {
+                // A 32x32 block with `eob < 136` keeps its coefficients in the top-left 16x16.
+                let (nw, nh) = if w == 32 && eob < 136 {
+                    (16, 16)
+                } else {
+                    (w, h)
+                };
+                for _ in 0..n {
                     if rng.next() % 2 == 0 {
-                        *c = (rng.next() % (2 * range) as u32) as i16 - range as i16;
+                        let (x, y) = (rng.next() as usize % nw, rng.next() as usize % nh);
+                        coeff[x * h + y] = (rng.next() % (2 * range) as u32) as i16 - range as i16;
                     }
                 }
                 coeff[0] = (rng.next() % (2 * range) as u32) as i16 - range as i16;
@@ -960,6 +1010,21 @@ mod tests {
     #[test]
     fn simd_16x16_matches_scalar() {
         simd_matches_scalar(TxfmSize::S16x16, 16, 16);
+    }
+
+    #[test]
+    fn simd_8x16_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R8x16, 8, 16);
+    }
+
+    #[test]
+    fn simd_16x8_matches_scalar() {
+        simd_matches_scalar(TxfmSize::R16x8, 16, 8);
+    }
+
+    #[test]
+    fn simd_32x32_matches_scalar() {
+        simd_matches_scalar(TxfmSize::S32x32, 32, 32);
     }
 
     /// ns per call of a size's DCT_DCT and ADST_ADST with a full block, scalar, Rust SIMD and asm.
@@ -996,12 +1061,26 @@ mod tests {
             *b = rng.next() as u8;
         }
         let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
-        for (tx, w, h) in [(TxfmSize::S8x8, 8, 8), (TxfmSize::S16x16, 16, 16)] {
-            for t in [DCT_DCT, ADST_ADST] {
+        for (tx, w, h) in [
+            (TxfmSize::S8x8, 8, 8),
+            (TxfmSize::S16x16, 16, 16),
+            (TxfmSize::R16x8, 16, 8),
+            (TxfmSize::S32x32, 32, 32),
+        ] {
+            for (t, eob) in [(DCT_DCT, w * h - 1), (ADST_ADST, w * h - 1), (DCT_DCT, 100)] {
+                if (t == ADST_ADST && w == 32) || (eob == 100 && w != 32) {
+                    continue;
+                }
                 let coeff: Vec<i16> = (0..w * h)
-                    .map(|_| (rng.next() % 1024) as i16 - 512)
+                    .map(|i| {
+                        if eob < 136 && (i / h >= 16 || i % h >= 16) {
+                            0
+                        } else {
+                            (rng.next() % 1024) as i16 - 512
+                        }
+                    })
                     .collect();
-                let eob = (w * h - 1) as i32;
+                let eob = eob as i32;
                 let mut line = format!("{w}x{h} type {t:2}:");
                 for (name, dsp) in &dsps {
                     let f = &dsp.itxfm_add[tx as usize][t as usize];

@@ -81,6 +81,7 @@ const fn round_mul(t: Tx1d, n: usize, shift: u32) -> i32 {
     match (t, n) {
         (Identity, 8) => 1 << (16 - shift),
         (Identity, 16) if shift < 4 => 32768,
+        (Identity, 32) => 1 << (17 - shift),
         _ => 1 << (15 - shift),
     }
 }
@@ -96,17 +97,45 @@ fn round<const N: usize>(v: &mut [I16x8; N], k: i32, negated: u32) {
     }
 }
 
+/// `(x * c1 + 2048 >> 12, x * c2 + 2048 >> 12)`: a rotation whose other input is zero.
 #[inline(always)]
-fn dct8(v: &mut [I16x8; 8]) {
-    let (t1, t0) = v[0].rot(v[4], 2896, 2896);
-    let (t2, t3) = v[2].rot(v[6], 1567, 3784);
+fn rot1(x: I16x8, c1: i16, c2: i16) -> (I16x8, I16x8) {
+    (
+        x.mulhrs(I16x8::splat(c1 * 8)),
+        x.mulhrs(I16x8::splat(c2 * 8)),
+    )
+}
+
+/// `HALF`: the upper half of the inputs is zero (the C's `tx64`), so the first rotations are
+/// single products.
+#[inline(always)]
+fn dct8<const HALF: bool>(v: &mut [I16x8; 8]) {
+    let (t1, t0) = if HALF {
+        let t = v[0].mulhrs(I16x8::splat(2896 * 8));
+        (t, t)
+    } else {
+        v[0].rot(v[4], 2896, 2896)
+    };
+    let (t2, t3) = if HALF {
+        rot1(v[2], 1567, 3784)
+    } else {
+        v[2].rot(v[6], 1567, 3784)
+    };
     let d0 = t0.add_sat(t3);
     let d1 = t1.add_sat(t2);
     let d2 = t1.sub_sat(t2);
     let d3 = t0.sub_sat(t3);
 
-    let (t4a, t7a) = v[1].rot(v[7], 799, 4017);
-    let (t5a, t6a) = v[5].rot(v[3], 3406, 2276);
+    let (t4a, t7a) = if HALF {
+        rot1(v[1], 799, 4017)
+    } else {
+        v[1].rot(v[7], 799, 4017)
+    };
+    let (t5a, t6a) = if HALF {
+        rot1(v[3], -2276, 3406)
+    } else {
+        v[5].rot(v[3], 3406, 2276)
+    };
     let t4 = t4a.add_sat(t5a);
     let t5a = t4a.sub_sat(t5a);
     let t7 = t7a.add_sat(t6a);
@@ -124,14 +153,25 @@ fn dct8(v: &mut [I16x8; 8]) {
 }
 
 #[inline(always)]
-fn dct16(v: &mut [I16x8; 16]) {
+fn dct16<const HALF: bool>(v: &mut [I16x8; 16]) {
     let mut e = [v[0], v[2], v[4], v[6], v[8], v[10], v[12], v[14]];
-    dct8(&mut e);
+    dct8::<HALF>(&mut e);
 
-    let (t8a, t15a) = v[1].rot(v[15], 401, 4076);
-    let (t9a, t14a) = v[9].rot(v[7], 3166, 2598);
-    let (t10a, t13a) = v[5].rot(v[11], 1931, 3612);
-    let (t11a, t12a) = v[13].rot(v[3], 3920, 1189);
+    let ((t8a, t15a), (t9a, t14a), (t10a, t13a), (t11a, t12a)) = if HALF {
+        (
+            rot1(v[1], 401, 4076),
+            rot1(v[7], -2598, 3166),
+            rot1(v[5], 1931, 3612),
+            rot1(v[3], -1189, 3920),
+        )
+    } else {
+        (
+            v[1].rot(v[15], 401, 4076),
+            v[9].rot(v[7], 3166, 2598),
+            v[5].rot(v[11], 1931, 3612),
+            v[13].rot(v[3], 3920, 1189),
+        )
+    };
 
     let t8 = t8a.add_sat(t9a);
     let t9 = t8a.sub_sat(t9a);
@@ -161,6 +201,108 @@ fn dct16(v: &mut [I16x8; 16]) {
     for i in 0..8 {
         v[i] = e[i].add_sat(o[i]);
         v[15 - i] = e[i].sub_sat(o[i]);
+    }
+}
+
+#[inline(always)]
+fn dct32<const HALF: bool>(v: &mut [I16x8; 32]) {
+    let mut e: [I16x8; 16] = std::array::from_fn(|i| v[2 * i]);
+    dct16::<HALF>(&mut e);
+
+    let (t16a, t31a, t17a, t30a, t18a, t29a, t19a, t28a);
+    let (t20a, t27a, t21a, t26a, t22a, t25a, t23a, t24a);
+    if HALF {
+        (t16a, t31a) = rot1(v[1], 201, 4091);
+        (t17a, t30a) = rot1(v[15], -2751, 3035);
+        (t18a, t29a) = rot1(v[9], 1751, 3703);
+        (t19a, t28a) = rot1(v[7], -1380, 3857);
+        (t20a, t27a) = rot1(v[5], 995, 3973);
+        (t21a, t26a) = rot1(v[11], -2106, 3513);
+        (t22a, t25a) = rot1(v[13], 2440, 3290);
+        (t23a, t24a) = rot1(v[3], -601, 4052);
+    } else {
+        (t16a, t31a) = v[1].rot(v[31], 201, 4091);
+        (t17a, t30a) = v[17].rot(v[15], 3035, 2751);
+        (t18a, t29a) = v[9].rot(v[23], 1751, 3703);
+        (t19a, t28a) = v[25].rot(v[7], 3857, 1380);
+        (t20a, t27a) = v[5].rot(v[27], 995, 3973);
+        (t21a, t26a) = v[21].rot(v[11], 3513, 2106);
+        (t22a, t25a) = v[13].rot(v[19], 2440, 3290);
+        (t23a, t24a) = v[29].rot(v[3], 4052, 601);
+    }
+
+    let t16 = t16a.add_sat(t17a);
+    let t17 = t16a.sub_sat(t17a);
+    let t18 = t19a.sub_sat(t18a);
+    let t19 = t19a.add_sat(t18a);
+    let t20 = t20a.add_sat(t21a);
+    let t21 = t20a.sub_sat(t21a);
+    let t22 = t23a.sub_sat(t22a);
+    let t23 = t23a.add_sat(t22a);
+    let t24 = t24a.add_sat(t25a);
+    let t25 = t24a.sub_sat(t25a);
+    let t26 = t27a.sub_sat(t26a);
+    let t27 = t27a.add_sat(t26a);
+    let t28 = t28a.add_sat(t29a);
+    let t29 = t28a.sub_sat(t29a);
+    let t30 = t31a.sub_sat(t30a);
+    let t31 = t31a.add_sat(t30a);
+
+    let (t17a, t30a) = t30.rot(t17, 799, 4017);
+    let (t18a, t29a) = t18.madd2(t29, [-799, -4017], [-4017, 799]);
+    let (t21a, t26a) = t26.rot(t21, 3406, 2276);
+    let (t22a, t25a) = t22.madd2(t25, [-3406, -2276], [-2276, 3406]);
+
+    let t16a = t16.add_sat(t19);
+    let t17 = t17a.add_sat(t18a);
+    let t18 = t17a.sub_sat(t18a);
+    let t19a = t16.sub_sat(t19);
+    let t20a = t23.sub_sat(t20);
+    let t21 = t22a.sub_sat(t21a);
+    let t22 = t22a.add_sat(t21a);
+    let t23a = t23.add_sat(t20);
+    let t24a = t24.add_sat(t27);
+    let t25 = t25a.add_sat(t26a);
+    let t26 = t25a.sub_sat(t26a);
+    let t27a = t24.sub_sat(t27);
+    let t28a = t31.sub_sat(t28);
+    let t29 = t30a.sub_sat(t29a);
+    let t30 = t30a.add_sat(t29a);
+    let t31a = t31.add_sat(t28);
+
+    let (t18a, t29a) = t29.rot(t18, 1567, 3784);
+    let (t19, t28) = t28a.rot(t19a, 1567, 3784);
+    let (t20, t27) = t20a.madd2(t27a, [-1567, -3784], [-3784, 1567]);
+    let (t21a, t26a) = t21.madd2(t26, [-1567, -3784], [-3784, 1567]);
+
+    let t16 = t16a.add_sat(t23a);
+    let t17a = t17.add_sat(t22);
+    let t18 = t18a.add_sat(t21a);
+    let t19a = t19.add_sat(t20);
+    let t20a = t19.sub_sat(t20);
+    let t21 = t18a.sub_sat(t21a);
+    let t22a = t17.sub_sat(t22);
+    let t23 = t16a.sub_sat(t23a);
+    let t24 = t31a.sub_sat(t24a);
+    let t25a = t30.sub_sat(t25);
+    let t26 = t29a.sub_sat(t26a);
+    let t27a = t28.sub_sat(t27);
+    let t28a = t28.add_sat(t27);
+    let t29 = t29a.add_sat(t26a);
+    let t30a = t30.add_sat(t25);
+    let t31 = t31a.add_sat(t24a);
+
+    let (t20, t27) = t27a.rot(t20a, 2896, 2896);
+    let (t21a, t26a) = t26.rot(t21, 2896, 2896);
+    let (t22, t25) = t25a.rot(t22a, 2896, 2896);
+    let (t23a, t24a) = t24.rot(t23, 2896, 2896);
+
+    let o = [
+        t31, t30a, t29, t28a, t27, t26a, t25, t24a, t23a, t22, t21a, t20, t19a, t18, t17a, t16,
+    ];
+    for i in 0..16 {
+        v[i] = e[i].add_sat(o[i]);
+        v[31 - i] = e[i].sub_sat(o[i]);
     }
 }
 
@@ -307,7 +449,7 @@ fn identity16(v: &mut [I16x8; 16], shift: u32) {
 #[inline(always)]
 fn tx8<const COLS: bool>(v: &mut [I16x8; 8], t: Tx1d) {
     match t {
-        Dct => dct8(v),
+        Dct => dct8::<false>(v),
         Adst => adst8::<COLS>(v),
         FlipAdst => {
             adst8::<COLS>(v);
@@ -320,7 +462,7 @@ fn tx8<const COLS: bool>(v: &mut [I16x8; 8], t: Tx1d) {
 #[inline(always)]
 fn tx16<const COLS: bool>(v: &mut [I16x8; 16], t: Tx1d, shift: u32) {
     match t {
-        Dct => dct16(v),
+        Dct => dct16::<false>(v),
         Adst => adst16::<COLS>(v),
         FlipAdst => {
             adst16::<COLS>(v);
@@ -330,11 +472,24 @@ fn tx16<const COLS: bool>(v: &mut [I16x8; 16], t: Tx1d, shift: u32) {
     }
 }
 
+/// Only the DCT and the identity reach 32 points; the identity's factor of 4 is a shift the
+/// rounding absorbs.
 #[inline(always)]
-fn tx<const N: usize, const COLS: bool>(v: &mut [I16x8; N], t: Tx1d, shift: u32) {
+fn tx32(v: &mut [I16x8; 32], t: Tx1d, half: bool) {
+    match (t, half) {
+        (Dct, true) => dct32::<true>(v),
+        (Dct, false) => dct32::<false>(v),
+        _ => {}
+    }
+}
+
+/// `half`: the upper half of the inputs is zero.
+#[inline(always)]
+fn tx<const N: usize, const COLS: bool>(v: &mut [I16x8; N], t: Tx1d, shift: u32, half: bool) {
     match N {
         8 => tx8::<COLS>((&mut v[..8]).try_into().unwrap(), t),
         16 => tx16::<COLS>((&mut v[..16]).try_into().unwrap(), t, shift),
+        32 => tx32((&mut v[..32]).try_into().unwrap(), t, half),
         _ => unreachable!(),
     }
 }
@@ -381,8 +536,9 @@ fn add_dc<BD: BitDepth, const W: usize, const H: usize>(
     }
 }
 
-/// A `W`x`H` block of 8 and 16: the rows eight at a time into `tmp`, the columns eight at a time
-/// out of it; 8x8 turns around in the registers.
+/// A `W`x`H` block of 8, 16 and 32: the rows eight at a time into `tmp`, the columns eight at a
+/// time out of it; 8x8 turns around in the registers. A 32x32 block with `eob < 136` has every
+/// coefficient in its top-left 16x16 (the asm's tier), so half the rows and inputs are skipped.
 #[inline(always)]
 fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType>(
     dst: Rav1dPictureDataComponentOffset,
@@ -395,6 +551,8 @@ fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType>
     }
     let shift = row_shift(W, H);
     let coeff = &mut coeff[..W * H];
+    let half = W == 32 && eob < 136;
+    let (w, h) = if half { (16, 16) } else { (W, H) };
     if W == 8 && H == 8 {
         let mut v: [I16x8; 8] = std::array::from_fn(|x| I16x8::load(&coeff[x * 8..]));
         coeff.fill(0);
@@ -405,22 +563,28 @@ fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType>
         round(&mut v, round_mul(cols, 8, 4), negated(cols));
         return add_rows::<BD, 8>(dst, 0, &v);
     }
-    let mut tmp = [0i16; 256];
+    let mut tmp = [0i16; 1024];
     let tmp = &mut tmp[..W * H];
     let rect = if W * 2 == H || H * 2 == W {
         Some(I16x8::splat(2896 * 8))
     } else {
         None
     };
-    for y0 in (0..H).step_by(8) {
+    let zero = I16x8::splat(0);
+    for y0 in (0..h).step_by(8) {
         let mut v: [I16x8; W] = std::array::from_fn(|x| {
-            let v = I16x8::load(&coeff[x * H + y0..]);
+            if x >= w {
+                return zero;
+            }
+            let c = &mut coeff[x * H + y0..];
+            let v = I16x8::load(c);
+            zero.store(c);
             match rect {
                 Some(k) => v.mulhrs(k),
                 None => v,
             }
         });
-        tx::<W, false>(&mut v, rows, shift);
+        tx::<W, false>(&mut v, rows, shift, half);
         round(&mut v, round_mul(rows, W, shift), negated(rows));
         for x0 in (0..W).step_by(8) {
             let block: &mut [I16x8; 8] = (&mut v[x0..x0 + 8]).try_into().unwrap();
@@ -430,10 +594,15 @@ fn add_block<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType>
             }
         }
     }
-    coeff.fill(0);
     for x0 in (0..W).step_by(8) {
-        let mut v: [I16x8; H] = std::array::from_fn(|y| I16x8::load(&tmp[y * W + x0..]));
-        tx::<H, true>(&mut v, cols, 4);
+        let mut v: [I16x8; H] = std::array::from_fn(|y| {
+            if y >= h {
+                zero
+            } else {
+                I16x8::load(&tmp[y * W + x0..])
+            }
+        });
+        tx::<H, true>(&mut v, cols, 4, half);
         round(&mut v, round_mul(cols, H, 4), negated(cols));
         add_rows::<BD, H>(dst, x0, &v);
     }

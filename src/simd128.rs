@@ -300,23 +300,24 @@ mod imp {
         /// saturated to `i16`.
         #[inline(always)]
         pub fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
-            let pair =
-                |k: [i16; 2]| unsafe { _mm_set1_epi32(k[0] as u16 as i32 | (k[1] as i32) << 16) };
-            let rnd = unsafe { _mm_set1_epi32(2048) };
-            let (lo, hi) = unsafe {
+            // No closures: one would not inherit the kernel's target features.
+            unsafe {
+                let k1 = _mm_set1_epi32(k1[0] as u16 as i32 | (k1[1] as i32) << 16);
+                let k2 = _mm_set1_epi32(k2[0] as u16 as i32 | (k2[1] as i32) << 16);
+                let rnd = _mm_set1_epi32(2048);
+                let lo = _mm_unpacklo_epi16(self.0, o.0);
+                let hi = _mm_unpackhi_epi16(self.0, o.0);
                 (
-                    _mm_unpacklo_epi16(self.0, o.0),
-                    _mm_unpackhi_epi16(self.0, o.0),
+                    Self(_mm_packs_epi32(
+                        _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(lo, k1), rnd)),
+                        _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(hi, k1), rnd)),
+                    )),
+                    Self(_mm_packs_epi32(
+                        _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(lo, k2), rnd)),
+                        _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(hi, k2), rnd)),
+                    )),
                 )
-            };
-            let madd = |k| unsafe {
-                let k = pair(k);
-                Self(_mm_packs_epi32(
-                    _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(lo, k), rnd)),
-                    _mm_srai_epi32::<12>(_mm_add_epi32(_mm_madd_epi16(hi, k), rnd)),
-                ))
-            };
-            (madd(k1), madd(k2))
+            }
         }
 
         #[inline(always)]
@@ -580,14 +581,18 @@ mod imp {
             unsafe {
                 let (a_lo, a_hi) = (vget_low_s16(self.0), vget_high_s16(self.0));
                 let (b_lo, b_hi) = (vget_low_s16(o.0), vget_high_s16(o.0));
-                let madd = |k: [i16; 2]| {
-                    let (ka, kb) = (vdup_n_s16(k[0]), vdup_n_s16(k[1]));
+                let (k1a, k1b) = (vdup_n_s16(k1[0]), vdup_n_s16(k1[1]));
+                let (k2a, k2b) = (vdup_n_s16(k2[0]), vdup_n_s16(k2[1]));
+                (
                     Self(vcombine_s16(
-                        vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_lo, ka), b_lo, kb)),
-                        vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_hi, ka), b_hi, kb)),
-                    ))
-                };
-                (madd(k1), madd(k2))
+                        vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_lo, k1a), b_lo, k1b)),
+                        vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_hi, k1a), b_hi, k1b)),
+                    )),
+                    Self(vcombine_s16(
+                        vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_lo, k2a), b_lo, k2b)),
+                        vqrshrn_n_s32::<12>(vmlal_s16(vmull_s16(a_hi, k2a), b_hi, k2b)),
+                    )),
+                )
             }
         }
 
@@ -854,22 +859,34 @@ mod imp {
         #[inline(always)]
         pub fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
             let rnd = i32x4_splat(2048);
-            let madd = |k: [i16; 2]| {
-                let (ka, kb) = (i16x8_splat(k[0]), i16x8_splat(k[1]));
-                let lo = i32x4_add(
-                    i32x4_extmul_low_i16x8(self.0, ka),
-                    i32x4_extmul_low_i16x8(o.0, kb),
-                );
-                let hi = i32x4_add(
-                    i32x4_extmul_high_i16x8(self.0, ka),
-                    i32x4_extmul_high_i16x8(o.0, kb),
-                );
+            let (k1a, k1b) = (i16x8_splat(k1[0]), i16x8_splat(k1[1]));
+            let (k2a, k2b) = (i16x8_splat(k2[0]), i16x8_splat(k2[1]));
+            let lo1 = i32x4_add(
+                i32x4_extmul_low_i16x8(self.0, k1a),
+                i32x4_extmul_low_i16x8(o.0, k1b),
+            );
+            let hi1 = i32x4_add(
+                i32x4_extmul_high_i16x8(self.0, k1a),
+                i32x4_extmul_high_i16x8(o.0, k1b),
+            );
+            let lo2 = i32x4_add(
+                i32x4_extmul_low_i16x8(self.0, k2a),
+                i32x4_extmul_low_i16x8(o.0, k2b),
+            );
+            let hi2 = i32x4_add(
+                i32x4_extmul_high_i16x8(self.0, k2a),
+                i32x4_extmul_high_i16x8(o.0, k2b),
+            );
+            (
                 Self(i16x8_narrow_i32x4(
-                    i32x4_shr(i32x4_add(lo, rnd), 12),
-                    i32x4_shr(i32x4_add(hi, rnd), 12),
-                ))
-            };
-            (madd(k1), madd(k2))
+                    i32x4_shr(i32x4_add(lo1, rnd), 12),
+                    i32x4_shr(i32x4_add(hi1, rnd), 12),
+                )),
+                Self(i16x8_narrow_i32x4(
+                    i32x4_shr(i32x4_add(lo2, rnd), 12),
+                    i32x4_shr(i32x4_add(hi2, rnd), 12),
+                )),
+            )
         }
 
         #[inline(always)]
