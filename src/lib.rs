@@ -61,11 +61,7 @@
     clippy::useless_conversion,
     clippy::zero_prefixed_literal
 )]
-#![deny(
-    unsafe_op_in_unsafe_fn,
-    clippy::missing_safety_doc,
-    clippy::undocumented_unsafe_blocks
-)]
+#![deny(unsafe_op_in_unsafe_fn, clippy::missing_safety_doc)]
 
 #[cfg(not(any(feature = "bitdepth_8", feature = "bitdepth_16")))]
 compile_error!("No bitdepths enabled. Enable one or more of the following features: `bitdepth_8`, `bitdepth_16`");

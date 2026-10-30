@@ -4122,7 +4122,7 @@ mod tests {
     fn mc_extreme_bd<BD: BitDepth>(max: i32) {
         let (scalar, tiers) = dsps::<BD>();
         let bd = BD::from_c(max);
-        let mut rng = Rng(0x5eed_8a9_e7e3_e11e ^ max as u64);
+        let mut rng = Rng(0x05ee_d8a9_e7e3_e11e ^ max as u64);
         let id = [0, 0, 0, 1, 0, 0, 0, 0];
         for (w, h) in [(2, 8), (4, 4), (8, 8), (16, 8), (32, 16)] {
             for &f in &FILTERS[..9] {

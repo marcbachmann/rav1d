@@ -2970,8 +2970,7 @@ mod rust_simd {
         let cur = &coeffs[row_taps..][..LAG];
         for y in 0..h - PAD {
             let mut acc = [0; GRAIN_WIDTH];
-            let mut x0 = 0;
-            while LAG > 0 {
+            for x0 in (0..n).step_by(8) {
                 let x = cmp::min(x0, n - 8);
                 let mut s = [I32x4::splat(0); 2];
                 for dy in 0..LAG {
@@ -2984,10 +2983,6 @@ mod rust_simd {
                 }
                 s[0].store(&mut acc[x..]);
                 s[1].store(&mut acc[x + 4..]);
-                if x0 + 8 >= n {
-                    break;
-                }
-                x0 += 8;
             }
             if let Some((luma, sx, sy)) = luma {
                 let (sx, sy) = (sx as usize, sy as usize);
@@ -3274,8 +3269,10 @@ mod tests {
 
     fn case<BD: BitDepth>(rng: &mut Rng, bits: u8, (sx, sy): (bool, bool)) -> Case<BD> {
         let ctr = 128 << (bits - 8);
-        let mut data = Rav1dFilmGrainData::default();
-        data.seed = rng.next() & 0xffff;
+        let mut data = Rav1dFilmGrainData {
+            seed: rng.next() & 0xffff,
+            ..Default::default()
+        };
         data.scaling_shift = rng.range(8, 11) as u8;
         data.overlap_flag = rng.bit();
         data.clip_to_restricted_range = rng.bit();
@@ -3395,8 +3392,10 @@ mod tests {
             g.iter().flatten().map(|&e| e.as_::<c_int>()).collect()
         };
         for i in 0..512 {
-            let mut data = Rav1dFilmGrainData::default();
-            data.seed = rng.next() & 0xffff;
+            let mut data = Rav1dFilmGrainData {
+                seed: rng.next() & 0xffff,
+                ..Default::default()
+            };
             data.ar_coeff_lag = (i % 4) as c_int;
             data.grain_scale_shift = (i / 4 % 4) as u8;
             data.ar_coeff_shift = rng.range(6, 9) as u8;
@@ -3493,8 +3492,10 @@ mod tests {
         if std::env::var("FG_BENCH").is_ok() {
             return;
         }
-        let mut data = Rav1dFilmGrainData::default();
-        data.seed = 0x1234;
+        let mut data = Rav1dFilmGrainData {
+            seed: 0x1234,
+            ..Default::default()
+        };
         data.ar_coeff_lag = 3;
         data.ar_coeff_shift = 7;
         data.ar_coeffs_y.iter_mut().for_each(|c| *c = rng.range(-20, 20) as i8);

@@ -54,6 +54,8 @@ jobs:
           cargo +${{ steps.toolchain.outputs.name }} build --target ${{ matrix.target }} ${{ matrix.build.flags }}
         env:
           RUSTFLAGS: "-C overflow-checks=on"
+      - name: Clippy
+        run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
       - name: download, check, and unpack argon test vectors
         if: ${{ steps.cache-argon.outputs.cache-hit != 'true' }}
         run: | # delete the downloaded .zip to avoid out-of-diskspace errors

@@ -1079,9 +1079,7 @@ fn scatter<const W: usize, const H: usize, const G: usize>(
             block[i] = v[g * 8 + i];
         }
         transpose8x8(&mut block);
-        for y in 0..8.min(H) {
-            group[y0 + y] = block[y];
-        }
+        group[y0..y0 + 8.min(H)].copy_from_slice(&block[..8.min(H)]);
     }
 }
 

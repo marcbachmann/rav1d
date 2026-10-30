@@ -63,7 +63,6 @@ jobs:
           RUSTFLAGS="-C target-feature=+crt-static -C linker=${{ matrix.linker }}" \
             cargo +${{ steps.toolchain.outputs.name }} build --release --target ${{ matrix.target }}
       - name: Clippy
-        continue-on-error: true # the tree has pre-existing clippy errors
         run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
       - name: run tests
         run: |
