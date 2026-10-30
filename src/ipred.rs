@@ -611,13 +611,17 @@ mod rust_simd {
         off: usize,
         half: u32,
     ) -> P {
-        let top = || lanes::<P, W>(&topleft[off + 1..]);
-        let left = || lanes::<P, H>(&topleft[off - H..]);
+        // No closures for the edges: they would not inherit the kernel's target features.
         let dc = match DcGen::from_repr(GEN) {
-            Some(DcGen::Top) => top().hsum_u() + (W >> 1) as u32 >> W.trailing_zeros(),
-            Some(DcGen::Left) => left().hsum_u() + (H >> 1) as u32 >> H.trailing_zeros(),
+            Some(DcGen::Top) => {
+                lanes::<P, W>(&topleft[off + 1..]).hsum_u() + (W >> 1) as u32 >> W.trailing_zeros()
+            }
+            Some(DcGen::Left) => {
+                lanes::<P, H>(&topleft[off - H..]).hsum_u() + (H >> 1) as u32 >> H.trailing_zeros()
+            }
             Some(DcGen::TopLeft) => {
-                let sum = top().add(left()).hsum_u();
+                let top = lanes::<P, W>(&topleft[off + 1..]);
+                let sum = top.add(lanes::<P, H>(&topleft[off - H..])).hsum_u();
                 let dc = sum + ((W + H) >> 1) as u32 >> (W + H).trailing_zeros();
                 // 1/3 and 1/5 in fixed point, finer for the larger sums of `u16` pixels.
                 let (third, fifth, shift) =
@@ -649,14 +653,13 @@ mod rust_simd {
             }
             return;
         }
-        // One borrow for the block, ending at the last row: the rows above it are exact chunks.
+        // One borrow for the block, its rows by offset: chunks of the stride would divide by it.
         let stride = stride as usize;
         let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
-        let (rows, last) = px_mut::<P>(block.as_bytes_mut()).split_at_mut((H - 1) * stride);
-        for r in rows.chunks_exact_mut(stride) {
-            r[..W].copy_from_slice(&row);
+        let block = px_mut::<P>(block.as_bytes_mut());
+        for y in 0..H {
+            block[y * stride..][..W].copy_from_slice(&row);
         }
-        last.copy_from_slice(&row);
     }
 
     #[cfg_attr(
@@ -839,17 +842,19 @@ mod rust_simd {
         let neg = alpha < 0;
         let alpha = I16x8::splat((alpha.unsigned_abs() << 9) as i16);
         let ac = &ac[..W * H];
+        // The rows by offset: a zip of chunks of the stride would divide by it.
         if W == 4 {
-            for (rows, ac) in block.chunks_mut(2 * stride).zip(ac.chunks_exact(8)) {
-                let p = cfl_px::<P>(I16x8::load(ac), alpha, neg, dc, max);
-                rows[..4].copy_from_slice(&p[..4]);
-                rows[stride..][..4].copy_from_slice(&p[4..]);
+            for y in (0..H).step_by(2) {
+                let p = cfl_px::<P>(I16x8::load(&ac[4 * y..]), alpha, neg, dc, max);
+                block[y * stride..][..4].copy_from_slice(&p[..4]);
+                block[(y + 1) * stride..][..4].copy_from_slice(&p[4..]);
             }
             return;
         }
-        for (row, ac) in block.chunks_mut(stride).zip(ac.chunks_exact(W)) {
+        for y in 0..H {
+            let row = &mut block[y * stride..][..W];
             for i in 0..W / 8 {
-                let p = cfl_px::<P>(I16x8::load(&ac[8 * i..]), alpha, neg, dc, max);
+                let p = cfl_px::<P>(I16x8::load(&ac[W * y + 8 * i..]), alpha, neg, dc, max);
                 row[8 * i..][..8].copy_from_slice(&p);
             }
         }
@@ -1076,9 +1081,65 @@ mod rust_simd {
         }
     }
 
+    /// [`upsample_edge`] in vectors: the clipped input padded once, then
+    /// `(-a + 9 * b + 9 * c - d + 8) >> 4` as `(m + (m - n + 8 >> 3)) >> 1` with `m = b + c`
+    /// and `n = a + d`, which stays in 16 bits to 12 bpc, interleaved with the input.
+    #[inline(always)]
+    fn upsample_edge_px<P: Pix>(
+        out: &mut [P],
+        hsz: usize,
+        r#in: &[P],
+        in_off: usize,
+        from: isize,
+        to: isize,
+        max: i16,
+    ) {
+        // `p[k]` is the input at `clip(k - 1, from, to - 1)`; `hsz <= 17`.
+        let mut p = [P::default(); 32];
+        for (k, p) in p[..hsz + 2].iter_mut().enumerate() {
+            *p = r#in[in_off.wrapping_add_signed((k as isize - 1).clamp(from, to - 1))];
+        }
+        let n_out = 2 * hsz - 1;
+        for i in (0..hsz - 1).step_by(8) {
+            let (a, b) = (P::load8(&p[i..]), P::load8(&p[i + 1..]));
+            let (c, d) = (P::load8(&p[i + 2..]), P::load8(&p[i + 3..]));
+            let m = b.add(c);
+            let s = m.add(m.sub(a.add(d)).add(I16x8::splat(8)).shr_s::<3>()).shr_s::<1>();
+            let s = s.max(I16x8::splat(0)).min(I16x8::splat(max));
+            let n = (n_out - 2 * i).min(16);
+            let mut o = [P::default(); 16];
+            o[..8].copy_from_slice(&P::px8(b.zip_lo16(s)));
+            o[8..].copy_from_slice(&P::px8(b.zip_hi16(s)));
+            out[2 * i..][..n].copy_from_slice(&o[..n]);
+        }
+        out[n_out - 1] = p[hsz];
+    }
+
+    #[inline(always)]
+    pub(super) fn upsample_edge_simd<BD: BitDepth>(
+        out: &mut [BD::Pixel],
+        hsz: c_int,
+        r#in: &[BD::Pixel; SCRATCH_EDGE_LEN],
+        in_off: usize,
+        from: c_int,
+        to: c_int,
+        bd: BD,
+    ) {
+        let max = bd.bitdepth_max().as_::<c_int>() as i16;
+        with_px!(BD, |P| upsample_edge_px::<P>(
+            px_mut(out.as_bytes_mut()),
+            hsz as usize,
+            px(r#in.as_bytes()),
+            in_off,
+            from as isize,
+            to as isize,
+            max,
+        ))
+    }
+
     /// [`filter_edge_px`] in the shape of [`filter_edge`], for the edge helpers.
     #[inline(always)]
-    fn filter_edge_simd<BD: BitDepth>(
+    pub(super) fn filter_edge_simd<BD: BitDepth>(
         out: &mut [BD::Pixel],
         sz: c_int,
         lim_from: c_int,
@@ -1125,7 +1186,7 @@ mod rust_simd {
     ) {
         let mut e = [0.into(); EXT];
         let (dx, max, upsample) =
-            z1_edge::<BD>(&mut e, topleft, off, width, height, angle, bd, filter_edge_simd::<BD>);
+            z1_edge::<BD, true>(&mut e, topleft, off, width, height, angle, bd);
         let (w, h, dx) = (width as usize, height as usize, dx as usize);
         let stride = dst.pixel_stride::<BD>() as usize;
         let mut block = dst.slice_mut::<BD>((h - 1) * stride + w);
@@ -1294,7 +1355,7 @@ mod rust_simd {
         bd: BD,
     ) {
         let mut edge = [0.into(); 64 + 64 + 1];
-        let (dx, dy, up_above, up_left) = z2_edge::<BD>(
+        let (dx, dy, up_above, up_left) = z2_edge::<BD, true>(
             &mut edge,
             topleft,
             off,
@@ -1304,7 +1365,6 @@ mod rust_simd {
             max_width,
             max_height,
             bd,
-            filter_edge_simd::<BD>,
         );
         let (dx, dy) = (dx as usize, dy as usize);
         let stride = dst.pixel_stride::<BD>() as usize;
@@ -1334,7 +1394,7 @@ mod rust_simd {
     ) {
         let mut left = [0.into(); 64 + 64];
         let (dy, left_off, max, upsample) =
-            z3_edge::<BD>(&mut left, topleft, off, width, height, angle, bd, filter_edge_simd::<BD>);
+            z3_edge::<BD, true>(&mut left, topleft, off, width, height, angle, bd);
         let stride = dst.pixel_stride::<BD>() as usize;
         let mut block = dst.slice_mut::<BD>((height as usize - 1) * stride + width as usize);
         with_px!(BD, |P| {
@@ -1969,10 +2029,49 @@ fn upsample_edge<BD: BitDepth>(
     out[(i * 2) as usize] = r#in[in_off + iclip(i, from, to - 1) as usize];
 }
 
+/// [`filter_edge`], in vectors where `SIMD`: called straight, so that it inlines into the
+/// kernel and takes its target features.
+#[inline(always)]
+fn edge_filter<BD: BitDepth, const SIMD: bool>(
+    out: &mut [BD::Pixel],
+    sz: c_int,
+    lim_from: c_int,
+    lim_to: c_int,
+    r#in: &[BD::Pixel; SCRATCH_EDGE_LEN],
+    in_off: usize,
+    from: c_int,
+    to: c_int,
+    strength: c_int,
+) {
+    if SIMD {
+        rust_simd::filter_edge_simd::<BD>(out, sz, lim_from, lim_to, r#in, in_off, from, to, strength)
+    } else {
+        filter_edge::<BD>(out, sz, lim_from, lim_to, r#in, in_off, from, to, strength)
+    }
+}
+
+/// [`upsample_edge`], in vectors where `SIMD`.
+#[inline(always)]
+fn edge_upsample<BD: BitDepth, const SIMD: bool>(
+    out: &mut [BD::Pixel],
+    hsz: c_int,
+    r#in: &[BD::Pixel; SCRATCH_EDGE_LEN],
+    in_off: usize,
+    from: c_int,
+    to: c_int,
+    bd: BD,
+) {
+    if SIMD {
+        rust_simd::upsample_edge_simd::<BD>(out, hsz, r#in, in_off, from, to, bd)
+    } else {
+        upsample_edge::<BD>(out, hsz, r#in, in_off, from, to, bd)
+    }
+}
+
 /// Z1's top edge into `top`, filtered or upsampled as the angle asks: `(dx, max_base_x,
 /// upsample_above)`.
 #[inline(always)]
-fn z1_edge<BD: BitDepth>(
+fn z1_edge<BD: BitDepth, const SIMD: bool>(
     top: &mut [BD::Pixel],
     topleft_in: &[BD::Pixel; SCRATCH_EDGE_LEN],
     topleft_in_off: usize,
@@ -1980,7 +2079,6 @@ fn z1_edge<BD: BitDepth>(
     height: c_int,
     mut angle: c_int,
     bd: BD,
-    filter: impl FnOnce(&mut [BD::Pixel], c_int, c_int, c_int, &[BD::Pixel; SCRATCH_EDGE_LEN], usize, c_int, c_int, c_int),
 ) -> (c_int, usize, bool) {
     let is_sm = (angle >> 9) & 1 != 0;
     let enable_intra_edge_filter = (angle >> 10) != 0;
@@ -1993,7 +2091,7 @@ fn z1_edge<BD: BitDepth>(
         false
     };
     let max_base_x = if upsample_above {
-        upsample_edge::<BD>(
+        edge_upsample::<BD, SIMD>(
             top,
             width + height,
             topleft_in,
@@ -2011,7 +2109,7 @@ fn z1_edge<BD: BitDepth>(
             0
         };
         if filter_strength != 0 {
-            filter(
+            edge_filter::<BD, SIMD>(
                 top,
                 width + height,
                 0,
@@ -2045,7 +2143,7 @@ fn ipred_z1_rust<BD: BitDepth>(
 ) {
     let mut top = [0.into(); 64 + 64];
     let (dx, max_base_x, upsample_above) =
-        z1_edge::<BD>(&mut top, topleft_in, topleft_in_off, width, height, angle, bd, filter_edge::<BD>);
+        z1_edge::<BD, false>(&mut top, topleft_in, topleft_in_off, width, height, angle, bd);
     let width = width as usize;
     let base_inc = 1 + upsample_above as usize;
     for y in 0..height {
@@ -2071,7 +2169,7 @@ fn ipred_z1_rust<BD: BitDepth>(
 /// Z2's edge into `edge`, its top-left pixel at 64, the top filtered or upsampled as the
 /// angle asks and the left the same: `(dx, dy, upsample_above, upsample_left)`.
 #[inline(always)]
-fn z2_edge<BD: BitDepth>(
+fn z2_edge<BD: BitDepth, const SIMD: bool>(
     edge: &mut [BD::Pixel; 64 + 64 + 1],
     topleft_in: &[BD::Pixel; SCRATCH_EDGE_LEN],
     topleft_in_off: usize,
@@ -2081,7 +2179,6 @@ fn z2_edge<BD: BitDepth>(
     max_width: c_int,
     max_height: c_int,
     bd: BD,
-    filter: impl FnOnce(&mut [BD::Pixel], c_int, c_int, c_int, &[BD::Pixel; SCRATCH_EDGE_LEN], usize, c_int, c_int, c_int) + Copy,
 ) -> (c_int, c_int, bool, bool) {
     let is_sm = (angle >> 9) & 1 != 0;
     let enable_intra_edge_filter = angle >> 10;
@@ -2102,7 +2199,7 @@ fn z2_edge<BD: BitDepth>(
     let topleft = 64;
 
     if upsample_above {
-        upsample_edge::<BD>(
+        edge_upsample::<BD, SIMD>(
             &mut edge[topleft..],
             width + 1,
             topleft_in,
@@ -2119,7 +2216,7 @@ fn z2_edge<BD: BitDepth>(
             0
         };
         if filter_strength != 0 {
-            filter(
+            edge_filter::<BD, SIMD>(
                 &mut edge[topleft + 1..],
                 width,
                 0,
@@ -2140,7 +2237,7 @@ fn z2_edge<BD: BitDepth>(
         }
     }
     if upsample_left {
-        upsample_edge::<BD>(
+        edge_upsample::<BD, SIMD>(
             &mut edge[topleft - height as usize * 2..],
             height + 1,
             topleft_in,
@@ -2157,7 +2254,7 @@ fn z2_edge<BD: BitDepth>(
             0
         };
         if filter_strength_0 != 0 {
-            filter(
+            edge_filter::<BD, SIMD>(
                 &mut edge[topleft - height as usize..],
                 height,
                 height - max_height,
@@ -2195,7 +2292,7 @@ fn ipred_z2_rust<BD: BitDepth>(
 ) {
     let mut edge = [0.into(); 64 + 64 + 1];
     let topleft = 64;
-    let (dx, dy, upsample_above, upsample_left) = z2_edge::<BD>(
+    let (dx, dy, upsample_above, upsample_left) = z2_edge::<BD, false>(
         &mut edge,
         topleft_in,
         topleft_in_off,
@@ -2205,7 +2302,6 @@ fn ipred_z2_rust<BD: BitDepth>(
         max_width,
         max_height,
         bd,
-        filter_edge::<BD>,
     );
     let base_inc_x = 1 + upsample_above as usize;
     let left = topleft - (1 + upsample_left as usize);
@@ -2238,7 +2334,7 @@ fn ipred_z2_rust<BD: BitDepth>(
 /// Z3's left edge into `left`, filtered or upsampled as the angle asks, read downwards from
 /// `left[left_off]`: `(dy, left_off, max_base_y, upsample_left)`.
 #[inline(always)]
-fn z3_edge<BD: BitDepth>(
+fn z3_edge<BD: BitDepth, const SIMD: bool>(
     left: &mut [BD::Pixel],
     topleft_in: &[BD::Pixel; SCRATCH_EDGE_LEN],
     topleft_in_off: usize,
@@ -2246,7 +2342,6 @@ fn z3_edge<BD: BitDepth>(
     height: c_int,
     mut angle: c_int,
     bd: BD,
-    filter: impl FnOnce(&mut [BD::Pixel], c_int, c_int, c_int, &[BD::Pixel; SCRATCH_EDGE_LEN], usize, c_int, c_int, c_int),
 ) -> (usize, usize, usize, bool) {
     let is_sm = (angle >> 9) & 1 != 0;
     let enable_intra_edge_filter = angle >> 10;
@@ -2259,7 +2354,7 @@ fn z3_edge<BD: BitDepth>(
         false
     };
     let (left_off, max_base_y) = if upsample_left {
-        upsample_edge::<BD>(
+        edge_upsample::<BD, SIMD>(
             left,
             width + height,
             topleft_in,
@@ -2278,7 +2373,7 @@ fn z3_edge<BD: BitDepth>(
         };
 
         if filter_strength != 0 {
-            filter(
+            edge_filter::<BD, SIMD>(
                 left,
                 width + height,
                 0,
@@ -2312,7 +2407,7 @@ fn ipred_z3_rust<BD: BitDepth>(
 ) {
     let mut left = [0.into(); 64 + 64];
     let (dy, left_off, max_base_y, upsample_left) =
-        z3_edge::<BD>(&mut left, topleft_in, topleft_in_off, width, height, angle, bd, filter_edge::<BD>);
+        z3_edge::<BD, false>(&mut left, topleft_in, topleft_in_off, width, height, angle, bd);
     let base_inc = 1 + upsample_left as usize;
     let width = width as usize;
     let height = height as usize;
@@ -3050,8 +3145,15 @@ mod tests {
             ("smooth", SMOOTH_PRED),
             ("smooth_v", SMOOTH_V_PRED),
             ("smooth_h", SMOOTH_H_PRED),
+            ("paeth", PAETH_PRED),
+            ("h", HOR_PRED),
+            ("v", VERT_PRED),
+            ("filter", FILTER_PRED),
         ] {
-            for (w, h) in [(4, 4), (8, 8), (16, 8), (16, 16), (32, 32), (64, 64)] {
+            for (w, h) in [(4, 4), (8, 8), (16, 8), (16, 16), (32, 32), (64, 64)]
+                .into_iter()
+                .filter(|&(w, _)| mode != FILTER_PRED || w <= 32)
+            {
                 line(name, w, h, &|dsp| {
                     let f = &dsp.intra_pred[mode as usize];
                     f.call::<BitDepth8>(at, black_box(edge), off, w, h, 0, w, h, bd);
@@ -3065,6 +3167,9 @@ mod tests {
             ("z1 unfiltered", Z1_PRED, 45),
             ("z2 unfiltered", Z2_PRED, 135),
             ("z3 unfiltered", Z3_PRED, 225),
+            ("z1 upsampled", Z1_PRED, 81 | 1 << 10),
+            ("z2 upsampled", Z2_PRED, 99 | 1 << 10),
+            ("z3 upsampled", Z3_PRED, 189 | 1 << 10),
         ] {
             for (w, h) in [(4, 4), (8, 8), (16, 8), (16, 16), (32, 32), (64, 64)] {
                 line(name, w, h, &|dsp| {
