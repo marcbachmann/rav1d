@@ -692,13 +692,6 @@ mod rust_simd {
         v
     }
 
-    /// The edge around `topleft[off]`, where it is at 64: the 64 pixels left of it, then the
-    /// 64 above. One bounds check for the edge.
-    #[inline(always)]
-    fn edge_window<P>(topleft: &[P], off: usize) -> &[P; 129] {
-        topleft[off - 64..][..129].try_into().unwrap()
-    }
-
     /// The sum of `px[..N]`, `N` a power of two from 4.
     #[inline(always)]
     fn edge_sum<P: Pix, const N: usize>(px: &[P]) -> u32 {
@@ -716,8 +709,8 @@ mod rust_simd {
         off: usize,
         half: u32,
     ) -> P {
-        let e = edge_window(topleft, off);
-        let (top, left) = (&e[65..][..W], &e[64 - H..][..H]);
+        // Inter-intra has the top-left pixel at 32, not 128.
+        let (top, left) = (&topleft[off + 1..][..W], &topleft[off - H..][..H]);
         // No closures for the edges: they would not inherit the kernel's target features.
         let dc = match DcGen::from_repr(GEN) {
             Some(DcGen::Top) => edge_sum::<P, W>(top) + (W >> 1) as u32 >> W.trailing_zeros(),
@@ -3188,13 +3181,25 @@ mod tests {
         angle: c_int,
         max: c_int,
     ) -> Vec<u8> {
+        run_at::<BD>(f, edge, SCRATCH_EDGE_LEN / 2, w, h, angle, max)
+    }
+
+    /// With the top-left pixel at `edge[off]`.
+    fn run_at<BD: BitDepth>(
+        f: &angular_ipred::Fn,
+        edge: &[u16; SCRATCH_EDGE_LEN],
+        off: usize,
+        w: c_int,
+        h: c_int,
+        angle: c_int,
+        max: c_int,
+    ) -> Vec<u8> {
         let mut buf = plane::<BD>(&[]);
         let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), STRIDE);
         let dst = WithOffset {
             data: &comp,
             offset: 4 * STRIDE + 16,
         };
-        let off = SCRATCH_EDGE_LEN / 2;
         f.call::<BD>(dst, &pixels::<BD>(edge), off, w, h, angle, w, h, BD::from_c(max));
         drop(comp);
         buf.as_slice().as_bytes().to_vec()
@@ -3290,6 +3295,12 @@ mod tests {
                 }
                 if w > 32 || h > 32 {
                     continue;
+                }
+                // Inter-intra predicts from an edge with the top-left pixel at 32.
+                for mode in DCS.into_iter().chain(SMOOTHS).chain([VERT_PRED, HOR_PRED]) {
+                    let want = run_at::<BD>(&scalar.intra_pred[mode as usize], &edge, 32, w, h, 0, max);
+                    let got = run_at::<BD>(&rust.intra_pred[mode as usize], &edge, 32, w, h, 0, max);
+                    assert_eq!(got, want, "{w}x{h} mode {mode} round {round} at 32");
                 }
                 for filt in 0..5 {
                     let (s, r) = (&scalar.intra_pred[FILTER_PRED as usize], &rust.intra_pred[FILTER_PRED as usize]);
