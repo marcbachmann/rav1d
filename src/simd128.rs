@@ -91,13 +91,6 @@ pub trait Lanes: Copy {
     fn zip_hi32(self, o: Self) -> Self;
     fn zip_lo64(self, o: Self) -> Self;
     fn zip_hi64(self, o: Self) -> Self;
-
-    /// The butterfly rotation `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`
-    /// in 32 bits, each result saturated to `i16`.
-    #[inline(always)]
-    fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
-        self.madd2(o, [c1, -c2], [c2, c1])
-    }
 }
 
 macro_rules! forward_lanes {
@@ -519,6 +512,48 @@ mod imp {
         #[inline(always)]
         pub fn pack(lo: Self, hi: Self) -> I16x8 {
             I16x8(unsafe { _mm_packs_epi32(lo.0, hi.0) })
+        }
+
+        #[inline(always)]
+        pub fn min(self, o: Self) -> Self {
+            Self(unsafe { _mm_min_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(unsafe { _mm_or_si128(self.0, o.0) })
+        }
+
+        /// Whether any lane is nonzero.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { _mm_testz_si128(self.0, self.0) == 0 }
+        }
+
+        /// `(x + (1 << N >> 1)) >> N`.
+        #[inline(always)]
+        pub fn round_shr<const N: i32>(self) -> Self {
+            unsafe {
+                Self(_mm_srai_epi32::<N>(_mm_add_epi32(
+                    self.0,
+                    _mm_set1_epi32(1 << N >> 1),
+                )))
+            }
+        }
+
+        /// `(x * k + 2048) >> 12`, for products within 32 bits.
+        #[inline(always)]
+        pub fn mul_q12(self, k: i32) -> Self {
+            unsafe {
+                let p = _mm_mullo_epi32(self.0, _mm_set1_epi32(k));
+                Self(_mm_srai_epi32::<12>(_mm_add_epi32(p, _mm_set1_epi32(2048))))
+            }
+        }
+
+        /// `lo` then `hi` shifted with rounding by `N`, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack_round_shr<const N: i32>(lo: Self, hi: Self) -> I16x8 {
+            Self::pack(lo.round_shr::<N>(), hi.round_shr::<N>())
         }
     }
 
@@ -972,6 +1007,41 @@ mod imp {
         #[inline(always)]
         pub fn pack(lo: Self, hi: Self) -> I16x8 {
             I16x8(unsafe { vqmovn_high_s32(vqmovn_s32(lo.0), hi.0) })
+        }
+
+        #[inline(always)]
+        pub fn min(self, o: Self) -> Self {
+            Self(unsafe { vminq_s32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(unsafe { vorrq_s32(self.0, o.0) })
+        }
+
+        /// Whether any lane is nonzero.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { vmaxvq_u32(vreinterpretq_u32_s32(self.0)) != 0 }
+        }
+
+        /// `(x + (1 << N >> 1)) >> N`.
+        #[inline(always)]
+        pub fn round_shr<const N: i32>(self) -> Self {
+            Self(unsafe { vrshrq_n_s32::<N>(self.0) })
+        }
+
+        /// `(x * k + 2048) >> 12`, for `|k| < 4096`: one rounding doubling multiply-high by
+        /// `k << 19`, exact as its product is wider than 32 bits.
+        #[inline(always)]
+        pub fn mul_q12(self, k: i32) -> Self {
+            Self(unsafe { vqrdmulhq_n_s32(self.0, k << 19) })
+        }
+
+        /// `lo` then `hi` shifted with rounding by `N`, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack_round_shr<const N: i32>(lo: Self, hi: Self) -> I16x8 {
+            I16x8(unsafe { vqrshrn_high_n_s32::<N>(vqrshrn_n_s32::<N>(lo.0), hi.0) })
         }
     }
 
@@ -1475,6 +1545,46 @@ mod imp {
         pub fn pack(lo: Self, hi: Self) -> I16x8 {
             I16x8(i16x8_narrow_i32x4(lo.0, hi.0))
         }
+
+        #[inline(always)]
+        pub fn min(self, o: Self) -> Self {
+            Self(i32x4_min(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(v128_or(self.0, o.0))
+        }
+
+        /// Whether any lane is nonzero.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            v128_any_true(self.0)
+        }
+
+        /// `(x + (1 << N >> 1)) >> N`.
+        #[inline(always)]
+        pub fn round_shr<const N: i32>(self) -> Self {
+            Self(i32x4_shr(
+                i32x4_add(self.0, i32x4_splat(1 << N >> 1)),
+                N as u32,
+            ))
+        }
+
+        /// `(x * k + 2048) >> 12`, for products within 32 bits.
+        #[inline(always)]
+        pub fn mul_q12(self, k: i32) -> Self {
+            Self(i32x4_shr(
+                i32x4_add(i32x4_mul(self.0, i32x4_splat(k)), i32x4_splat(2048)),
+                12,
+            ))
+        }
+
+        /// `lo` then `hi` shifted with rounding by `N`, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack_round_shr<const N: i32>(lo: Self, hi: Self) -> I16x8 {
+            Self::pack(lo.round_shr::<N>(), hi.round_shr::<N>())
+        }
     }
 
     impl I16x8 {
@@ -1959,6 +2069,40 @@ mod imp {
             I16x8(std::array::from_fn(|i| {
                 [lo.0, hi.0][i >> 2][i & 3].clamp(i16::MIN as i32, i16::MAX as i32) as i16
             }))
+        }
+
+        #[inline(always)]
+        pub fn min(self, o: Self) -> Self {
+            self.zip(o, i32::min)
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            self.zip(o, |a, b| a | b)
+        }
+
+        /// Whether any lane is nonzero.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            self.0 != [0; 4]
+        }
+
+        /// `(x + (1 << N >> 1)) >> N`.
+        #[inline(always)]
+        pub fn round_shr<const N: i32>(self) -> Self {
+            Self(self.0.map(|v| v.wrapping_add(1 << N >> 1) >> N))
+        }
+
+        /// `(x * k + 2048) >> 12`, for products within 32 bits.
+        #[inline(always)]
+        pub fn mul_q12(self, k: i32) -> Self {
+            Self(self.0.map(|v| v.wrapping_mul(k).wrapping_add(2048) >> 12))
+        }
+
+        /// `lo` then `hi` shifted with rounding by `N`, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack_round_shr<const N: i32>(lo: Self, hi: Self) -> I16x8 {
+            Self::pack(lo.round_shr::<N>(), hi.round_shr::<N>())
         }
     }
 

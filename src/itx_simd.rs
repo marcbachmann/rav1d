@@ -5,7 +5,7 @@
 //! where the C clips, rotations run in 32 bits, and the rounding shifts are Q15 multiplies, so
 //! the adst's negated outputs cost nothing: their multiplier is negated instead.
 
-use zerocopy::AsBytes;
+use zerocopy::{AsBytes, FromBytes};
 
 use crate::include::common::bitdepth::BitDepth;
 use crate::include::dav1d::picture::Rav1dPictureDataComponentOffset;
@@ -13,7 +13,7 @@ use crate::levels::{
     TxfmType, ADST_ADST, ADST_DCT, ADST_FLIPADST, DCT_ADST, DCT_DCT, DCT_FLIPADST, FLIPADST_ADST,
     FLIPADST_DCT, FLIPADST_FLIPADST, H_ADST, H_DCT, H_FLIPADST, IDTX, V_ADST, V_DCT, V_FLIPADST,
 };
-use crate::simd128::{transpose8x8, I16x8, Lanes};
+use crate::simd128::{transpose8x8, I16x8, I32x4, Lanes};
 use crate::strided::Strided as _;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -45,6 +45,118 @@ const fn kinds(t: TxfmType) -> (Tx1d, Tx1d) {
         V_ADST => (Identity, Adst),
         V_FLIPADST => (Identity, FlipAdst),
         _ => unreachable!(),
+    }
+}
+
+/// What the 1-D kernels take of a lane type: butterflies clipped where the C clips, products
+/// with 12-bit constants rounded as `(x * k + 2048) >> 12`. The `i16` lanes saturate to `i16`,
+/// the C's clip at 8 bpc and in the column pass at 10; [`Row10`] runs the 10-bit row pass.
+trait Butterfly: Copy {
+    fn add_sat(self, o: Self) -> Self;
+    fn sub_sat(self, o: Self) -> Self;
+    /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`.
+    fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self);
+    /// `(a * k[0] + b * k[1] + c * k[2] + d * k[3] + 2048) >> 12`.
+    fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self;
+    /// `(x * k + 2048) >> 12`.
+    fn mul12(self, k: i16) -> Self;
+
+    /// `((a * c1 - b * c2 + 2048) >> 12, (a * c2 + b * c1 + 2048) >> 12)`.
+    #[inline(always)]
+    fn rot(self, o: Self, c1: i16, c2: i16) -> (Self, Self) {
+        self.madd2(o, [c1, -c2], [c2, c1])
+    }
+}
+
+macro_rules! butterfly_i16 {
+    ($t:ty) => {
+        impl Butterfly for $t {
+            #[inline(always)]
+            fn add_sat(self, o: Self) -> Self {
+                Lanes::add_sat(self, o)
+            }
+
+            #[inline(always)]
+            fn sub_sat(self, o: Self) -> Self {
+                Lanes::sub_sat(self, o)
+            }
+
+            #[inline(always)]
+            fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
+                Lanes::madd2(self, o, k1, k2)
+            }
+
+            #[inline(always)]
+            fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
+                Lanes::madd4(self, b, c, d, k)
+            }
+
+            #[inline(always)]
+            fn mul12(self, k: i16) -> Self {
+                Lanes::mulhrs(self, <$t as Lanes>::splat(k * 8))
+            }
+        }
+    };
+}
+
+butterfly_i16!(I16x8);
+#[cfg(target_arch = "x86_64")]
+butterfly_i16!(crate::simd128::I16x16);
+
+/// Four rows of the 10-bit row pass in 32 bits, clipped to the C's 18-bit row range.
+#[derive(Clone, Copy)]
+struct Row10(I32x4);
+
+impl Row10 {
+    #[inline(always)]
+    fn clip(v: I32x4) -> Self {
+        Self(
+            v.max(I32x4::splat(-(1 << 17)))
+                .min(I32x4::splat((1 << 17) - 1)),
+        )
+    }
+}
+
+#[inline(always)]
+fn madd(a: I32x4, b: I32x4, k: [i16; 2]) -> I32x4 {
+    a.mul(I32x4::splat(k[0] as i32))
+        .add(b.mul(I32x4::splat(k[1] as i32)))
+        .round_shr::<12>()
+}
+
+impl Butterfly for Row10 {
+    #[inline(always)]
+    fn add_sat(self, o: Self) -> Self {
+        Self::clip(self.0.add(o.0))
+    }
+
+    #[inline(always)]
+    fn sub_sat(self, o: Self) -> Self {
+        Self::clip(self.0.sub(o.0))
+    }
+
+    #[inline(always)]
+    fn madd2(self, o: Self, k1: [i16; 2], k2: [i16; 2]) -> (Self, Self) {
+        (Self(madd(self.0, o.0, k1)), Self(madd(self.0, o.0, k2)))
+    }
+
+    #[inline(always)]
+    fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
+        let [k0, k1, k2, k3] = [k[0], k[1], k[2], k[3]];
+        let sp = I32x4::splat;
+        Self(
+            self.0
+                .mul(sp(k0 as i32))
+                .add(b.0.mul(sp(k1 as i32)))
+                .add(c.0.mul(sp(k2 as i32)))
+                .add(d.0.mul(sp(k3 as i32)))
+                .round_shr::<12>(),
+        )
+    }
+
+    #[inline(always)]
+    fn mul12(self, k: i16) -> Self {
+        Self(self.0.mul_q12(k as i32))
     }
 }
 
@@ -112,7 +224,7 @@ fn round<V: Lanes, const N: usize>(v: &mut [V; N], k: i32, negated: u32) {
 }
 
 #[inline(always)]
-fn dct4<V: Lanes>(v: &mut [V; 4]) {
+fn dct4<V: Butterfly>(v: &mut [V; 4]) {
     let (t1, t0) = v[0].rot(v[2], 2896, 2896);
     let (t2, t3) = v[1].rot(v[3], 1567, 3784);
     v[0] = t0.add_sat(t3);
@@ -123,7 +235,7 @@ fn dct4<V: Lanes>(v: &mut [V; 4]) {
 
 /// Four-term sums in 32 bits, as the C has them; nothing comes out negated.
 #[inline(always)]
-fn adst4<V: Lanes>(v: &mut [V; 4]) {
+fn adst4<V: Butterfly>(v: &mut [V; 4]) {
     let [a, b, c, d] = *v;
     v[0] = a.madd4(b, c, d, [1321, 3344, 3803, 2482]);
     v[1] = a.madd4(b, c, d, [2482, 3344, -1321, -3803]);
@@ -149,7 +261,7 @@ fn identity4<V: Lanes>(v: &mut [V; 4], shift: u32) {
 }
 
 #[inline(always)]
-fn tx4<V: Lanes>(v: &mut [V; 4], t: Tx1d, shift: u32) {
+fn tx4<V: Lanes + Butterfly>(v: &mut [V; 4], t: Tx1d, shift: u32) {
     match t {
         Dct => dct4(v),
         Adst => adst4(v),
@@ -163,16 +275,16 @@ fn tx4<V: Lanes>(v: &mut [V; 4], t: Tx1d, shift: u32) {
 
 /// `(x * c1 + 2048 >> 12, x * c2 + 2048 >> 12)`: a rotation whose other input is zero.
 #[inline(always)]
-fn rot1<V: Lanes>(x: V, c1: i16, c2: i16) -> (V, V) {
-    (x.mulhrs(V::splat(c1 * 8)), x.mulhrs(V::splat(c2 * 8)))
+fn rot1<V: Butterfly>(x: V, c1: i16, c2: i16) -> (V, V) {
+    (x.mul12(c1), x.mul12(c2))
 }
 
 /// `HALF`: the upper half of the inputs is zero (the C's `tx64`), so the first rotations are
 /// single products.
 #[inline(always)]
-fn dct8<V: Lanes, const HALF: bool>(v: &mut [V; 8]) {
+fn dct8<V: Butterfly, const HALF: bool>(v: &mut [V; 8]) {
     let (t1, t0) = if HALF {
-        let t = v[0].mulhrs(V::splat(2896 * 8));
+        let t = v[0].mul12(2896);
         (t, t)
     } else {
         v[0].rot(v[4], 2896, 2896)
@@ -214,7 +326,7 @@ fn dct8<V: Lanes, const HALF: bool>(v: &mut [V; 8]) {
 }
 
 #[inline(always)]
-fn dct16<V: Lanes, const HALF: bool>(v: &mut [V; 16]) {
+fn dct16<V: Butterfly, const HALF: bool>(v: &mut [V; 16]) {
     let mut e = [v[0], v[2], v[4], v[6], v[8], v[10], v[12], v[14]];
     dct8::<_, HALF>(&mut e);
 
@@ -266,7 +378,7 @@ fn dct16<V: Lanes, const HALF: bool>(v: &mut [V; 16]) {
 }
 
 #[inline(always)]
-fn dct32<V: Lanes, const HALF: bool>(v: &mut [V; 32]) {
+fn dct32<V: Butterfly, const HALF: bool>(v: &mut [V; 32]) {
     let mut e: [V; 16] = std::array::from_fn(|i| v[2 * i]);
     dct16::<_, HALF>(&mut e);
 
@@ -369,7 +481,7 @@ fn dct32<V: Lanes, const HALF: bool>(v: &mut [V; 32]) {
 
 /// A 64-point DCT sees 32 coefficients, so its upper inputs are always zero.
 #[inline(always)]
-fn dct64<V: Lanes>(v: &mut [V; 64]) {
+fn dct64<V: Butterfly>(v: &mut [V; 64]) {
     let mut e: [V; 32] = std::array::from_fn(|i| v[2 * i]);
     dct32::<_, true>(&mut e);
 
@@ -571,7 +683,7 @@ fn dct64<V: Lanes>(v: &mut [V; 64]) {
 /// Outputs 1, 3, 5 and 7 come out negated. The last stage's `* 2896 >> 12` runs in 32 bits on
 /// the row pass and in 16 on the column pass, where the asm has the inputs small enough.
 #[inline(always)]
-fn adst8<V: Lanes, const COLS: bool>(v: &mut [V; 8]) {
+fn adst8<V: Butterfly, const COLS: bool>(v: &mut [V; 8]) {
     let (t1a, t0a) = v[7].rot(v[0], 401, 4076);
     let (t3a, t2a) = v[5].rot(v[2], 1931, 3612);
     let (t5a, t4a) = v[3].rot(v[4], 3166, 2598);
@@ -604,10 +716,9 @@ fn adst8<V: Lanes, const COLS: bool>(v: &mut [V; 8]) {
 
 /// `((a - b) * 2896 >> 12, (a + b) * 2896 >> 12)`: the adst's last stage.
 #[inline(always)]
-fn half_rot<V: Lanes, const COLS: bool>(a: V, b: V) -> (V, V) {
+fn half_rot<V: Butterfly, const COLS: bool>(a: V, b: V) -> (V, V) {
     if COLS {
-        let k = V::splat(2896 * 8);
-        (a.sub_sat(b).mulhrs(k), a.add_sat(b).mulhrs(k))
+        (a.sub_sat(b).mul12(2896), a.add_sat(b).mul12(2896))
     } else {
         a.rot(b, 2896, 2896)
     }
@@ -615,7 +726,7 @@ fn half_rot<V: Lanes, const COLS: bool>(a: V, b: V) -> (V, V) {
 
 /// The odd outputs come out negated, as in [`adst8`].
 #[inline(always)]
-fn adst16<V: Lanes, const COLS: bool>(v: &mut [V; 16]) {
+fn adst16<V: Butterfly, const COLS: bool>(v: &mut [V; 16]) {
     let (t1, t0) = v[15].rot(v[0], 201, 4091);
     let (t3, t2) = v[13].rot(v[2], 995, 3973);
     let (t5, t4) = v[11].rot(v[4], 1751, 3703);
@@ -709,7 +820,7 @@ fn identity16<V: Lanes>(v: &mut [V; 16], shift: u32) {
 }
 
 #[inline(always)]
-fn tx8<V: Lanes, const COLS: bool>(v: &mut [V; 8], t: Tx1d) {
+fn tx8<V: Lanes + Butterfly, const COLS: bool>(v: &mut [V; 8], t: Tx1d) {
     match t {
         Dct => dct8::<_, false>(v),
         Adst => adst8::<_, COLS>(v),
@@ -722,7 +833,7 @@ fn tx8<V: Lanes, const COLS: bool>(v: &mut [V; 8], t: Tx1d) {
 }
 
 #[inline(always)]
-fn tx16<V: Lanes, const COLS: bool>(v: &mut [V; 16], t: Tx1d, shift: u32) {
+fn tx16<V: Lanes + Butterfly, const COLS: bool>(v: &mut [V; 16], t: Tx1d, shift: u32) {
     match t {
         Dct => dct16::<_, false>(v),
         Adst => adst16::<_, COLS>(v),
@@ -737,7 +848,7 @@ fn tx16<V: Lanes, const COLS: bool>(v: &mut [V; 16], t: Tx1d, shift: u32) {
 /// Only the DCT and the identity reach 32 points; the identity's factor of 4 is a shift the
 /// rounding absorbs.
 #[inline(always)]
-fn tx32<V: Lanes>(v: &mut [V; 32], t: Tx1d, half: bool) {
+fn tx32<V: Lanes + Butterfly>(v: &mut [V; 32], t: Tx1d, half: bool) {
     match (t, half) {
         (Dct, true) => dct32::<_, true>(v),
         (Dct, false) => dct32::<_, false>(v),
@@ -747,7 +858,12 @@ fn tx32<V: Lanes>(v: &mut [V; 32], t: Tx1d, half: bool) {
 
 /// `half`: the upper half of the inputs is zero.
 #[inline(always)]
-fn tx<V: Lanes, const N: usize, const COLS: bool>(v: &mut [V; N], t: Tx1d, shift: u32, half: bool) {
+fn tx<V: Lanes + Butterfly, const N: usize, const COLS: bool>(
+    v: &mut [V; N],
+    t: Tx1d,
+    shift: u32,
+    half: bool,
+) {
     match N {
         4 => tx4((&mut v[..4]).try_into().unwrap(), t, shift),
         8 => tx8::<_, COLS>((&mut v[..8]).try_into().unwrap(), t),
@@ -758,58 +874,134 @@ fn tx<V: Lanes, const N: usize, const COLS: bool>(v: &mut [V; N], t: Tx1d, shift
     }
 }
 
-/// `v[y]` added to the block's row `y` from column `x0`, saturated to the pixel range; `W` lanes
-/// of 4 or 8.
+/// A picture row's sixteen-bit pixels.
+#[inline(always)]
+fn px16(b: &mut [u8]) -> &mut [u16] {
+    FromBytes::mut_slice_from(b).unwrap()
+}
+
+/// `v[y]` added to the block's row `y` from column `x0`, saturated to the pixel range
+/// `0..=px_max`; `W` lanes of 4 or 8.
 #[inline(always)]
 fn add_rows<BD: BitDepth, const W: usize, const H: usize>(
     dst: Rav1dPictureDataComponentOffset,
     x0: usize,
     v: &[I16x8; H],
+    px_max: i16,
 ) {
     let n = if W == 4 { 4 } else { 8 };
+    let (zero, max) = (I16x8::splat(0), I16x8::splat(px_max));
     for y in 0..H {
         let row = dst + (y as isize * dst.pixel_stride::<BD>());
         let px = &mut *row.slice_mut::<BD>(x0 + n);
-        let px = &mut px.as_bytes_mut()[x0..];
-        let out = if n == 4 {
-            I16x8::from_u8x4(px)
+        if BD::BITDEPTH == 8 {
+            let px = &mut px.as_bytes_mut()[x0..];
+            let out = if n == 4 {
+                I16x8::from_u8x4(px)
+            } else {
+                I16x8::from_u8x8(px)
+            }
+            .add(v[y]);
+            px.copy_from_slice(&out.pack_u8()[..n]);
         } else {
-            I16x8::from_u8x8(px)
+            let px = &mut px16(px.as_bytes_mut())[x0..];
+            if n == 4 {
+                let out = I16x8::load_u16_lo(px).add_sat(v[y]).max(zero).min(max);
+                out.store_u16_lo(px);
+            } else {
+                let out = I16x8::load_u16(px).add_sat(v[y]).max(zero).min(max);
+                out.store_u16(px);
+            }
         }
-        .add(v[y]);
-        px.copy_from_slice(&out.pack_u8()[..n]);
     }
 }
 
-/// `eob == 0` of a DCT: one value over the block.
+/// `eob == 0` of a DCT: the value `dc` of the first coefficient turns into one value over the
+/// block.
 #[inline(always)]
 fn add_dc<BD: BitDepth, const W: usize, const H: usize>(
     dst: Rav1dPictureDataComponentOffset,
-    coeff: &mut [i16],
+    mut dc: i32,
+    px_max: i16,
 ) {
     let shift = row_shift(W, H);
-    let mut dc = coeff[0] as i32;
-    coeff[0] = 0;
     if W * 2 == H || H * 2 == W {
         dc = dc * 181 + 128 >> 8;
     }
     dc = dc * 181 + 128 >> 8;
     dc = dc + (1 << shift >> 1) >> shift;
     dc = dc * 181 + 128 + 2048 >> 12;
-    let dc = I16x8::splat(dc as i16);
+    if BD::BITDEPTH == 8 {
+        let dc = I16x8::splat(dc as i16);
+        for y in 0..H {
+            let row = dst + (y as isize * dst.pixel_stride::<BD>());
+            let px = &mut *row.slice_mut::<BD>(W);
+            let px = px.as_bytes_mut();
+            if W == 4 {
+                let out = I16x8::from_u8x4(px).add(dc);
+                px.copy_from_slice(&out.pack_u8()[..4]);
+                continue;
+            }
+            for px in px.chunks_exact_mut(8) {
+                let out = I16x8::from_u8x8(px).add(dc);
+                px.copy_from_slice(&out.pack_u8());
+            }
+        }
+        return;
+    }
+    let dc = I16x8::splat(dc.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+    let (zero, max) = (I16x8::splat(0), I16x8::splat(px_max));
     for y in 0..H {
         let row = dst + (y as isize * dst.pixel_stride::<BD>());
         let px = &mut *row.slice_mut::<BD>(W);
-        let px = px.as_bytes_mut();
+        let px = px16(px.as_bytes_mut());
         if W == 4 {
-            let out = I16x8::from_u8x4(px).add(dc);
-            px.copy_from_slice(&out.pack_u8()[..4]);
+            let out = I16x8::load_u16_lo(px).add_sat(dc).max(zero).min(max);
+            out.store_u16_lo(px);
             continue;
         }
         for px in px.chunks_exact_mut(8) {
-            let out = I16x8::from_u8x8(px).add(dc);
-            px.copy_from_slice(&out.pack_u8());
+            let out = I16x8::load_u16(px).add_sat(dc).max(zero).min(max);
+            out.store_u16(px);
         }
+    }
+}
+
+/// The row pass's outputs `v` for rows `y0..y0 + 8`, one column per vector, turned into each
+/// column group's rows.
+#[inline(always)]
+fn scatter<const W: usize, const H: usize, const G: usize>(
+    v: &[I16x8; W],
+    y0: usize,
+    groups: &mut [[I16x8; H]; G],
+) {
+    for (g, group) in groups.iter_mut().enumerate() {
+        let mut block = [I16x8::splat(0); 8];
+        for i in 0..8.min(W) {
+            block[i] = v[g * 8 + i];
+        }
+        transpose8x8(&mut block);
+        for y in 0..8.min(H) {
+            group[y0 + y] = block[y];
+        }
+    }
+}
+
+/// The column pass over groups `g0..` into the picture.
+#[inline(always)]
+fn cols_128<BD: BitDepth, const W: usize, const H: usize, const G: usize>(
+    dst: Rav1dPictureDataComponentOffset,
+    groups: &mut [[I16x8; H]; G],
+    g0: usize,
+    cols: Tx1d,
+    half: bool,
+    px_max: i16,
+) {
+    for g in g0..G {
+        let group = &mut groups[g];
+        tx::<_, H, true>(group, cols, 4, half);
+        round(group, round_mul(cols, H, 4), negated(cols, H));
+        add_rows::<BD, W, H>(dst, g * 8, group, px_max);
     }
 }
 
@@ -834,7 +1026,9 @@ fn add_block<
 ) {
     let (rows, cols) = kinds(TYPE);
     if TYPE == DCT_DCT && eob == 0 {
-        return add_dc::<BD, W, H>(dst, coeff);
+        let dc = coeff[0] as i32;
+        coeff[0] = 0;
+        return add_dc::<BD, W, H>(dst, dc, 255);
     }
     let shift = row_shift(W, H);
     let (cw, ch) = (W.min(32), H.min(32));
@@ -878,18 +1072,10 @@ fn add_block<
         }
         tx::<_, W, false>(&mut v, rows, shift, half);
         round(&mut v, round_mul(rows, W, shift), negated(rows, W));
-        for (g, group) in groups.iter_mut().enumerate() {
-            let mut block = [zero; 8];
-            for i in 0..8.min(W) {
-                block[i] = v[g * 8 + i];
-            }
-            transpose8x8(&mut block);
-            for y in 0..8.min(H) {
-                group[y0 + y] = block[y];
-            }
-        }
+        scatter(&v, y0, &mut groups);
         y0 += 8;
     }
+    #[allow(unused_mut)]
     let mut g = 0;
     #[cfg(target_arch = "x86_64")]
     if WIDE && W >= 16 {
@@ -898,13 +1084,133 @@ fn add_block<
             g += 2;
         }
     }
-    while g < G {
-        let group = &mut groups[g];
-        tx::<_, H, true>(group, cols, 4, half);
-        round(group, round_mul(cols, H, 4), negated(cols, H));
-        add_rows::<BD, W, H>(dst, g * 8, group);
-        g += 1;
+    cols_128::<BD, W, H, G>(dst, &mut groups, g, cols, half, 255);
+}
+
+/// The 10-bit row transform of `t` over `N` points, the identity's scale left to [`rows10`].
+#[inline(always)]
+fn tx10<const N: usize>(v: &mut [Row10; N], t: Tx1d, half: bool) {
+    match (N, t) {
+        (_, Identity) => {}
+        (4, _) => {
+            let v: &mut [_; 4] = (&mut v[..4]).try_into().unwrap();
+            match t {
+                Dct => dct4(v),
+                _ => adst4(v),
+            }
+        }
+        (8, Dct) => dct8::<_, false>((&mut v[..8]).try_into().unwrap()),
+        (8, _) => adst8::<_, false>((&mut v[..8]).try_into().unwrap()),
+        (16, Dct) => dct16::<_, false>((&mut v[..16]).try_into().unwrap()),
+        (16, _) => adst16::<_, false>((&mut v[..16]).try_into().unwrap()),
+        (32, _) if half => dct32::<_, true>((&mut v[..32]).try_into().unwrap()),
+        (32, _) => dct32::<_, false>((&mut v[..32]).try_into().unwrap()),
+        _ => dct64((&mut v[..64]).try_into().unwrap()),
     }
+    if t == FlipAdst {
+        v.reverse();
+    }
+}
+
+/// Rows `y0..y0 + 4` of the 10-bit row pass into `out`, one column per vector, before the
+/// pass's rounding shift: false, with `out` untouched, where all their coefficients are zero.
+#[inline(always)]
+fn rows10<const W: usize>(
+    coeff: &mut [i32],
+    ch: usize,
+    y0: usize,
+    w: usize,
+    rect: bool,
+    t: Tx1d,
+    half: bool,
+    out: &mut [I32x4; W],
+) -> bool {
+    let zero = I32x4::splat(0);
+    let mut v = [Row10(zero); W];
+    let mut set = zero;
+    for x in 0..w {
+        let c = &mut coeff[x * ch + y0..];
+        v[x] = Row10(I32x4::load(c));
+        zero.store(c);
+        set = set.or(v[x].0);
+    }
+    if !set.any() {
+        return false;
+    }
+    if rect {
+        for x in 0..w {
+            v[x] = v[x].mul12(2896);
+        }
+    }
+    tx10(&mut v, t, half);
+    let neg = negated(t, W);
+    for x in 0..W {
+        let mut a = v[x].0;
+        if t == Identity {
+            a = match W {
+                4 => a.add(a.mul_q12(1697)),
+                8 => a.add(a),
+                16 => a.add(a).add(a.mul_q12(3394)),
+                _ => a.shl::<2>(),
+            };
+        }
+        if x < 32 && neg >> x & 1 != 0 {
+            a = zero.sub(a);
+        }
+        out[x] = a;
+    }
+    true
+}
+
+/// [`add_block`] at 10 bits: the row pass in 32 bits ([`Row10`]), four rows at a time, its
+/// rounding shift saturating into `i16`, where the C's column clip is; from there the 8 bpc
+/// column pass, whose saturation is that clip.
+#[inline(always)]
+fn add_block10<
+    BD: BitDepth,
+    const W: usize,
+    const H: usize,
+    const TYPE: TxfmType,
+    const G: usize,
+>(
+    dst: Rav1dPictureDataComponentOffset,
+    coeff: &mut [i32],
+    eob: i32,
+    px_max: i16,
+) {
+    let (rows, cols) = kinds(TYPE);
+    if TYPE == DCT_DCT && eob == 0 {
+        let dc = coeff[0];
+        coeff[0] = 0;
+        return add_dc::<BD, W, H>(dst, dc, px_max);
+    }
+    let shift = row_shift(W, H);
+    let (cw, ch) = (W.min(32), H.min(32));
+    let coeff = &mut coeff[..cw * ch];
+    let half = W == 32 && H == 32 && eob < 136;
+    let (w, h) = if half { (16, 16) } else { (cw, ch) };
+    let rect = W * 2 == H || H * 2 == W;
+    let mut groups = [[I16x8::splat(0); H]; G];
+    let mut y0 = 0;
+    while y0 < h {
+        let zero = I32x4::splat(0);
+        let (mut lo, mut hi) = ([zero; W], [zero; W]);
+        let set_lo = rows10(coeff, ch, y0, w, rect, rows, half, &mut lo);
+        let set_hi = H > 4 && rows10(coeff, ch, y0 + 4, w, rect, rows, half, &mut hi);
+        if set_lo || set_hi {
+            let mut v = [I16x8::splat(0); W];
+            for x in 0..W {
+                v[x] = match shift {
+                    0 => I32x4::pack(lo[x], hi[x]),
+                    1 => I32x4::pack_round_shr::<1>(lo[x], hi[x]),
+                    _ => I32x4::pack_round_shr::<2>(lo[x], hi[x]),
+                };
+            }
+            scatter(&v, y0, &mut groups);
+        }
+        y0 += 8;
+    }
+    cols_128::<BD, W, H, G>(dst, &mut groups, 0, cols, half, px_max);
 }
 
 /// The passes sixteen lanes at a time: rows where a column holds 16 coefficients, columns where
@@ -1009,4 +1315,17 @@ pub fn add_avx2<
     eob: i32,
 ) {
     add_block::<BD, W, H, TYPE, G, true>(dst, coeff, eob)
+}
+
+#[cfg_attr(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature(enable = "sse4.1")
+)]
+pub fn add10<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType, const G: usize>(
+    dst: Rav1dPictureDataComponentOffset,
+    coeff: &mut [i32],
+    eob: i32,
+    px_max: i16,
+) {
+    add_block10::<BD, W, H, TYPE, G>(dst, coeff, eob, px_max)
 }
