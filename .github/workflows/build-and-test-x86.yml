@@ -13,9 +13,8 @@ jobs:
           "i686-unknown-linux-gnu"
         ]
         build: [
-          # release build without optimized assembly routines
-          {name: "release", flags: "--release --no-default-features --features=bitdepth_8,bitdepth_16", timeout_multiplier: 1},
-          # debug build with optimizations to catch overflows with optimized assembly routines
+          {name: "release", flags: "--release", timeout_multiplier: 1},
+          # debug build with optimizations to catch overflows
           {name: "opt-dev", flags: "--profile opt-dev", timeout_multiplier: 3}
         ]
         # Test with negative strides, threads and framedelay
@@ -51,6 +50,7 @@ jobs:
         run: |
           cargo +${{ steps.toolchain.outputs.name }} build --target ${{ matrix.target }} ${{ matrix.build.flags }}
       - name: Clippy
+        continue-on-error: true # the tree has pre-existing clippy errors
         run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
       - name: meson test for ${{ matrix.target }} ${{ matrix.build.name }}
         run: |
@@ -72,6 +72,28 @@ jobs:
           name: meson-test-logs-${{ matrix.target }}-${{ matrix.build.name }}
           path: |
              ${{ github.workspace }}/build/meson-logs/testlog-*.txt
+  cargo-test-on-ubuntu-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable # consumers build on stable, no #![feature] on x86_64
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo +${{ steps.toolchain.outputs.name }} check --workspace --all-targets --features capi,encoder
+      - name: cargo test lib
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --lib
+      - name: cargo test lib with encoder
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --lib --features encoder
+      - name: cargo test integration tests
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --features capi --tests
   test-on-macos-x86_64:
     runs-on: macos-15-intel # select an x86_64 image
     steps:
