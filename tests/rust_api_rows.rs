@@ -396,14 +396,16 @@ fn drops_data_read_in_place_with_the_decoder() {
         assert!(Arc::try_unwrap(frame).is_ok(), "the data outlived the decoder");
     }
 
-    // Two frames in one buffer: the second waits in the decoder as pending data.
-    let two = Arc::new([frames[0], frames[1]].concat());
+    // A second frame sent before the first one's picture is taken waits as pending data.
+    let (first, second) = (Arc::new(frames[0].to_vec()), Arc::new(frames[1].to_vec()));
     let mut decoder = Open::new(true, false).decoder();
-    let sent = decoder.send_data_owned(Shared(two.clone()), None, None, None);
+    decoder.send_data_owned(Shared(first.clone()), None, None, None).unwrap();
+    let sent = decoder.send_data_owned(Shared(second.clone()), None, None, None);
     assert_eq!(sent, Err(Rav1dError::TryAgain));
-    assert!(Arc::strong_count(&two) > 1);
+    assert!(Arc::strong_count(&second) > 1);
     drop(decoder);
-    assert!(Arc::try_unwrap(two).is_ok(), "the pending data outlived the decoder");
+    assert!(Arc::try_unwrap(first).is_ok(), "the data outlived the decoder");
+    assert!(Arc::try_unwrap(second).is_ok(), "the pending data outlived the decoder");
 
     let broken = Arc::new(vec![0x12, 0x00, 0x0a, 0x0a, 0xff, 0xff, 0xff, 0xff]);
     let mut decoder = Open::new(true, false).decoder();
