@@ -944,7 +944,7 @@ pub fn rav1d_msac_decode_bool(s: &mut MsacContext, f: c_uint) -> bool {
 
 /// Return value is in the range `0..16`.
 #[inline(always)]
-#[cfg_attr(not(any(test, feature = "encoder")), expect(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn rav1d_msac_decode_hi_tok(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
     decode_hi_tok(s, cdf)
 }
