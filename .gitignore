@@ -5,9 +5,7 @@
 tags
 .DS_Store
 *.snap
-/tools/output/xxhash.h
 /.vscode
-compile_commands.json
 
 # Rust
 target/
@@ -16,11 +14,6 @@ target/
 /tests/argon
 /tests/large
 
-/retranspile/
-
 .gdb_history
 .gdbinit
 
-.cache/clangd/index
-
-/benchmarks/

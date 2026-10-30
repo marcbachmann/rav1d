@@ -85,9 +85,12 @@ The following targets are currently supported:
 
 ## Running Tests
 
-Currently we use the original [Meson](https://mesonbuild.com/) test suite for
-testing the Rust port. This means you'll need to [have Meson
-installed](https://mesonbuild.com/Getting-meson.html) to run tests.
+The conformance vectors in `tests/dav1d-test-data` come with
+[Meson](https://mesonbuild.com/) test definitions, and the top-level
+`meson.build` runs them against the `dav1d` binary built by cargo; it compiles
+nothing itself. This means you'll need to [have Meson
+installed](https://mesonbuild.com/Getting-meson.html) to run them. The unit
+tests run with `cargo test`.
 
 To setup and run the tests, do the following:
 

@@ -43,7 +43,7 @@ jobs:
       - name: install prerequisites
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
-          packages: ${{ matrix.packages }} qemu-user-static meson nasm
+          packages: ${{ matrix.packages }} qemu-user-static meson
           version: 3.0 # version of cache to load
       - name: git checkout
         uses: actions/checkout@v4

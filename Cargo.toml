@@ -16,7 +16,7 @@ rust-version = "1.79"
 description = "Rust port of the dav1d AV1 decoder"
 license = "BSD-2-Clause"
 repository = "https://github.com/memorysafety/rav1d"
-exclude = ["*.c", "*.h", "*.in", "meson*", "tests/", "doc/", "package/"]
+exclude = ["*.c", "*.h", "*.in", "meson*", "tests/", "doc/"]
 
 [lib]
 crate-type = ["staticlib", "rlib"]
