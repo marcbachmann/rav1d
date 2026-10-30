@@ -4859,6 +4859,8 @@ fn decode_columns(
         done: Mutex::new((0, false)),
         finished: Condvar::new(),
     });
+    // Before the first column is handed out: a spawner that unwinds after taking one waits for it.
+    let waiting = Waiting(&row);
     for _ in 1..cols {
         let (theirs, contexts) = (Arc::clone(&row), Arc::clone(contexts));
         let thread_data = Arc::clone(&c.tc[0].thread_data);
@@ -4876,7 +4878,6 @@ fn decode_columns(
             break;
         }
     }
-    let waiting = Waiting(&row);
     row.work(t);
     drop(waiting);
     let failed = row.done.lock().1;

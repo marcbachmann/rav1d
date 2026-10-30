@@ -316,25 +316,21 @@ pub unsafe extern "C" fn dav1d_get_frame_delay(s: Option<NonNull<Dav1dSettings>>
 /// take is dropped unrun.
 pub type Spawner = Arc<dyn Fn(Box<dyn FnOnce() + Send>) -> bool + Send + Sync>;
 
-/// Workers handed to `spawner`, up to `most`, until it takes no more: those it took.
-fn spawn_helpers(
-    spawner: &Spawner,
-    ttd: &Arc<TaskThreadData>,
-    most: u16,
-) -> Vec<Arc<Rav1dTaskContextTaskThread>> {
-    let mut taken = Vec::new();
+/// Workers handed to `spawner`, up to `most`, until it takes no more, into `taken`. Each is in
+/// `taken` before it is handed out, so that one a spawner takes and then unwinds is told to return.
+fn spawn_helpers(spawner: &Spawner, ttd: &Arc<TaskThreadData>, most: u16, taken: &mut Starting) {
     for _ in 0..most {
         let thread_data = Arc::new(Rav1dTaskContextTaskThread::new(Arc::clone(ttd)));
         let (helping, theirs) = (Helping::new(ttd), Arc::clone(&thread_data));
+        taken.0.push(thread_data);
         if !spawner(Box::new(move || {
             let _helping = helping;
             rav1d_helper_task(theirs);
         })) {
+            taken.0.pop();
             break;
         }
-        taken.push(thread_data);
     }
-    taken
 }
 
 /// Workers waiting for their context, told to return if it is never made.
@@ -393,10 +389,10 @@ pub(crate) fn rav1d_open(
     };
     // TODO fallible allocation
     let task_thread = Arc::new(ttd);
-    let mut starting = Starting(match spawner {
-        Some(spawner) if n_tc > 1 => spawn_helpers(spawner, &task_thread, n_tc - 1),
-        _ => Vec::new(),
-    });
+    let mut starting = Starting(Vec::new());
+    if let Some(spawner) = spawner.filter(|_| n_tc > 1) {
+        spawn_helpers(spawner, &task_thread, n_tc - 1, &mut starting);
+    }
 
     let fc = (0..n_fc)
         .map(|i| {
@@ -449,11 +445,16 @@ pub(crate) fn rav1d_open(
                 let thread_data = Arc::new(Rav1dTaskContextTaskThread::new(task_thread));
                 let thread_data_copy = Arc::clone(&thread_data);
                 let task = if n_tc > 1 {
+                    // Counted as a helper, so that closing waits until it let go of the context.
+                    let helping = Helping::new(&thread_data.ttd);
                     let handle = thread::Builder::new()
                         // Don't set stack size like `dav1d` does.
                         // See <https://github.com/memorysafety/rav1d/issues/889>.
                         .name(format!("rav1d-worker-{n}"))
-                        .spawn(|| rav1d_worker_task(thread_data_copy))
+                        .spawn(move || {
+                            let _helping = helping;
+                            rav1d_worker_task(thread_data_copy)
+                        })
                         .unwrap();
                     Rav1dContextTaskType::Worker(handle)
                 } else {

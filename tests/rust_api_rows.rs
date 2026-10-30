@@ -755,3 +755,157 @@ fn parses_a_sequence_header_alone() {
     assert_eq!(parse_sequence_header(&[]).err(), Some(Rav1dError::InvalidArgument));
     assert_eq!(parse_sequence_header(&[0x32, 0x00]).err(), Some(Rav1dError::NoEntity));
 }
+
+#[test]
+fn gives_each_picture_the_sequence_header_it_was_decoded_under() {
+    let mut checked = 0;
+    for file in streams().iter().step_by(8) {
+        let data = std::fs::read(file).unwrap();
+        let mut decoder = Decoder::with_settings(&Settings::new()).unwrap();
+        let mut last = None;
+        for frame in ivf_frames(&data) {
+            if let Ok(seq) = parse_sequence_header(frame) {
+                last = Some(seq);
+            }
+            let mut sent = decoder.send_data(frame.into(), None, None, None);
+            while matches!(sent, Err(Rav1dError::TryAgain)) {
+                while let Ok(p) = decoder.get_picture() {
+                    check_sequence_header(&p, last.as_ref(), file, &mut checked);
+                }
+                sent = decoder.send_pending_data();
+            }
+            if sent.is_err() {
+                break;
+            }
+            while let Ok(p) = decoder.get_picture() {
+                check_sequence_header(&p, last.as_ref(), file, &mut checked);
+            }
+        }
+    }
+    assert!(checked > 100, "{checked} pictures");
+}
+
+fn check_sequence_header(p: &Picture, parsed: Option<&rav1d::SequenceHeader>, file: &Path, checked: &mut usize) {
+    let seq = p.sequence_header().expect("a decoded picture has a sequence header");
+    let parsed = parsed.expect("a picture before any sequence header");
+    let f = file.display();
+    assert_eq!((seq.max_width, seq.max_height, seq.hbd), (parsed.max_width, parsed.max_height, parsed.hbd), "{f}");
+    assert_eq!(
+        (seq.pri as u32, seq.trc as u32, seq.mtrx as u32, seq.color_range as u32, seq.layout as u32),
+        (parsed.pri as u32, parsed.trc as u32, parsed.mtrx as u32, parsed.color_range as u32, parsed.layout as u32),
+        "{f}"
+    );
+    assert_eq!(p.matrix_coefficients(), seq.mtrx.into(), "{f}");
+    *checked += 1;
+}
+
+/// Data read in place goes by the time a decoder with threads of its own is dropped, also with a
+/// frame left part decoded in it.
+#[test]
+fn drops_data_read_in_place_with_a_decoder_of_threads() {
+    let data = std::fs::read(intra()).unwrap();
+    let frames = ivf_frames(&data);
+    for threads in [2, 4, 8] {
+        for run in 0..50 {
+            let mut decoder = Open { threads, ..Open::new(true, false) }.decoder();
+            let mut sent = Vec::new();
+            for (i, frame) in frames.iter().take(3).enumerate() {
+                let bytes = match i == 2 && run % 2 == 1 {
+                    true => frame[..frame.len() / 2].to_vec(),
+                    false => frame.to_vec(),
+                };
+                let owner = Arc::new(bytes);
+                sent.push(Arc::clone(&owner));
+                if decoder.send_data_owned(Shared(owner), None, None, None).is_err() {
+                    break;
+                }
+            }
+            drop(decoder);
+            for owner in &sent {
+                assert_eq!(Arc::strong_count(owner), 1, "{threads} threads, run {run}");
+            }
+        }
+    }
+}
+
+/// A rows spawner that unwinds after it took a column: `decode_rows` unwinds only once that column
+/// is decoded, and the column never runs on a decoder that is gone.
+#[test]
+fn waits_for_a_column_its_spawner_took_before_it_unwound() {
+    let (started, threads) = (Arc::new(AtomicUsize::new(0)), Arc::new(std::sync::Mutex::new(Vec::new())));
+    let (s, t) = (Arc::clone(&started), Arc::clone(&threads));
+    let spawner: Spawner = Arc::new(move |work| {
+        let s = Arc::clone(&s);
+        t.lock().unwrap().push(std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            s.fetch_add(1, Ordering::SeqCst);
+            work();
+        }));
+        panic!("the spawner unwinds after it took a column");
+    });
+    let mut unwound = 0;
+    for file in streams() {
+        let mut decoder = Open { rows_spawner: Some(spawner.clone()), ..Open::new(true, true) }.decoder();
+        let data = std::fs::read(&file).unwrap();
+        'frames: for frame in ivf_frames(&data) {
+            if decoder.send_data(frame.into(), None, None, None).is_err() || decoder.rows_picture().is_err() {
+                break;
+            }
+            loop {
+                let taken = threads.lock().unwrap().len();
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode_rows())) {
+                    Err(_) => {
+                        assert_eq!(started.load(Ordering::SeqCst), taken + 1, "{}", file.display());
+                        unwound += 1;
+                        break 'frames;
+                    }
+                    Ok(Ok(rows)) if rows < decoder.rows_picture().map_or(0, |p| p.height()) => {}
+                    Ok(_) => break,
+                }
+            }
+        }
+        drop(decoder);
+        for thread in threads.lock().unwrap().drain(..) {
+            assert!(thread.join().is_ok(), "a column ran on a decoder that is gone: {}", file.display());
+        }
+        if unwound >= 3 {
+            break;
+        }
+    }
+    assert!(unwound > 0, "no stream had a column to hand out");
+}
+
+/// Memory whose `as_mut` or `Drop` panics fails its frame or is leaked, and never aborts.
+#[test]
+fn survives_picture_memory_that_panics() {
+    struct Memory(Aligned, bool);
+    impl AsMut<[u8]> for Memory {
+        fn as_mut(&mut self) -> &mut [u8] {
+            assert!(!self.1, "no bytes for a picture");
+            self.0.as_mut()
+        }
+    }
+    impl Drop for Memory {
+        fn drop(&mut self) {
+            if !self.1 {
+                panic!("the picture's memory panics as it goes");
+            }
+        }
+    }
+    struct Allocator(bool);
+    impl PictureAllocator for Allocator {
+        fn alloc(&self, picture: &PictureParameters) -> Result<PictureBuffer, Rav1dError> {
+            let mut layout = picture.plane_layout().ok_or(Rav1dError::OutOfMemory)?;
+            let memory = vec![0; layout.len + PICTURE_ALIGNMENT];
+            let skip = memory.as_ptr().align_offset(PICTURE_ALIGNMENT);
+            layout.offsets = layout.offsets.map(|o| o + skip);
+            layout.len += skip;
+            Ok(PictureBuffer { memory: Box::new(Memory(Aligned(memory), self.0)), layout })
+        }
+    }
+    let data = std::fs::read(intra()).unwrap();
+    let in_as_mut = decode_data(&data, &Open { allocator: Some(Arc::new(Allocator(true))), ..Open::new(true, false) }, false);
+    assert_eq!(in_as_mut.out.first(), Some(&Err(Rav1dError::OutOfMemory)));
+    let in_drop = decode_data(&data, &Open { allocator: Some(Arc::new(Allocator(false))), ..Open::new(true, false) }, false);
+    assert!(in_drop.out.iter().filter(|o| o.is_ok()).count() > 0, "{:?}", in_drop.out);
+}

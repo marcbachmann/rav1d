@@ -572,6 +572,11 @@ impl Picture {
         self.inner.m.offset
     }
 
+    /// The sequence header the picture was decoded under, which may follow the first one in the data.
+    pub fn sequence_header(&self) -> Option<&SequenceHeader> {
+        self.inner.seq_hdr.as_deref().map(|h| &h.rav1d)
+    }
+
     /// Chromaticity coordinates of the source colour primaries.
     pub fn color_primaries(&self) -> pixel::ColorPrimaries {
         self.inner.seq_hdr.as_ref().unwrap().pri.into()
@@ -585,13 +590,7 @@ impl Picture {
     /// Matrix coefficients used in deriving luma and chroma signals from the
     /// green, blue and red or X, Y and Z primaries.
     pub fn matrix_coefficients(&self) -> pixel::MatrixCoefficients {
-        self.inner
-            .seq_hdr
-            .as_ref()
-            .unwrap()
-            .mtrx
-            .try_into()
-            .unwrap()
+        self.inner.seq_hdr.as_ref().unwrap().mtrx.into()
     }
 
     /// YUV color range.
@@ -800,7 +799,11 @@ unsafe extern "C" fn alloc_picture(
     let memory = NonNull::from(Box::leak(Box::new(memory)));
     // SAFETY: `memory` is not otherwise borrowed until `release_picture` drops it, so what it
     // lends here stays where it is until then.
-    let bytes: &mut [u8] = unsafe { (**memory.as_ptr()).as_mut() };
+    let Ok(bytes) = catch_unwind(AssertUnwindSafe(|| unsafe { (**memory.as_ptr()).as_mut() })) else {
+        // SAFETY: From `Box::leak` above, and nothing it lent is used.
+        drop_memory(unsafe { Box::from_raw(memory.as_ptr()) });
+        return Err::<(), _>(Rav1dError::OutOfMemory).into();
+    };
     match place(&picture, bytes, &layout) {
         Ok((data, stride)) => {
             p.data = data;
@@ -811,7 +814,7 @@ unsafe extern "C" fn alloc_picture(
         }
         Err(e) => {
             // SAFETY: From `Box::leak` above, and `bytes` is not used again.
-            drop(unsafe { Box::from_raw(memory.as_ptr()) });
+            drop_memory(unsafe { Box::from_raw(memory.as_ptr()) });
             Err::<(), _>(e).into()
         }
     }
@@ -825,5 +828,11 @@ unsafe extern "C" fn release_picture(p: *mut Dav1dPicture, _: Option<SendSyncNon
     let p = unsafe { &mut *p };
     let memory = p.allocator_data.take().unwrap().cast::<PictureMemory>();
     // SAFETY: `alloc_picture` leaked this `Box`, and frees it only here.
-    drop(unsafe { memory.into_box() });
+    drop_memory(unsafe { memory.into_box() });
+}
+
+/// Drops a picture's memory; a panic in its `Drop` cannot unwind out of the `extern "C"` callers,
+/// so it is caught there and the rest of the memory is leaked.
+fn drop_memory<T: ?Sized>(memory: Box<T>) {
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(memory)));
 }
