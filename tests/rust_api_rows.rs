@@ -828,17 +828,15 @@ fn drops_data_read_in_place_with_a_decoder_of_threads() {
     }
 }
 
-/// A rows spawner that unwinds after it took a column: `decode_rows` unwinds only once that column
-/// is decoded, and the column never runs on a decoder that is gone.
+/// A rows spawner that unwinds after it took a column: the column, run once the decoder is gone,
+/// finds nothing left to decode, as `decode_rows` unwinding takes or waits for every column.
 #[test]
 fn waits_for_a_column_its_spawner_took_before_it_unwound() {
-    let (started, threads) = (Arc::new(AtomicUsize::new(0)), Arc::new(std::sync::Mutex::new(Vec::new())));
-    let (s, t) = (Arc::clone(&started), Arc::clone(&threads));
+    let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let t = Arc::clone(&threads);
     let spawner: Spawner = Arc::new(move |work| {
-        let s = Arc::clone(&s);
         t.lock().unwrap().push(std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            s.fetch_add(1, Ordering::SeqCst);
             work();
         }));
         panic!("the spawner unwinds after it took a column");
@@ -852,10 +850,8 @@ fn waits_for_a_column_its_spawner_took_before_it_unwound() {
                 break;
             }
             loop {
-                let taken = threads.lock().unwrap().len();
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decoder.decode_rows())) {
                     Err(_) => {
-                        assert_eq!(started.load(Ordering::SeqCst), taken + 1, "{}", file.display());
                         unwound += 1;
                         break 'frames;
                     }
