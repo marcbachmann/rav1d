@@ -23,6 +23,11 @@ pub struct I16x8(imp::Inner);
 #[derive(Clone, Copy)]
 pub struct I32x4(imp::Inner32);
 
+/// Sixteen `u8` lanes, the 8 bpc loop filter's pixels as dav1d's asm holds them; the `_i`
+/// operations read the lanes as `i8`. The sums that outgrow a byte widen to two [`I16x8`].
+#[derive(Clone, Copy)]
+pub struct U8x16(imp::Inner8);
+
 impl I16x8 {
     /// Bytes `b[..4]` zero-extended into the low four lanes.
     #[inline(always)]
@@ -224,6 +229,77 @@ pub fn transpose8x8<V: Lanes>(v: &mut [V; 8]) {
         v[2 * i] = b[i].zip_lo64(b[i + 4]);
         v[2 * i + 1] = b[i].zip_hi64(b[i + 4]);
     }
+}
+
+/// Sixteen rows of eight bytes, each in the low half of `r[i]`, as eight columns of sixteen:
+/// pairs of rows interleaved into 16-bit elements, then [`transpose8x8`]'s rounds on those.
+#[inline(always)]
+pub fn transpose16x8(r: &[U8x16; 16]) -> [U8x16; 8] {
+    let mut a = [r[0]; 8];
+    for (j, a) in a.iter_mut().enumerate() {
+        *a = r[2 * j].zip_lo8(r[2 * j + 1]);
+    }
+    // Four rows each, columns 0-3 then 4-7.
+    let b = [
+        a[0].zip_lo16(a[1]),
+        a[0].zip_hi16(a[1]),
+        a[2].zip_lo16(a[3]),
+        a[2].zip_hi16(a[3]),
+        a[4].zip_lo16(a[5]),
+        a[4].zip_hi16(a[5]),
+        a[6].zip_lo16(a[7]),
+        a[6].zip_hi16(a[7]),
+    ];
+    // Eight rows each, two columns at a time.
+    let c = [
+        b[0].zip_lo32(b[2]),
+        b[0].zip_hi32(b[2]),
+        b[1].zip_lo32(b[3]),
+        b[1].zip_hi32(b[3]),
+        b[4].zip_lo32(b[6]),
+        b[4].zip_hi32(b[6]),
+        b[5].zip_lo32(b[7]),
+        b[5].zip_hi32(b[7]),
+    ];
+    let mut out = a;
+    for i in 0..4 {
+        out[2 * i] = c[i].zip_lo64(c[i + 4]);
+        out[2 * i + 1] = c[i].zip_hi64(c[i + 4]);
+    }
+    out
+}
+
+/// [`transpose16x8`] back: eight columns of sixteen bytes as sixteen rows of eight, rows `2 * i`
+/// and `2 * i + 1` in the halves of `out[i]`. Three rounds, as halves need no fourth.
+#[inline(always)]
+pub fn transpose8x16(c: &[U8x16; 8]) -> [U8x16; 8] {
+    // Rows 0-7 then 8-15, two columns each.
+    let a = [
+        c[0].zip_lo8(c[1]),
+        c[2].zip_lo8(c[3]),
+        c[4].zip_lo8(c[5]),
+        c[6].zip_lo8(c[7]),
+        c[0].zip_hi8(c[1]),
+        c[2].zip_hi8(c[3]),
+        c[4].zip_hi8(c[5]),
+        c[6].zip_hi8(c[7]),
+    ];
+    let mut out = a;
+    for h in 0..2 {
+        let a = &a[4 * h..];
+        // Rows 0-3 then 4-7 of the half, columns 0-3 then 4-7.
+        let b = [
+            a[0].zip_lo16(a[1]),
+            a[0].zip_hi16(a[1]),
+            a[2].zip_lo16(a[3]),
+            a[2].zip_hi16(a[3]),
+        ];
+        out[4 * h] = b[0].zip_lo32(b[2]);
+        out[4 * h + 1] = b[0].zip_hi32(b[2]);
+        out[4 * h + 2] = b[1].zip_lo32(b[3]);
+        out[4 * h + 3] = b[1].zip_hi32(b[3]);
+    }
+    out
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -448,7 +524,7 @@ mod imp {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    use super::{I16x8, I32x4};
+    use super::{I16x8, I32x4, U8x16};
 
     pub type Inner = __m128i;
 
@@ -947,6 +1023,179 @@ mod imp {
             Self(unsafe { _mm_unpackhi_epi64(self.0, o.0) })
         }
     }
+
+    pub type Inner8 = __m128i;
+
+    // SAFETY (every `unsafe` here): SSE4.1 holds where these are compiled in (see the module
+    // docs), and loads and stores go through bounds-checked slices of 16 or 8 bytes.
+    impl U8x16 {
+        #[inline(always)]
+        pub fn load(b: &[u8]) -> Self {
+            Self(unsafe { _mm_loadu_si128(b[..16].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn load_lo(b: &[u8]) -> Self {
+            Self(unsafe { _mm_loadl_epi64(b[..8].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [u8]) {
+            unsafe { _mm_storeu_si128(d[..16].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn store_halves(self, lo: &mut [u8], hi: &mut [u8]) {
+            unsafe {
+                _mm_storel_epi64(lo[..8].as_mut_ptr().cast(), self.0);
+                _mm_storeh_pd(hi[..8].as_mut_ptr().cast(), _mm_castsi128_pd(self.0));
+            }
+        }
+
+        #[inline(always)]
+        pub fn splat(v: u8) -> Self {
+            Self(unsafe { _mm_set1_epi8(v as i8) })
+        }
+
+        #[inline(always)]
+        pub fn abd(self, o: Self) -> Self {
+            Self(unsafe { _mm_or_si128(_mm_subs_epu8(self.0, o.0), _mm_subs_epu8(o.0, self.0)) })
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(unsafe { _mm_max_epu8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            Self(unsafe { _mm_adds_epu8(self.0, o.0) })
+        }
+
+        /// There is no byte shift: a 16-bit one, with the bits from the next byte masked off.
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(unsafe {
+                _mm_and_si128(
+                    _mm_srli_epi16::<N>(self.0),
+                    _mm_set1_epi8((0xff_u8 >> N) as i8),
+                )
+            })
+        }
+
+        #[inline(always)]
+        pub fn le(self, o: Self) -> Self {
+            Self(unsafe { _mm_cmpeq_epi8(_mm_max_epu8(self.0, o.0), o.0) })
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            Self(unsafe { _mm_and_si128(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn andnot(self, o: Self) -> Self {
+            Self(unsafe { _mm_andnot_si128(o.0, self.0) })
+        }
+
+        #[inline(always)]
+        pub fn xor(self, o: Self) -> Self {
+            Self(unsafe { _mm_xor_si128(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(unsafe { _mm_blendv_epi8(b.0, a.0, m.0) })
+        }
+
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { _mm_movemask_epi8(self.0) != 0 }
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(unsafe { _mm_add_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn add_sat_i(self, o: Self) -> Self {
+            Self(unsafe { _mm_adds_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub_sat_i(self, o: Self) -> Self {
+            Self(unsafe { _mm_subs_epi8(self.0, o.0) })
+        }
+
+        /// The unsigned shift, its sign bit extended by `(v ^ m) - m`.
+        #[inline(always)]
+        pub fn shr_i<const N: i32>(self) -> Self {
+            let m = Self::splat(0x80 >> N);
+            Self(unsafe { _mm_sub_epi8(self.shr_u::<N>().xor(m).0, m.0) })
+        }
+
+        #[inline(always)]
+        pub fn widen(self) -> [I16x8; 2] {
+            unsafe {
+                [
+                    I16x8(_mm_cvtepu8_epi16(self.0)),
+                    I16x8(_mm_unpackhi_epi8(self.0, _mm_setzero_si128())),
+                ]
+            }
+        }
+
+        #[inline(always)]
+        pub fn narrow_rshr<const N: i32>(lo: I16x8, hi: I16x8) -> Self {
+            unsafe {
+                let r = _mm_set1_epi16(1 << (N - 1));
+                Self(_mm_packus_epi16(
+                    _mm_srai_epi16::<N>(_mm_add_epi16(lo.0, r)),
+                    _mm_srai_epi16::<N>(_mm_add_epi16(hi.0, r)),
+                ))
+            }
+        }
+
+        #[inline(always)]
+        pub fn zip_lo8(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpacklo_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi8(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpackhi_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpacklo_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpackhi_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpacklo_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpackhi_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpacklo_epi64(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(unsafe { _mm_unpackhi_epi64(self.0, o.0) })
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -954,7 +1203,7 @@ mod imp {
 mod imp {
     use std::arch::aarch64::*;
 
-    use super::{I16x8, I32x4};
+    use super::{I16x8, I32x4, U8x16};
 
     pub type Inner = int16x8_t;
 
@@ -1491,13 +1740,202 @@ mod imp {
             Self(unsafe { vcombine_s16(vget_high_s16(self.0), vget_high_s16(o.0)) })
         }
     }
+
+    pub type Inner8 = uint8x16_t;
+
+    #[inline(always)]
+    fn s8(v: uint8x16_t) -> int8x16_t {
+        unsafe { vreinterpretq_s8_u8(v) }
+    }
+
+    #[inline(always)]
+    fn u8s(v: int8x16_t) -> uint8x16_t {
+        unsafe { vreinterpretq_u8_s8(v) }
+    }
+
+    // SAFETY (every `unsafe` here): NEON is part of aarch64, and loads and stores go through
+    // bounds-checked slices of 16 or 8 bytes.
+    impl U8x16 {
+        #[inline(always)]
+        pub fn load(b: &[u8]) -> Self {
+            Self(unsafe { vld1q_u8(b[..16].as_ptr()) })
+        }
+
+        #[inline(always)]
+        pub fn load_lo(b: &[u8]) -> Self {
+            Self(unsafe { vcombine_u8(vld1_u8(b[..8].as_ptr()), vdup_n_u8(0)) })
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [u8]) {
+            unsafe { vst1q_u8(d[..16].as_mut_ptr(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn store_halves(self, lo: &mut [u8], hi: &mut [u8]) {
+            unsafe {
+                vst1_u8(lo[..8].as_mut_ptr(), vget_low_u8(self.0));
+                vst1_u8(hi[..8].as_mut_ptr(), vget_high_u8(self.0));
+            }
+        }
+
+        #[inline(always)]
+        pub fn splat(v: u8) -> Self {
+            Self(unsafe { vdupq_n_u8(v) })
+        }
+
+        #[inline(always)]
+        pub fn abd(self, o: Self) -> Self {
+            Self(unsafe { vabdq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(unsafe { vmaxq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            Self(unsafe { vqaddq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(unsafe { vshrq_n_u8::<N>(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn le(self, o: Self) -> Self {
+            Self(unsafe { vcleq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            Self(unsafe { vandq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn andnot(self, o: Self) -> Self {
+            Self(unsafe { vbicq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn xor(self, o: Self) -> Self {
+            Self(unsafe { veorq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(unsafe { vbslq_u8(m.0, a.0, b.0) })
+        }
+
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { vmaxvq_u8(self.0) != 0 }
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(unsafe { vaddq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn add_sat_i(self, o: Self) -> Self {
+            Self(u8s(unsafe { vqaddq_s8(s8(self.0), s8(o.0)) }))
+        }
+
+        #[inline(always)]
+        pub fn sub_sat_i(self, o: Self) -> Self {
+            Self(u8s(unsafe { vqsubq_s8(s8(self.0), s8(o.0)) }))
+        }
+
+        #[inline(always)]
+        pub fn shr_i<const N: i32>(self) -> Self {
+            Self(u8s(unsafe { vshrq_n_s8::<N>(s8(self.0)) }))
+        }
+
+        #[inline(always)]
+        pub fn widen(self) -> [I16x8; 2] {
+            unsafe {
+                [
+                    I16x8(s(vmovl_u8(vget_low_u8(self.0)))),
+                    I16x8(s(vmovl_high_u8(self.0))),
+                ]
+            }
+        }
+
+        #[inline(always)]
+        pub fn narrow_rshr<const N: i32>(lo: I16x8, hi: I16x8) -> Self {
+            Self(unsafe { vqrshrun_high_n_s16::<N>(vqrshrun_n_s16::<N>(lo.0), hi.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo8(self, o: Self) -> Self {
+            Self(unsafe { vzip1q_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi8(self, o: Self) -> Self {
+            Self(unsafe { vzip2q_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(unsafe {
+                vreinterpretq_u8_u16(vzip1q_u16(
+                    vreinterpretq_u16_u8(self.0),
+                    vreinterpretq_u16_u8(o.0),
+                ))
+            })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(unsafe {
+                vreinterpretq_u8_u16(vzip2q_u16(
+                    vreinterpretq_u16_u8(self.0),
+                    vreinterpretq_u16_u8(o.0),
+                ))
+            })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(unsafe {
+                vreinterpretq_u8_u32(vzip1q_u32(
+                    vreinterpretq_u32_u8(self.0),
+                    vreinterpretq_u32_u8(o.0),
+                ))
+            })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(unsafe {
+                vreinterpretq_u8_u32(vzip2q_u32(
+                    vreinterpretq_u32_u8(self.0),
+                    vreinterpretq_u32_u8(o.0),
+                ))
+            })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(unsafe { vcombine_u8(vget_low_u8(self.0), vget_low_u8(o.0)) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(unsafe { vcombine_u8(vget_high_u8(self.0), vget_high_u8(o.0)) })
+        }
+    }
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod imp {
     use std::arch::wasm32::*;
 
-    use super::{I16x8, I32x4};
+    use super::{I16x8, I32x4, U8x16};
 
     pub type Inner = v128;
 
@@ -2017,6 +2455,173 @@ mod imp {
             Self(i64x2_shuffle::<1, 3>(self.0, o.0))
         }
     }
+
+    pub type Inner8 = v128;
+
+    impl U8x16 {
+        #[inline(always)]
+        pub fn load(b: &[u8]) -> Self {
+            // SAFETY: 16 bytes are in bounds; the load takes unaligned pointers.
+            Self(unsafe { v128_load(b[..16].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn load_lo(b: &[u8]) -> Self {
+            // SAFETY: 8 bytes are in bounds; the load takes unaligned pointers.
+            Self(unsafe { v128_load64_zero(b[..8].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [u8]) {
+            // SAFETY: 16 bytes are in bounds; the store takes unaligned pointers.
+            unsafe { v128_store(d[..16].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn store_halves(self, lo: &mut [u8], hi: &mut [u8]) {
+            // SAFETY: 8 bytes each are in bounds; the stores take unaligned pointers.
+            unsafe {
+                v128_store64_lane::<0>(self.0, lo[..8].as_mut_ptr().cast());
+                v128_store64_lane::<1>(self.0, hi[..8].as_mut_ptr().cast());
+            }
+        }
+
+        #[inline(always)]
+        pub fn splat(v: u8) -> Self {
+            Self(u8x16_splat(v))
+        }
+
+        #[inline(always)]
+        pub fn abd(self, o: Self) -> Self {
+            Self(v128_or(u8x16_sub_sat(self.0, o.0), u8x16_sub_sat(o.0, self.0)))
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(u8x16_max(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            Self(u8x16_add_sat(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(u8x16_shr(self.0, N as u32))
+        }
+
+        #[inline(always)]
+        pub fn le(self, o: Self) -> Self {
+            Self(u8x16_le(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            Self(v128_and(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn andnot(self, o: Self) -> Self {
+            Self(v128_andnot(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn xor(self, o: Self) -> Self {
+            Self(v128_xor(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(v128_bitselect(a.0, b.0, m.0))
+        }
+
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            v128_any_true(self.0)
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(u8x16_add(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn add_sat_i(self, o: Self) -> Self {
+            Self(i8x16_add_sat(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn sub_sat_i(self, o: Self) -> Self {
+            Self(i8x16_sub_sat(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn shr_i<const N: i32>(self) -> Self {
+            Self(i8x16_shr(self.0, N as u32))
+        }
+
+        #[inline(always)]
+        pub fn widen(self) -> [I16x8; 2] {
+            [
+                I16x8(u16x8_extend_low_u8x16(self.0)),
+                I16x8(u16x8_extend_high_u8x16(self.0)),
+            ]
+        }
+
+        #[inline(always)]
+        pub fn narrow_rshr<const N: i32>(lo: I16x8, hi: I16x8) -> Self {
+            let r = i16x8_splat(1 << (N - 1));
+            Self(u8x16_narrow_i16x8(
+                i16x8_shr(i16x8_add(lo.0, r), N as u32),
+                i16x8_shr(i16x8_add(hi.0, r), N as u32),
+            ))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo8(self, o: Self) -> Self {
+            Self(i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(
+                self.0, o.0,
+            ))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi8(self, o: Self) -> Self {
+            Self(i8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(
+                self.0, o.0,
+            ))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(i32x4_shuffle::<0, 4, 1, 5>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(i32x4_shuffle::<2, 6, 3, 7>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(i64x2_shuffle::<0, 2>(self.0, o.0))
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(i64x2_shuffle::<1, 3>(self.0, o.0))
+        }
+    }
 }
 
 #[cfg(not(any(
@@ -2026,7 +2631,7 @@ mod imp {
     all(target_arch = "wasm32", target_feature = "simd128"),
 )))]
 mod imp {
-    use super::{I16x8, I32x4};
+    use super::{I16x8, I32x4, U8x16};
 
     pub type Inner = [i16; 8];
 
@@ -2481,6 +3086,181 @@ mod imp {
         #[inline(always)]
         pub fn zip_hi64(self, o: Self) -> Self {
             Self(std::array::from_fn(|i| [self.0, o.0][i >> 2][4 + (i & 3)]))
+        }
+    }
+
+    pub type Inner8 = [u8; 16];
+
+    impl U8x16 {
+        #[inline(always)]
+        fn zip(self, o: Self, f: impl Fn(u8, u8) -> u8) -> Self {
+            Self(std::array::from_fn(|i| f(self.0[i], o.0[i])))
+        }
+
+        #[inline(always)]
+        fn zip_i(self, o: Self, f: impl Fn(i8, i8) -> i8) -> Self {
+            self.zip(o, |a, b| f(a as i8, b as i8) as u8)
+        }
+
+        /// The interleave of `E`-byte elements from the low (`hi == 0`) or high half.
+        #[inline(always)]
+        fn interleave<const E: usize>(self, o: Self, hi: usize) -> Self {
+            Self(std::array::from_fn(|i| {
+                let e = i / E;
+                [self.0, o.0][e & 1][(hi * 8 / E + e / 2) * E + i % E]
+            }))
+        }
+
+        #[inline(always)]
+        pub fn load(b: &[u8]) -> Self {
+            Self(b[..16].try_into().unwrap())
+        }
+
+        #[inline(always)]
+        pub fn load_lo(b: &[u8]) -> Self {
+            Self(std::array::from_fn(|i| if i < 8 { b[i] } else { 0 }))
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [u8]) {
+            d[..16].copy_from_slice(&self.0);
+        }
+
+        #[inline(always)]
+        pub fn store_halves(self, lo: &mut [u8], hi: &mut [u8]) {
+            lo[..8].copy_from_slice(&self.0[..8]);
+            hi[..8].copy_from_slice(&self.0[8..]);
+        }
+
+        #[inline(always)]
+        pub fn splat(v: u8) -> Self {
+            Self([v; 16])
+        }
+
+        #[inline(always)]
+        pub fn abd(self, o: Self) -> Self {
+            self.zip(o, u8::abs_diff)
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            self.zip(o, u8::max)
+        }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            self.zip(o, u8::saturating_add)
+        }
+
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(self.0.map(|v| v >> N))
+        }
+
+        #[inline(always)]
+        pub fn le(self, o: Self) -> Self {
+            self.zip(o, |a, b| if a <= b { 0xff } else { 0 })
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            self.zip(o, |a, b| a & b)
+        }
+
+        #[inline(always)]
+        pub fn andnot(self, o: Self) -> Self {
+            self.zip(o, |a, b| a & !b)
+        }
+
+        #[inline(always)]
+        pub fn xor(self, o: Self) -> Self {
+            self.zip(o, |a, b| a ^ b)
+        }
+
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(std::array::from_fn(|i| a.0[i] & m.0[i] | b.0[i] & !m.0[i]))
+        }
+
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            self.0.iter().any(|&m| m != 0)
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            self.zip(o, u8::wrapping_add)
+        }
+
+        #[inline(always)]
+        pub fn add_sat_i(self, o: Self) -> Self {
+            self.zip_i(o, i8::saturating_add)
+        }
+
+        #[inline(always)]
+        pub fn sub_sat_i(self, o: Self) -> Self {
+            self.zip_i(o, i8::saturating_sub)
+        }
+
+        #[inline(always)]
+        pub fn shr_i<const N: i32>(self) -> Self {
+            Self(self.0.map(|v| (v as i8 >> N) as u8))
+        }
+
+        #[inline(always)]
+        pub fn widen(self) -> [I16x8; 2] {
+            [
+                I16x8(std::array::from_fn(|i| self.0[i] as i16)),
+                I16x8(std::array::from_fn(|i| self.0[8 + i] as i16)),
+            ]
+        }
+
+        #[inline(always)]
+        pub fn narrow_rshr<const N: i32>(lo: I16x8, hi: I16x8) -> Self {
+            Self(std::array::from_fn(|i| {
+                let v = [lo.0, hi.0][i >> 3][i & 7] as i32;
+                ((v + (1 << (N - 1))) >> N).clamp(0, 255) as u8
+            }))
+        }
+
+        #[inline(always)]
+        pub fn zip_lo8(self, o: Self) -> Self {
+            self.interleave::<1>(o, 0)
+        }
+
+        #[inline(always)]
+        pub fn zip_hi8(self, o: Self) -> Self {
+            self.interleave::<1>(o, 1)
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            self.interleave::<2>(o, 0)
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            self.interleave::<2>(o, 1)
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            self.interleave::<4>(o, 0)
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            self.interleave::<4>(o, 1)
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            self.interleave::<8>(o, 0)
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            self.interleave::<8>(o, 1)
         }
     }
 }

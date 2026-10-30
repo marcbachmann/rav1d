@@ -276,18 +276,19 @@ fn loop_filter<BD: BitDepth>(
     }
 }
 
-/// [`loop_filter_sb128_rust`] eight lines of an edge at a time for 8 bpc, sixteen on AVX2: two
-/// (four) 4-line segments, each with its own levels and filter length. Every lane takes the
-/// narrow filter and the flat filters the group's longest length needs, and masks per lane pick
-/// its result, as the C's branches would. Along a vertical edge the lines are rows, turned into
-/// lanes by an 8x8 transpose; along a horizontal one they are columns, loaded as they lie.
+/// [`loop_filter_sb128_rust`] sixteen lines of an edge at a time at 8 bpc, in byte lanes as
+/// dav1d's asm (on AVX2 in sixteen-bit lanes), and eight at a time at 10 bits: four (two) 4-line
+/// segments, each with its own levels and filter length. Every lane takes the narrow filter and
+/// the flat filters the group's longest length needs, and masks per lane pick its result, as the
+/// C's branches would. Along a vertical edge the lines are rows, turned into lanes by transposes;
+/// along a horizontal one they are columns, loaded as they lie.
 mod rust_simd {
     use zerocopy::{AsBytes, FromBytes};
 
     use super::*;
     #[cfg(target_arch = "x86_64")]
     use crate::simd128::I16x16;
-    use crate::simd128::{transpose8x8, I16x8, Lanes};
+    use crate::simd128::{transpose16x8, transpose8x16, transpose8x8, I16x8, Lanes, U8x16};
 
     /// A lane type with its pixel loads and stores.
     pub trait Px: Lanes {
@@ -425,10 +426,15 @@ mod rust_simd {
         a.sub(b).abs()
     }
 
-    /// Generated from `loop_filter`'s flat16 branch: one running sum, a term in and out per output.
+    #[inline(always)]
+    fn rshr<V: Lanes, const N: i32>(v: V) -> V {
+        v.add(V::splat(1 << (N - 1))).shr_s::<N>()
+    }
+
+    /// Generated from `loop_filter`'s flat16 branch: one running sum, a term in and out per output;
+    /// `out` holds the sums before [`rshr`]`::<4>`.
     #[inline(always)]
     fn flat16<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
-        let rnd = V::splat(8);
         let mut s = px[0]
             .add(px[0])
             .add(px[0])
@@ -445,35 +451,35 @@ mod rust_simd {
             .add(px[5])
             .add(px[6])
             .add(px[7]);
-        out[1] = s.add(rnd).shr_s::<4>();
+        out[1] = s;
         s = s.sub(px[0]).sub(px[0]).add(px[3]).add(px[8]);
-        out[2] = s.add(rnd).shr_s::<4>();
+        out[2] = s;
         s = s.sub(px[0]).sub(px[1]).add(px[4]).add(px[9]);
-        out[3] = s.add(rnd).shr_s::<4>();
+        out[3] = s;
         s = s.sub(px[0]).sub(px[2]).add(px[5]).add(px[10]);
-        out[4] = s.add(rnd).shr_s::<4>();
+        out[4] = s;
         s = s.sub(px[0]).sub(px[3]).add(px[6]).add(px[11]);
-        out[5] = s.add(rnd).shr_s::<4>();
+        out[5] = s;
         s = s.sub(px[0]).sub(px[4]).add(px[7]).add(px[12]);
-        out[6] = s.add(rnd).shr_s::<4>();
+        out[6] = s;
         s = s.sub(px[0]).sub(px[5]).add(px[8]).add(px[13]);
-        out[7] = s.add(rnd).shr_s::<4>();
+        out[7] = s;
         s = s.sub(px[1]).sub(px[6]).add(px[9]).add(px[13]);
-        out[8] = s.add(rnd).shr_s::<4>();
+        out[8] = s;
         s = s.sub(px[2]).sub(px[7]).add(px[10]).add(px[13]);
-        out[9] = s.add(rnd).shr_s::<4>();
+        out[9] = s;
         s = s.sub(px[3]).sub(px[8]).add(px[11]).add(px[13]);
-        out[10] = s.add(rnd).shr_s::<4>();
+        out[10] = s;
         s = s.sub(px[4]).sub(px[9]).add(px[12]).add(px[13]);
-        out[11] = s.add(rnd).shr_s::<4>();
+        out[11] = s;
         s = s.sub(px[5]).sub(px[10]).add(px[13]).add(px[13]);
-        out[12] = s.add(rnd).shr_s::<4>();
+        out[12] = s;
     }
 
-    /// Generated from `loop_filter`'s flat8 branch: one running sum, a term in and out per output.
+    /// Generated from `loop_filter`'s flat8 branch: one running sum, a term in and out per output;
+    /// `out` holds the sums before [`rshr`]`::<3>`.
     #[inline(always)]
     fn flat8<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
-        let rnd = V::splat(4);
         let mut s = px[3]
             .add(px[3])
             .add(px[3])
@@ -482,23 +488,23 @@ mod rust_simd {
             .add(px[5])
             .add(px[6])
             .add(px[7]);
-        out[4] = s.add(rnd).shr_s::<3>();
+        out[4] = s;
         s = s.sub(px[3]).sub(px[4]).add(px[5]).add(px[8]);
-        out[5] = s.add(rnd).shr_s::<3>();
+        out[5] = s;
         s = s.sub(px[3]).sub(px[5]).add(px[6]).add(px[9]);
-        out[6] = s.add(rnd).shr_s::<3>();
+        out[6] = s;
         s = s.sub(px[3]).sub(px[6]).add(px[7]).add(px[10]);
-        out[7] = s.add(rnd).shr_s::<3>();
+        out[7] = s;
         s = s.sub(px[4]).sub(px[7]).add(px[8]).add(px[10]);
-        out[8] = s.add(rnd).shr_s::<3>();
+        out[8] = s;
         s = s.sub(px[5]).sub(px[8]).add(px[9]).add(px[10]);
-        out[9] = s.add(rnd).shr_s::<3>();
+        out[9] = s;
     }
 
-    /// Generated from `loop_filter`'s flat6 branch: one running sum, a term in and out per output.
+    /// Generated from `loop_filter`'s flat6 branch: one running sum, a term in and out per output;
+    /// `out` holds the sums before [`rshr`]`::<3>`.
     #[inline(always)]
     fn flat6<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
-        let rnd = V::splat(4);
         let mut s = px[4]
             .add(px[4])
             .add(px[4])
@@ -507,13 +513,13 @@ mod rust_simd {
             .add(px[6])
             .add(px[6])
             .add(px[7]);
-        out[5] = s.add(rnd).shr_s::<3>();
+        out[5] = s;
         s = s.sub(px[4]).sub(px[4]).add(px[7]).add(px[8]);
-        out[6] = s.add(rnd).shr_s::<3>();
+        out[6] = s;
         s = s.sub(px[4]).sub(px[5]).add(px[8]).add(px[9]);
-        out[7] = s.add(rnd).shr_s::<3>();
+        out[7] = s;
         s = s.sub(px[5]).sub(px[6]).add(px[9]).add(px[9]);
-        out[8] = s.add(rnd).shr_s::<3>();
+        out[8] = s;
     }
 
     /// `px[7 + k]` is the pixel at offset `k` across the edge, `-7..=6`; `MAX` is the group's
@@ -580,7 +586,7 @@ mod rust_simd {
             }
             flat6(&orig, &mut out);
             for k in 5..=8 {
-                px[k] = V::select(m, out[k], px[k]);
+                px[k] = V::select(m, rshr::<V, 3>(out[k]), px[k]);
             }
             return;
         }
@@ -590,7 +596,7 @@ mod rust_simd {
         }
         flat8(&orig, &mut out);
         for k in 4..=9 {
-            px[k] = V::select(m, out[k], px[k]);
+            px[k] = V::select(m, rshr::<V, 3>(out[k]), px[k]);
         }
         if MAX == 16 && flat_in.and(p.wd16).any() {
             let flat_out = le(absdiff(p6, p0), p.flat)
@@ -602,8 +608,119 @@ mod rust_simd {
             let m = flat_in.and(flat_out).and(p.wd16);
             flat16(&orig, &mut out);
             for k in 1..=12 {
-                px[k] = V::select(m, out[k], px[k]);
+                px[k] = V::select(m, rshr::<V, 4>(out[k]), px[k]);
             }
+        }
+    }
+
+    /// [`Params`] at 8 bpc, on byte lanes.
+    #[derive(Clone, Copy)]
+    struct Params8 {
+        e: U8x16,
+        i: U8x16,
+        h: U8x16,
+        active: U8x16,
+        /// Filter length above 4, and 16. A group whose longest filter is 8 or 16 is luma, where
+        /// no length is 6, so above 4 is also above 6.
+        gt4: U8x16,
+        wd16: U8x16,
+    }
+
+    /// [`filter`] at 8 bpc as dav1d's asm: masks and the narrow filter on bytes, the latter
+    /// signed after `^ 0x80` with saturating adds, which clip as `iclip_diff` and the pixel clip
+    /// do; only the flat filters' sums widen to 16 bits.
+    #[inline(always)]
+    fn filter8<const MAX: usize>(px: &mut [U8x16; 14], p: Params8) {
+        let orig = *px;
+        let [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6] = orig;
+        let one = U8x16::splat(1);
+        let (dp1, dq1) = (p1.abd(p0), q1.abd(q0));
+        let inner = dp1.max(dq1);
+        let mut m = inner;
+        if MAX > 4 {
+            let mut c = p2.abd(p1).max(q2.abd(q1));
+            if MAX > 6 {
+                c = c.max(p3.abd(p2)).max(q3.abd(q2));
+            }
+            m = m.max(c.and(p.gt4));
+        }
+        let d = p0.abd(q0);
+        let fm = m
+            .le(p.i)
+            .and(d.add_sat(d).add_sat(p1.abd(q1).shr_u::<1>()).le(p.e))
+            .and(p.active);
+        if !fm.any() {
+            return;
+        }
+
+        // A sum of the same sign saturated step by step clips as the sum would: once past a
+        // bound, every further step stays past it.
+        let nhev = inner.le(p.h);
+        let x80 = U8x16::splat(0x80);
+        let (sp1, sp0, sq0, sq1) = (p1.xor(x80), p0.xor(x80), q0.xor(x80), q1.xor(x80));
+        let f = sp1.sub_sat_i(sq1).andnot(nhev);
+        let d = sq0.sub_sat_i(sp0);
+        let f = f.add_sat_i(d).add_sat_i(d).add_sat_i(d);
+        let f1 = f.add_sat_i(U8x16::splat(4)).shr_i::<3>();
+        let f2 = f.add_sat_i(U8x16::splat(3)).shr_i::<3>();
+        let f3 = f1.add(one).shr_i::<1>().and(nhev);
+        px[5] = U8x16::select(fm, sp1.add_sat_i(f3).xor(x80), p1);
+        px[6] = U8x16::select(fm, sp0.add_sat_i(f2).xor(x80), p0);
+        px[7] = U8x16::select(fm, sq0.sub_sat_i(f1).xor(x80), q0);
+        px[8] = U8x16::select(fm, sq1.sub_sat_i(f3).xor(x80), q1);
+
+        if MAX < 6 {
+            return;
+        }
+        let mut flat = p2.abd(p0).max(dp1).max(dq1).max(q2.abd(q0));
+        if MAX > 6 {
+            flat = flat.max(p3.abd(p0)).max(q3.abd(q0));
+        }
+        let mut m8 = flat.le(one).and(fm).and(p.gt4);
+        if !m8.any() {
+            return;
+        }
+        let (mut lo, mut hi) = ([I16x8::splat(0); 14], [I16x8::splat(0); 14]);
+        for k in 0..14 {
+            [lo[k], hi[k]] = orig[k].widen();
+        }
+        let (mut out_lo, mut out_hi) = (lo, hi);
+        if MAX == 6 {
+            flat6(&lo, &mut out_lo);
+            flat6(&hi, &mut out_hi);
+            for k in 5..=8 {
+                let v = U8x16::narrow_rshr::<3>(out_lo[k], out_hi[k]);
+                px[k] = U8x16::select(m8, v, px[k]);
+            }
+            return;
+        }
+        if MAX == 16 && m8.and(p.wd16).any() {
+            let flat_out = p6
+                .abd(p0)
+                .max(p5.abd(p0))
+                .max(p4.abd(p0))
+                .max(q4.abd(q0))
+                .max(q5.abd(q0))
+                .max(q6.abd(q0));
+            let m16 = flat_out.le(one).and(m8).and(p.wd16);
+            m8 = m8.andnot(m16);
+            if m16.any() {
+                flat16(&lo, &mut out_lo);
+                flat16(&hi, &mut out_hi);
+                for k in 1..=12 {
+                    let v = U8x16::narrow_rshr::<4>(out_lo[k], out_hi[k]);
+                    px[k] = U8x16::select(m16, v, px[k]);
+                }
+            }
+            if !m8.any() {
+                return;
+            }
+        }
+        flat8(&lo, &mut out_lo);
+        flat8(&hi, &mut out_hi);
+        for k in 4..=9 {
+            let v = U8x16::narrow_rshr::<3>(out_lo[k], out_hi[k]);
+            px[k] = U8x16::select(m8, v, px[k]);
         }
     }
 
@@ -735,10 +852,214 @@ mod rust_simd {
         }
     }
 
-    /// [`loop_filter_sb128_rust`] a group of `V::N / 4` segments at a time; a group running past
+    /// [`group_v`] at 8 bpc: sixteen columns as bytes.
+    #[inline(always)]
+    fn group_v8<BD: BitDepth, const MAX: usize>(dst: Rav1dPictureDataComponentOffset, p: Params8) {
+        let stride = dst.pixel_stride::<BD>();
+        let r = reach(MAX) as isize;
+        let mut px = [U8x16::splat(0); 14];
+        for k in -r..r {
+            let row = (dst + k * stride).slice::<BD>(16);
+            px[(7 + k) as usize] = U8x16::load(row.as_bytes());
+        }
+        filter8::<MAX>(&mut px, p);
+        let w = if MAX == 16 { 6 } else { r.min(3) };
+        for k in -w..w {
+            let mut row = (dst + k * stride).slice_mut::<BD>(16);
+            px[(7 + k) as usize].store(row.as_bytes_mut());
+        }
+    }
+
+    /// [`group_h`] at 8 bpc: sixteen rows of 8 (or 16) bytes turned into columns.
+    #[inline(always)]
+    fn group_h8<BD: BitDepth, const MAX: usize>(dst: Rav1dPictureDataComponentOffset, p: Params8) {
+        let stride = dst.pixel_stride::<BD>();
+        let (n, x0) = if MAX == 16 { (2, -8) } else { (1, -4) };
+        let mut win = [[U8x16::splat(0); 8]; 2];
+        for (w, win) in win.iter_mut().enumerate().take(n) {
+            let x = x0 + 8 * w as isize;
+            let mut rows = [U8x16::splat(0); 16];
+            for (r, v) in rows.iter_mut().enumerate() {
+                let row = (dst + (r as isize * stride + x)).slice::<BD>(8);
+                *v = U8x16::load_lo(row.as_bytes());
+            }
+            *win = transpose16x8(&rows);
+        }
+        let mut px = [U8x16::splat(0); 14];
+        for k in -7..7isize {
+            let c = (k - x0) as usize;
+            if c < 8 * n {
+                px[(7 + k) as usize] = win[c / 8][c % 8];
+            }
+        }
+        filter8::<MAX>(&mut px, p);
+        for k in -7..7isize {
+            let c = (k - x0) as usize;
+            if c < 8 * n {
+                win[c / 8][c % 8] = px[(7 + k) as usize];
+            }
+        }
+        for (w, win) in win.iter().enumerate().take(n) {
+            let x = x0 + 8 * w as isize;
+            for (i, v) in transpose8x16(win).into_iter().enumerate() {
+                let mut a = (dst + ((2 * i) as isize * stride + x)).slice_mut::<BD>(8);
+                let mut b = (dst + ((2 * i + 1) as isize * stride + x)).slice_mut::<BD>(8);
+                v.store_halves(a.as_bytes_mut(), b.as_bytes_mut());
+            }
+        }
+    }
+
+    /// A segment's thresholds and filter length.
+    #[derive(Clone, Copy)]
+    struct Seg {
+        e: u8,
+        i: u8,
+        h: u8,
+        wd: usize,
+    }
+
+    /// A lane type filtering a group of `N / 4` segments, `max` the longest filter among them.
+    trait Groups {
+        const N: usize;
+        fn group<BD: BitDepth>(
+            dst: Rav1dPictureDataComponentOffset,
+            hv: super::HV,
+            segs: &[Option<Seg>; 4],
+            max: usize,
+            bd: BD,
+        );
+    }
+
+    #[inline(always)]
+    fn group16<BD: BitDepth, V: Px>(
+        dst: Rav1dPictureDataComponentOffset,
+        hv: super::HV,
+        segs: &[Option<Seg>; 4],
+        max: usize,
+        bd: BD,
+    ) {
+        let s = bd.bitdepth() - 8;
+        let mut lanes = [[0i16; 16]; 7];
+        for (j, seg) in segs.iter().enumerate().take(V::N / 4) {
+            let Some(Seg { e, i, h, wd }) = *seg else {
+                continue;
+            };
+            let flags = [
+                (e as i16) << s,
+                (i as i16) << s,
+                (h as i16) << s,
+                -1,
+                -((wd > 4) as i16),
+                -((wd > 6) as i16),
+                -((wd == 16) as i16),
+            ];
+            for (lane, flag) in lanes.iter_mut().zip(flags) {
+                lane[4 * j..4 * j + 4].fill(flag);
+            }
+        }
+        let [e, i, h, active, gt4, gt6, wd16] = lanes.map(|l| V::load_i16(&l));
+        let p = Params {
+            e,
+            i,
+            h,
+            active,
+            gt4,
+            gt6,
+            wd16,
+            flat: V::splat(1 << s),
+            lo: V::splat(-128 << s),
+            hi: V::splat((128 << s) - 1),
+            max: V::splat(bd.bitdepth_max().as_::<i16>()),
+        };
+        match (hv, max) {
+            (super::HV::H, 4) => group_h::<BD, V, 4>(dst, p),
+            (super::HV::H, 6) => group_h::<BD, V, 6>(dst, p),
+            (super::HV::H, 8) => group_h::<BD, V, 8>(dst, p),
+            (super::HV::H, _) => group_h::<BD, V, 16>(dst, p),
+            (super::HV::V, 4) => group_v::<BD, V, 4>(dst, p),
+            (super::HV::V, 6) => group_v::<BD, V, 6>(dst, p),
+            (super::HV::V, 8) => group_v::<BD, V, 8>(dst, p),
+            (super::HV::V, _) => group_v::<BD, V, 16>(dst, p),
+        }
+    }
+
+    impl Groups for I16x8 {
+        const N: usize = 8;
+        #[inline(always)]
+        fn group<BD: BitDepth>(
+            dst: Rav1dPictureDataComponentOffset,
+            hv: super::HV,
+            segs: &[Option<Seg>; 4],
+            max: usize,
+            bd: BD,
+        ) {
+            group16::<BD, Self>(dst, hv, segs, max, bd)
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl Groups for I16x16 {
+        const N: usize = 16;
+        #[inline(always)]
+        fn group<BD: BitDepth>(
+            dst: Rav1dPictureDataComponentOffset,
+            hv: super::HV,
+            segs: &[Option<Seg>; 4],
+            max: usize,
+            bd: BD,
+        ) {
+            group16::<BD, Self>(dst, hv, segs, max, bd)
+        }
+    }
+
+    /// 8 bpc only.
+    impl Groups for U8x16 {
+        const N: usize = 16;
+        #[inline(always)]
+        fn group<BD: BitDepth>(
+            dst: Rav1dPictureDataComponentOffset,
+            hv: super::HV,
+            segs: &[Option<Seg>; 4],
+            max: usize,
+            _: BD,
+        ) {
+            debug_assert_eq!(BD::BITDEPTH, 8);
+            let mut lanes = [[0u8; 16]; 6];
+            for (j, seg) in segs.iter().enumerate() {
+                let Some(Seg { e, i, h, wd }) = *seg else {
+                    continue;
+                };
+                let flags = [e, i, h, !0, 0u8.wrapping_sub((wd > 4) as u8), 0u8.wrapping_sub((wd == 16) as u8)];
+                for (lane, flag) in lanes.iter_mut().zip(flags) {
+                    lane[4 * j..4 * j + 4].fill(flag);
+                }
+            }
+            let [e, i, h, active, gt4, wd16] = lanes.map(|l| U8x16::load(&l));
+            let p = Params8 {
+                e,
+                i,
+                h,
+                active,
+                gt4,
+                wd16,
+            };
+            match (hv, max) {
+                (super::HV::H, 4) => group_h8::<BD, 4>(dst, p),
+                (super::HV::H, 6) => group_h8::<BD, 6>(dst, p),
+                (super::HV::H, 8) => group_h8::<BD, 8>(dst, p),
+                (super::HV::H, _) => group_h8::<BD, 16>(dst, p),
+                (super::HV::V, 4) => group_v8::<BD, 4>(dst, p),
+                (super::HV::V, 6) => group_v8::<BD, 6>(dst, p),
+                (super::HV::V, 8) => group_v8::<BD, 8>(dst, p),
+                (super::HV::V, _) => group_v8::<BD, 16>(dst, p),
+            }
+        }
+    }
+
+    /// [`loop_filter_sb128_rust`] a group of `G::N / 4` segments at a time; a group running past
     /// the `wh` segments inside the picture takes the scalar filter, so no lane reads beyond it.
     #[inline(always)]
-    fn filter_sb<BD: BitDepth, V: Px, const HV: usize, const YUV: usize>(
+    fn filter_sb<BD: BitDepth, G: Groups, const HV: usize, const YUV: usize>(
         mut dst: Rav1dPictureDataComponentOffset,
         vmask: &[u32; 3],
         mut lvl: WithOffset<&DisjointMut<AlignedVec2<u8>>>,
@@ -762,13 +1083,12 @@ mod rust_simd {
             super::YUV::Y => vmask[0] | vmask[1] | vmask[2],
             super::YUV::UV => vmask[0] | vmask[1],
         };
-        let segs = V::N / 4;
+        let n = G::N / 4;
         let mut s0 = 0;
         while s0 < 32 && vm >> s0 != 0 {
-            let mut lanes = [[0i16; 16]; 7];
-            let mut scalar = [None; 4];
+            let mut segs = [None; 4];
             let mut max = 0;
-            for j in 0..segs {
+            for (j, seg) in segs.iter_mut().enumerate().take(n) {
                 let xy = 1u32 << (s0 + j);
                 if vm & xy == 0 {
                     continue;
@@ -799,62 +1119,26 @@ mod rust_simd {
                     super::YUV::UV => 4 + 2 * idx,
                 };
                 let (e, i, h) = (lut.0.e[l as usize], lut.0.i[l as usize], l >> 4);
-                scalar[j] = Some((e, i, h, wd));
+                *seg = Some(Seg { e, i, h, wd });
                 max = max.max(wd);
-                let s = bd.bitdepth() - 8;
-                let flags = [
-                    (e as i16) << s,
-                    (i as i16) << s,
-                    (h as i16) << s,
-                    -1,
-                    -((wd > 4) as i16),
-                    -((wd > 6) as i16),
-                    -((wd == 16) as i16),
-                ];
-                for (lane, flag) in lanes.iter_mut().zip(flags) {
-                    lane[4 * j..4 * j + 4].fill(flag);
-                }
             }
-            if max != 0 && s0 + segs > wh as usize {
-                for (j, seg) in scalar.into_iter().enumerate() {
-                    if let Some((e, i, h, wd)) = seg {
+            if max != 0 && s0 + n > wh as usize {
+                for (j, seg) in segs.into_iter().enumerate() {
+                    if let Some(Seg { e, i, h, wd }) = seg {
                         let dst = dst + (4 * j) as isize * stridea;
                         loop_filter(dst, e, i, h, stridea, strideb, wd as c_int, bd);
                     }
                 }
             } else if max != 0 {
-                let [e, i, h, active, gt4, gt6, wd16] = lanes.map(|l| V::load_i16(&l));
-                let s = bd.bitdepth() - 8;
-                let p = Params {
-                    e,
-                    i,
-                    h,
-                    active,
-                    gt4,
-                    gt6,
-                    wd16,
-                    flat: V::splat(1 << s),
-                    lo: V::splat(-128 << s),
-                    hi: V::splat((128 << s) - 1),
-                    max: V::splat(bd.bitdepth_max().as_::<i16>()),
-                };
-                match (matches!(hv, super::HV::H), max) {
-                    (true, 4) => group_h::<BD, V, 4>(dst, p),
-                    (true, 6) => group_h::<BD, V, 6>(dst, p),
-                    (true, 8) => group_h::<BD, V, 8>(dst, p),
-                    (true, _) => group_h::<BD, V, 16>(dst, p),
-                    (false, 4) => group_v::<BD, V, 4>(dst, p),
-                    (false, 6) => group_v::<BD, V, 6>(dst, p),
-                    (false, 8) => group_v::<BD, V, 8>(dst, p),
-                    (false, _) => group_v::<BD, V, 16>(dst, p),
-                }
+                G::group(dst, hv, &segs, max, bd);
             }
-            s0 += segs;
-            dst += (4 * segs) as isize * stridea;
-            lvl += 4 * segs * b4_stridea;
+            s0 += n;
+            dst += (4 * n) as isize * stridea;
+            lvl += 4 * n * b4_stridea;
         }
     }
 
+    /// Bytes at 8 bpc, sixteen-bit lanes above.
     #[cfg_attr(
         any(target_arch = "x86", target_arch = "x86_64"),
         target_feature(enable = "sse4.1")
@@ -868,6 +1152,9 @@ mod rust_simd {
         wh: c_int,
         bd: BD,
     ) {
+        if BD::BITDEPTH == 8 {
+            return filter_sb::<BD, U8x16, { HV }, { YUV }>(dst, vmask, lvl, b4_stride, lut, wh, bd);
+        }
         filter_sb::<BD, I16x8, { HV }, { YUV }>(dst, vmask, lvl, b4_stride, lut, wh, bd)
     }
 
