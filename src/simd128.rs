@@ -543,7 +543,12 @@ impl U8x16 {
         rows_fit(b.len(), start, stride, 4 * v.len(), 4);
         let p = b.as_mut_ptr().wrapping_add(start);
         for (i, v) in v.iter().enumerate() {
-            let x = [v.lane32::<0>(), v.lane32::<1>(), v.lane32::<2>(), v.lane32::<3>()];
+            let x = [
+                v.lane32::<0>(),
+                v.lane32::<1>(),
+                v.lane32::<2>(),
+                v.lane32::<3>(),
+            ];
             for (k, x) in x.into_iter().enumerate() {
                 let r = (4 * i + k) as isize;
                 // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
@@ -563,7 +568,9 @@ impl U8x16 {
             for (i, v) in v.iter_mut().enumerate() {
                 let r = i as isize;
                 // SAFETY: Rows `r` and `r + 8` lie in `b`, checked by `rows_fit`.
-                *v = unsafe { Self::load_halves_at(p.offset(r * stride), p.offset((r + 8) * stride)) };
+                *v = unsafe {
+                    Self::load_halves_at(p.offset(r * stride), p.offset((r + 8) * stride))
+                };
             }
             imp::transpose_8x16b(v)
         }
@@ -1796,7 +1803,10 @@ mod imp {
                     lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), k));
                     hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), k));
                 }
-                Self(_mm_packs_epi32(_mm_srai_epi32::<S>(lo), _mm_srai_epi32::<S>(hi)))
+                Self(_mm_packs_epi32(
+                    _mm_srai_epi32::<S>(lo),
+                    _mm_srai_epi32::<S>(hi),
+                ))
             }
         }
 
@@ -1885,6 +1895,75 @@ mod imp {
         #[inline(always)]
         pub fn zip_hi64(self, o: Self) -> Self {
             Self(unsafe { _mm_unpackhi_epi64(self.0, o.0) })
+        }
+    }
+
+    // SAFETY (every `unsafe` here): SSE4.1 holds where these are compiled in.
+    impl I16x8 {
+        /// The sums of adjacent lanes, of `self` then of `o`.
+        #[inline(always)]
+        pub fn hadd(self, o: Self) -> Self {
+            Self(unsafe { _mm_hadd_epi16(self.0, o.0) })
+        }
+
+        /// Bytes `B..B + 16` of `self` then `o`: `o`'s lanes shifted in from the top.
+        #[inline(always)]
+        pub fn ext<const B: i32>(self, o: Self) -> Self {
+            Self(unsafe { _mm_alignr_epi8::<B>(o.0, self.0) })
+        }
+
+    }
+
+    impl I32x4 {
+        /// The sums of adjacent lanes, of `self` then of `o`.
+        #[inline(always)]
+        pub fn hadd(self, o: Self) -> Self {
+            Self(unsafe { _mm_hadd_epi32(self.0, o.0) })
+        }
+    }
+
+    impl I16x8 {
+        /// `self² + o²` in 32 bits, low four lanes then high four.
+        #[inline(always)]
+        pub fn sq2(self, o: Self) -> [I32x4; 2] {
+            unsafe {
+                let (lo, hi) = (_mm_unpacklo_epi16(self.0, o.0), _mm_unpackhi_epi16(self.0, o.0));
+                [I32x4(_mm_madd_epi16(lo, lo)), I32x4(_mm_madd_epi16(hi, hi))]
+            }
+        }
+
+        /// `acc + self² + o²`.
+        #[inline(always)]
+        pub fn sq2_acc(self, o: Self, acc: [I32x4; 2]) -> [I32x4; 2] {
+            let s = self.sq2(o);
+            [acc[0].add(s[0]), acc[1].add(s[1])]
+        }
+
+        /// `acc + self²`.
+        #[inline(always)]
+        pub fn sq_acc(self, acc: [I32x4; 2]) -> [I32x4; 2] {
+            let s = self.mul_wide(self);
+            [acc[0].add(s[0]), acc[1].add(s[1])]
+        }
+
+        /// `(v[0] * k[0] + .. + v[N - 1] * k[N - 1] + rnd) >> S` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd_n<const S: i32, const N: usize>(v: [Self; N], k: [i16; N], rnd: i32) -> Self {
+            unsafe {
+                let mut lo = _mm_set1_epi32(rnd);
+                let mut hi = lo;
+                for i in (0..N).step_by(2) {
+                    let (b, kb) = if i + 1 < N {
+                        (v[i + 1].0, k[i + 1])
+                    } else {
+                        (_mm_setzero_si128(), 0)
+                    };
+                    let k = _mm_set1_epi32(k[i] as u16 as i32 | (kb as i32) << 16);
+                    lo = _mm_add_epi32(lo, _mm_madd_epi16(_mm_unpacklo_epi16(v[i].0, b), k));
+                    hi = _mm_add_epi32(hi, _mm_madd_epi16(_mm_unpackhi_epi16(v[i].0, b), k));
+                }
+                Self(_mm_packs_epi32(_mm_srai_epi32::<S>(lo), _mm_srai_epi32::<S>(hi)))
+            }
         }
     }
 
@@ -2730,6 +2809,76 @@ mod imp {
                 vtrn2q_u16(h(t5), h(t7)),
             ];
             c.map(|c| U8x16(vreinterpretq_u8_u16(c)))
+        }
+    }
+
+    // SAFETY (every `unsafe` here): NEON is part of aarch64.
+    impl I16x8 {
+        /// The sums of adjacent lanes, of `self` then of `o`.
+        #[inline(always)]
+        pub fn hadd(self, o: Self) -> Self {
+            Self(unsafe { vpaddq_s16(self.0, o.0) })
+        }
+
+        /// Bytes `B..B + 16` of `self` then `o`: `o`'s lanes shifted in from the top.
+        #[inline(always)]
+        pub fn ext<const B: i32>(self, o: Self) -> Self {
+            unsafe {
+                let (a, b) = (vreinterpretq_s8_s16(self.0), vreinterpretq_s8_s16(o.0));
+                Self(vreinterpretq_s16_s8(vextq_s8::<B>(a, b)))
+            }
+        }
+
+    }
+
+    impl I32x4 {
+        /// The sums of adjacent lanes, of `self` then of `o`.
+        #[inline(always)]
+        pub fn hadd(self, o: Self) -> Self {
+            Self(unsafe { vpaddq_s32(self.0, o.0) })
+        }
+    }
+
+    impl I16x8 {
+        /// `self² + o²` in 32 bits, low four lanes then high four.
+        #[inline(always)]
+        pub fn sq2(self, o: Self) -> [I32x4; 2] {
+            let s = self.mul_wide(self);
+            o.sq_acc(s)
+        }
+
+        /// `acc + self² + o²`.
+        #[inline(always)]
+        pub fn sq2_acc(self, o: Self, acc: [I32x4; 2]) -> [I32x4; 2] {
+            o.sq_acc(self.sq_acc(acc))
+        }
+
+        /// `acc + self²`.
+        #[inline(always)]
+        pub fn sq_acc(self, acc: [I32x4; 2]) -> [I32x4; 2] {
+            unsafe {
+                [
+                    I32x4(vmlal_s16(acc[0].0, vget_low_s16(self.0), vget_low_s16(self.0))),
+                    I32x4(vmlal_high_s16(acc[1].0, self.0, self.0)),
+                ]
+            }
+        }
+
+        /// `(v[0] * k[0] + .. + v[N - 1] * k[N - 1] + rnd) >> S` in 32 bits, saturated to `i16`.
+        #[inline(always)]
+        pub fn madd_n<const S: i32, const N: usize>(v: [Self; N], k: [i16; N], rnd: i32) -> Self {
+            unsafe {
+                let mut lo = vdupq_n_s32(rnd);
+                let mut hi = lo;
+                for i in 0..N {
+                    lo = vmlal_n_s16(lo, vget_low_s16(v[i].0), k[i]);
+                    hi = vmlal_high_n_s16(hi, v[i].0, k[i]);
+                }
+                Self(vcombine_s16(
+                    vqmovn_s32(vshrq_n_s32::<S>(lo)),
+                    vqmovn_s32(vshrq_n_s32::<S>(hi)),
+                ))
+            }
         }
     }
 
@@ -4564,5 +4713,83 @@ mod imp {
         pub fn zip_hi64(self, o: Self) -> Self {
             self.interleave::<8>(o, 1)
         }
+    }
+}
+
+/// The lane-reordering operations by value on wasm and the scalar stand-in.
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+impl I16x8 {
+    /// `self² + o²` in 32 bits, low four lanes then high four.
+    #[inline(always)]
+    pub fn sq2(self, o: Self) -> [I32x4; 2] {
+        o.sq_acc(self.mul_wide(self))
+    }
+
+    /// `acc + self² + o²`.
+    #[inline(always)]
+    pub fn sq2_acc(self, o: Self, acc: [I32x4; 2]) -> [I32x4; 2] {
+        o.sq_acc(self.sq_acc(acc))
+    }
+
+    /// `acc + self²`.
+    #[inline(always)]
+    pub fn sq_acc(self, acc: [I32x4; 2]) -> [I32x4; 2] {
+        let s = self.mul_wide(self);
+        [acc[0].add(s[0]), acc[1].add(s[1])]
+    }
+
+    /// The sums of adjacent lanes, of `self` then of `o`.
+    #[inline(always)]
+    pub fn hadd(self, o: Self) -> Self {
+        let (a, b) = (self.to_array(), o.to_array());
+        let v: [i16; 8] = std::array::from_fn(|i| {
+            let s = if i < 4 { &a } else { &b };
+            s[2 * (i & 3)].wrapping_add(s[2 * (i & 3) + 1])
+        });
+        Self::load(&v)
+    }
+
+    /// Bytes `B..B + 16` of `self` then `o`: `o`'s lanes shifted in from the top.
+    #[inline(always)]
+    pub fn ext<const B: i32>(self, o: Self) -> Self {
+        let (a, b) = (self.to_array(), o.to_array());
+        let v: [i16; 8] = std::array::from_fn(|i| {
+            let k = i + B as usize / 2;
+            if k < 8 {
+                a[k]
+            } else {
+                b[k - 8]
+            }
+        });
+        Self::load(&v)
+    }
+
+    /// `(v[0] * k[0] + .. + v[N - 1] * k[N - 1] + rnd) >> S` in 32 bits, saturated to `i16`.
+    #[inline(always)]
+    pub fn madd_n<const S: i32, const N: usize>(v: [Self; N], k: [i16; N], rnd: i32) -> Self {
+        let v = v.map(|v| v.to_array());
+        let r: [i16; 8] = std::array::from_fn(|i| {
+            let s = (0..N).fold(rnd, |s, j| s.wrapping_add(v[j][i] as i32 * k[j] as i32));
+            (s >> S).clamp(i16::MIN as i32, i16::MAX as i32) as i16
+        });
+        Self::load(&r)
+    }
+
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+impl I32x4 {
+    /// The sums of adjacent lanes, of `self` then of `o`.
+    #[inline(always)]
+    pub fn hadd(self, o: Self) -> Self {
+        let (mut a, mut b) = ([0; 4], [0; 4]);
+        self.store(&mut a);
+        o.store(&mut b);
+        Self::load(&[
+            a[0].wrapping_add(a[1]),
+            a[2].wrapping_add(a[3]),
+            b[0].wrapping_add(b[1]),
+            b[2].wrapping_add(b[3]),
+        ])
     }
 }

@@ -512,7 +512,7 @@ mod rust_simd {
 
     use super::*;
     use crate::include::common::bitdepth::BPC;
-    use crate::simd128::I16x8;
+    use crate::simd128::{I16x8, I32x4};
 
     /// `constrain` as dav1d's asm has it: padding (`i16::MIN`) gives a difference of at least
     /// 28673 as `u16`, which every shift leaves above the threshold, so it adds nothing.
@@ -749,6 +749,149 @@ mod rust_simd {
         }
     }
 
+    /// `v` shifted up by `8 - B / 2` lanes into the 16 of `acc`, for `B` in `2..16`.
+    #[inline(always)]
+    fn shift_add<const B: i32>(acc: &mut [I16x8; 2], v: I16x8) {
+        let z = I16x8::splat(0);
+        acc[0] = acc[0].add(z.ext::<B>(v));
+        acc[1] = acc[1].add(v.ext::<B>(z));
+    }
+
+    /// `v` shifted up by `n` lanes into the 16 of `acc`.
+    macro_rules! shift_add {
+        ($acc:expr, $v:expr, 0) => {
+            $acc[0] = $acc[0].add($v)
+        };
+        ($acc:expr, $v:expr, $n:literal) => {
+            shift_add::<{ 16 - 2 * $n }>(&mut $acc, $v)
+        };
+    }
+
+    /// `Σ v[i]² * w[i]` over 16 lanes, in four `i32` lanes.
+    #[inline(always)]
+    fn weighted_squares(v: [I16x8; 2], w: &[i32; 16]) -> I32x4 {
+        let (lo, hi) = (v[0].mul_wide(v[0]), v[1].mul_wide(v[1]));
+        let w = |i: usize| I32x4::load(&w[4 * i..]);
+        lo[0]
+            .mul(w(0))
+            .add(lo[1].mul(w(1)))
+            .add(hi[0].mul(w(2)))
+            .add(hi[1].mul(w(3)))
+    }
+
+    /// [`super::cdef_find_dir_rust`] on the rows of the block as `i16` lanes: each line sum
+    /// is a row shifted along by its offset into 16 lanes. The diagonals and lines that run
+    /// against the rows are summed in reverse order, which leaves their costs unchanged.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn find_dir<BD: BitDepth, const SHIFT: i32>(
+        img: Rav1dPictureDataComponentOffset,
+        variance: &mut c_uint,
+    ) -> c_int {
+        const DIAG: [i32; 16] = [
+            840, 420, 280, 210, 168, 140, 120, 105, 120, 140, 168, 210, 280, 420, 840, 0,
+        ];
+        const ALT: [i32; 16] = [
+            420, 210, 140, 105, 105, 105, 105, 105, 140, 210, 420, 0, 0, 0, 0, 0,
+        ];
+        let stride = img.pixel_stride::<BD>();
+        let c128 = I16x8::splat(128);
+        let r: [I16x8; 8] = std::array::from_fn(|y| {
+            let row = &*(img + y as isize * stride).slice::<BD>(8);
+            let b = row.as_bytes();
+            let v = match BD::BPC {
+                BPC::BPC8 => I16x8::from_u8x8(b),
+                BPC::BPC16 => I16x8::from_bytes(b).shr_s::<SHIFT>(),
+            };
+            v.sub(c128)
+        });
+        let z = I16x8::splat(0);
+        let mut diag = [[z; 2]; 2];
+        let mut alt = [[z; 2]; 4];
+        let mut hv1 = z;
+        macro_rules! row {
+            ($y:tt, $ry:tt, $k:tt, $rk:tt) => {{
+                let v = r[$y];
+                let pairs = v.hadd(z);
+                hv1 = hv1.add(v);
+                shift_add!(diag[0], v, $y);
+                shift_add!(diag[1], v, $ry);
+                shift_add!(alt[0], pairs, $y);
+                shift_add!(alt[1], pairs, $ry);
+                if $y % 2 == 1 {
+                    let v = r[$y - 1].add(v);
+                    shift_add!(alt[2], v, $rk);
+                    shift_add!(alt[3], v, $k);
+                }
+            }};
+        }
+        row!(0, 7, 0, 3);
+        row!(1, 6, 0, 3);
+        row!(2, 5, 1, 2);
+        row!(3, 4, 1, 2);
+        row!(4, 3, 2, 1);
+        row!(5, 2, 2, 1);
+        row!(6, 1, 3, 0);
+        row!(7, 0, 3, 0);
+        let hv0 = r[0]
+            .hadd(r[1])
+            .hadd(r[2].hadd(r[3]))
+            .hadd(r[4].hadd(r[5]).hadd(r[6].hadd(r[7])));
+        let hv = |v: I16x8| {
+            let s = v.mul_wide(v);
+            s[0].add(s[1]).mul(I32x4::splat(105))
+        };
+        let c = [
+            weighted_squares(diag[0], &DIAG),
+            weighted_squares(alt[0], &ALT),
+            hv(hv0),
+            weighted_squares(alt[1], &ALT),
+            weighted_squares(diag[1], &DIAG),
+            weighted_squares(alt[2], &ALT),
+            hv(hv1),
+            weighted_squares(alt[3], &ALT),
+        ];
+        let mut cost = [0; 8];
+        c[0].hadd(c[1]).hadd(c[2].hadd(c[3])).store(&mut cost[..4]);
+        c[4].hadd(c[5]).hadd(c[6].hadd(c[7])).store(&mut cost[4..]);
+        let cost = cost.map(|c| c as c_uint);
+        let mut best_dir = 0;
+        let mut best_cost = cost[0];
+        for n in 1..8 {
+            if cost[n] > best_cost {
+                best_cost = cost[n];
+                best_dir = n;
+            }
+        }
+        *variance = (best_cost - cost[best_dir ^ 4]) >> 10;
+        best_dir as c_int
+    }
+
+    /// # Safety
+    ///
+    /// Must be called by [`cdef_dir::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn cdef_find_dir_simd_erased<BD: BitDepth>(
+        _img_ptr: *const DynPixel,
+        _stride: ptrdiff_t,
+        variance: &mut c_uint,
+        bitdepth_max: c_int,
+        img: FFISafeRav1dPictureDataComponentOffset,
+    ) -> c_int {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `cdef_dir::Fn::call`.
+        let img = unsafe { FFISafe::from_with_offset(img) };
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe {
+            match (BD::BPC, BD::from_c(bitdepth_max).bitdepth()) {
+                (BPC::BPC16, 12) => find_dir::<BD, 4>(img, variance),
+                _ => find_dir::<BD, 2>(img, variance),
+            }
+        }
+    }
+
     /// # Safety
     ///
     /// Must be called by [`cdef::Fn::call`], on x86 once the CPU flags hold SSE41.
@@ -813,9 +956,10 @@ impl Rav1dCdefDSPContext {
         }
     }
 
+
     #[inline(always)]
     const fn init<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
-        use self::rust_simd::cdef_filter_block_simd_erased;
+        use self::rust_simd::{cdef_filter_block_simd_erased, cdef_find_dir_simd_erased};
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if !flags.contains(CpuFlags::SSE41) {
@@ -826,6 +970,7 @@ impl Rav1dCdefDSPContext {
             return self;
         }
 
+        self.dir = cdef_dir::Fn::new(cdef_find_dir_simd_erased::<BD>);
         self.fb = [
             cdef::Fn::new(cdef_filter_block_simd_erased::<BD, 8, 8>),
             cdef::Fn::new(cdef_filter_block_simd_erased::<BD, 4, 8>),
@@ -1029,6 +1174,102 @@ mod tests {
     #[test]
     fn rust_simd_matches_scalar_12bpc() {
         matches_scalar::<BitDepth16>(12);
+    }
+
+    /// The direction and variance of blocks of noise, flat blocks at both ends of the range,
+    /// full-range noise and stripes along each direction.
+    fn dir_matches_scalar<BD: BitDepth>(bits: u8) {
+        let bd = BD::from_c((1 << bits) - 1);
+        let max = (1 << bits) - 1;
+        let mut rng = Rng(0x243f_6a88_85a3_08d3);
+        let dsps = contexts::<BD>();
+        for round in 0..20000 {
+            let fx = Fixture::<BD>::new(&mut rng, bits);
+            let kind = round % 8;
+            let (dx, dy) = (rng.next() % 5, rng.next() % 5);
+            for y in 0..8 {
+                let row = (BY + y) * STRIDE + BX;
+                let mut row = fx.comp.slice_mut::<BD, _>((row.., ..8));
+                for x in 0..8 {
+                    let v = match kind {
+                        0 => 0,
+                        1 => max,
+                        2 => (rng.next() % (max as u32 + 1)) as c_int,
+                        3 => [0, max][(x * dx as usize + y * dy as usize) / 3 % 2],
+                        _ => continue,
+                    };
+                    row[x] = v.as_::<BD::Pixel>();
+                }
+            }
+            let dst = WithOffset {
+                data: &fx.comp,
+                offset: BY * STRIDE + BX,
+            };
+            let mut want_var = 0;
+            let want = dsps[0].1.dir.call::<BD>(dst, &mut want_var, bd);
+            for (name, dsp) in &dsps[1..] {
+                let mut var = 0;
+                let dir = dsp.dir.call::<BD>(dst, &mut var, bd);
+                assert_eq!(
+                    (dir, var),
+                    (want, want_var),
+                    "{name} direction differs from scalar at {bits} bits, round {round}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dir_rust_simd_and_asm_match_scalar_8bpc() {
+        dir_matches_scalar::<BitDepth8>(8);
+    }
+
+    #[test]
+    fn dir_rust_simd_and_asm_match_scalar_10bpc() {
+        dir_matches_scalar::<BitDepth16>(10);
+    }
+
+    #[test]
+    fn dir_rust_simd_and_asm_match_scalar_12bpc() {
+        dir_matches_scalar::<BitDepth16>(12);
+    }
+
+    /// ns per direction search, scalar, Rust and asm.
+    fn time_dir<BD: BitDepth>(bits: u8) {
+        let bd = BD::from_c((1 << bits) - 1);
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let fxs: Vec<_> = (0..64)
+            .map(|_| Fixture::<BD>::new(&mut rng, bits))
+            .collect();
+        let mut line = format!("{bits:2}-bit dir:");
+        for (name, dsp) in contexts::<BD>() {
+            let mut best = f64::MAX;
+            for _ in 0..20 {
+                let start = Instant::now();
+                for _ in 0..50 {
+                    for fx in &fxs {
+                        let dst = WithOffset {
+                            data: &fx.comp,
+                            offset: BY * STRIDE + BX,
+                        };
+                        let mut var = 0;
+                        black_box(black_box(&dsp).dir.call::<BD>(dst, &mut var, bd));
+                        black_box(var);
+                    }
+                }
+                best = best.min(start.elapsed().as_secs_f64() * 1e9 / (50 * fxs.len()) as f64);
+            }
+            line += &format!("  {name} {best:6.1} ns");
+        }
+        println!("{line}");
+    }
+
+    #[test]
+    #[ignore]
+    fn time_dir_all() {
+        time_dir::<BitDepth8>(8);
+        time_dir::<BitDepth16>(10);
+        time_dir::<BitDepth16>(12);
     }
 
     /// `cargo test --release --lib cdef::tests::time -- --ignored --nocapture`

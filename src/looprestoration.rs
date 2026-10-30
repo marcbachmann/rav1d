@@ -956,6 +956,16 @@ mod rust_simd {
         I16x8::from_u8x8(&row[i..])
     }
 
+    /// Eight pixels of `row` from `i` as `i16` lanes.
+    #[inline(always)]
+    fn pxl<BD: BitDepth>(row: &[BD::Pixel], i: usize) -> I16x8 {
+        let b = row[i..i + 8].as_bytes();
+        match BD::BPC {
+            BPC::BPC8 => I16x8::from_u8x8(b),
+            BPC::BPC16 => I16x8::from_bytes(b),
+        }
+    }
+
     /// One row of 7 taps across, clipped to 13 bits, 8 pixels at a time with 32-bit sums. The
     /// 128 of the centre tap is folded back into its coefficient.
     #[inline(always)]
@@ -1042,7 +1052,9 @@ mod rust_simd {
         let stride = p.pixel_stride::<BD>();
         let store = |j: usize, row: &[u8]| {
             let p = p + j as isize * stride;
-            p.slice_mut::<BD>(row.len()).as_bytes_mut().copy_from_slice(row);
+            p.slice_mut::<BD>(row.len())
+                .as_bytes_mut()
+                .copy_from_slice(row);
         };
         wiener(store, tmp, w, h, &params.filter);
     }
@@ -1079,6 +1091,145 @@ mod rust_simd {
         unsafe { wiener_128::<BD>(p, left, lpf, lpf_off, w, h, params, edges) }
     }
 
+    /// One row of 7 symmetric taps across at 16 bpc, or of the 5 inner ones with `FIVE`: `k` on
+    /// the pairs `p0 + p6`, `p1 + p5`, `p2 + p4` and on `p3`, rounded off by `S` bits.
+    /// Saturating to `i16` is the clip below 2^15.
+    #[inline(always)]
+    fn wiener_h16<const S: i32, const FIVE: bool>(
+        out: &mut [i16; MAX_W + 8],
+        t: &[u16],
+        w: usize,
+        k: [i16; 4],
+        rnd: i32,
+    ) {
+        let zero = I16x8::splat(0);
+        for i in (0..w).step_by(8) {
+            let t = &t[i..i + 14];
+            let p = |d: usize| I16x8::load_u16(&t[d..]);
+            let (p15, p24, p3) = (p(1).add(p(5)), p(2).add(p(4)), p(3));
+            let v = if FIVE {
+                I16x8::madd_n::<S, 3>([p15, p24, p3], [k[1], k[2], k[3]], rnd)
+            } else {
+                I16x8::madd_n::<S, 4>([p(0).add(p(6)), p15, p24, p3], k, rnd)
+            };
+            v.max(zero).store(&mut out[i..]);
+        }
+    }
+
+    /// [`wiener`] at 10 or 12 bits, rounding off `SH` bits across and `SV` down; with `FIVE`
+    /// the outer taps are 0 and the rows only they read are skipped.
+    #[inline(always)]
+    fn wiener16<const SH: i32, const SV: i32, const FIVE: bool>(
+        mut dst: impl FnMut(usize, &[u16]),
+        tmp: &[u16; ROWS * REST_UNIT_STRIDE],
+        w: usize,
+        h: usize,
+        filter: &[[i16; 8]; 2],
+        bitdepth: i32,
+    ) {
+        let kh = [filter[0][0], filter[0][1], filter[0][2], filter[0][3]];
+        let rnd_h = (1 << bitdepth + 6) + (1 << SH - 1);
+        let kv = filter[1];
+        let rnd_v = (1 << SV - 1) - (1 << bitdepth + SV - 1);
+        let zero = I16x8::splat(0);
+        let max = I16x8::splat((1 << bitdepth) - 1);
+        let mut ring = [[0i16; MAX_W + 8]; 8];
+        let t = |r: usize| &tmp[r * REST_UNIT_STRIDE..][..REST_UNIT_STRIDE];
+        let (first, ahead) = if FIVE { (1, 5) } else { (0, 6) };
+        for r in first..ahead {
+            wiener_h16::<SH, FIVE>(&mut ring[r], t(r), w, kh, rnd_h);
+        }
+        let mut row = [0u16; MAX_W + 8];
+        for j in 0..h {
+            wiener_h16::<SH, FIVE>(&mut ring[(j + ahead) % 8], t(j + ahead), w, kh, rnd_h);
+            for i in (0..w).step_by(8) {
+                let r = |k: usize| I16x8::load(&ring[(j + k) % 8][i..]);
+                let v = if FIVE {
+                    I16x8::madd_n::<SV, 5>(
+                        [r(1), r(2), r(3), r(4), r(5)],
+                        [kv[1], kv[2], kv[3], kv[4], kv[5]],
+                        rnd_v,
+                    )
+                } else {
+                    I16x8::madd_n::<SV, 7>(
+                        [r(0), r(1), r(2), r(3), r(4), r(5), r(6)],
+                        [kv[0], kv[1], kv[2], kv[3], kv[4], kv[5], kv[6]],
+                        rnd_v,
+                    )
+                };
+                v.max(zero).min(max).store_u16(&mut row[i..]);
+            }
+            dst(j, &row[..w]);
+        }
+    }
+
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn wiener16_128<BD: BitDepth>(
+        p: Rav1dPictureDataComponentOffset,
+        left: &[LeftPixelRow<BD::Pixel>],
+        lpf: &DisjointMut<AlignedVec64<u8>>,
+        lpf_off: isize,
+        w: usize,
+        h: usize,
+        params: &LooprestorationParams,
+        edges: LrEdgeFlags,
+        bitdepth: u8,
+    ) {
+        let mut tmp = [0.into(); ROWS * REST_UNIT_STRIDE];
+        padding::<BD>(&mut tmp, p, left, lpf, lpf_off, w, h, edges);
+        let tmp = u16::slice_from(tmp.as_bytes()).unwrap().try_into().unwrap();
+        let stride = p.pixel_stride::<BD>();
+        let store = |j: usize, row: &[u16]| {
+            let p = p + j as isize * stride;
+            p.slice_mut::<BD>(row.len())
+                .as_bytes_mut()
+                .copy_from_slice(row.as_bytes());
+        };
+        let f = &params.filter;
+        match (bitdepth, f[0][0] == 0 && f[1][0] == 0) {
+            (10, false) => wiener16::<3, 11, false>(store, tmp, w, h, f, 10),
+            (10, true) => wiener16::<3, 11, true>(store, tmp, w, h, f, 10),
+            (_, false) => wiener16::<5, 9, false>(store, tmp, w, h, f, 12),
+            (_, true) => wiener16::<5, 9, true>(store, tmp, w, h, f, 12),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Must be called by [`loop_restoration_filter::Fn::call`] at 16 bpc, on x86 once the CPU
+    /// flags hold SSE41.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn wiener16_erased<BD: BitDepth>(
+        _p_ptr: *mut DynPixel,
+        _stride: ptrdiff_t,
+        left: *const LeftPixelRow<DynPixel>,
+        lpf_ptr: *const DynPixel,
+        w: c_int,
+        h: c_int,
+        params: &LooprestorationParams,
+        edges: LrEdgeFlags,
+        bitdepth_max: c_int,
+        p: FFISafeRav1dPictureDataComponentOffset,
+        lpf: *const FFISafe<DisjointMut<AlignedVec64<u8>>>,
+    ) {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `loop_restoration_filter::Fn::call`.
+        let p = unsafe { FFISafe::from_with_offset(p) };
+        let left = left.cast();
+        // SAFETY: Was passed as `FFISafe::new(_)` in `loop_restoration_filter::Fn::call`.
+        let lpf = unsafe { FFISafe::get(lpf) };
+        let lpf_off = reconstruct_lpf_offset::<BD>(lpf, lpf_ptr.cast());
+        let (w, h) = (w as usize, h as usize);
+        // SAFETY: Length sliced in `loop_restoration_filter::Fn::call`.
+        let left = unsafe { slice::from_raw_parts(left, h) };
+        let bitdepth = BD::from_c(bitdepth_max).bitdepth();
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe { wiener16_128::<BD>(p, left, lpf, lpf_off, w, h, params, edges, bitdepth) }
+    }
+
     /// Columns of the self-guided rows: the unit's `w` and one either side, in whole vectors.
     const SGR_W: usize = MAX_W + 16;
 
@@ -1112,26 +1263,40 @@ mod rust_simd {
     /// The 3- and 5-wide sums across one padded row, of pixels and of their squares, centred on
     /// columns -1..=w at index 0.
     #[inline(always)]
-    fn sgr_box_h<const THREE: bool, const FIVE: bool>(
+    fn sgr_box_h<BD: BitDepth, const THREE: bool, const FIVE: bool>(
         h3: &mut SgrRow,
         h5: &mut SgrRow,
-        t: &[u8],
+        t: &[BD::Pixel],
         w: usize,
     ) {
+        // Squares of bytes fit 16 bits unsigned; those of 10 and 12 bits do not.
+        let sq2 = |a: I16x8, b: I16x8, acc: Option<[I32x4; 2]>| match (BD::BPC, acc) {
+            (BPC::BPC8, None) => a.mul(a).addl_u(b.mul(b)),
+            (BPC::BPC8, Some(acc)) => b.mul(b).addw_u(a.mul(a).addw_u(acc)),
+            (BPC::BPC16, None) => a.sq2(b),
+            (BPC::BPC16, Some(acc)) => a.sq2_acc(b, acc),
+        };
+        let sq1 = |a: I16x8, acc: [I32x4; 2]| match BD::BPC {
+            BPC::BPC8 => a.mul(a).addw_u(acc),
+            BPC::BPC16 => a.sq_acc(acc),
+        };
         for i in (0..w + 2).step_by(8) {
-            let (v1, v2, v3) = (px8(t, i + 1), px8(t, i + 2), px8(t, i + 3));
+            let (v1, v2, v3) = (
+                pxl::<BD>(t, i + 1),
+                pxl::<BD>(t, i + 2),
+                pxl::<BD>(t, i + 3),
+            );
             let s = v1.add(v2).add(v3);
-            // Squares of bytes fit 16 bits unsigned.
-            let q = v3.mul(v3).addw_u(v1.mul(v1).addl_u(v2.mul(v2)));
+            let q = sq1(v3, sq2(v1, v2, None));
             if THREE {
                 s.store(&mut h3.s[i..]);
                 q[0].store(&mut h3.q[i..]);
                 q[1].store(&mut h3.q[i + 4..]);
             }
             if FIVE {
-                let (v0, v4) = (px8(t, i), px8(t, i + 4));
+                let (v0, v4) = (pxl::<BD>(t, i), pxl::<BD>(t, i + 4));
                 let s = s.add(v0).add(v4);
-                let q = v4.mul(v4).addw_u(v0.mul(v0).addw_u(q));
+                let q = sq2(v0, v4, Some(q));
                 s.store(&mut h5.s[i..]);
                 q[0].store(&mut h5.q[i..]);
                 q[1].store(&mut h5.q[i + 4..]);
@@ -1156,13 +1321,45 @@ mod rust_simd {
     /// `a` and `b` of one row from the box sums of the rows `h` (3 or 5 of them), with `b` as
     /// `x` and `a` as `x * sum * one_by_x` the way [`selfguided_filter`] inverts them.
     #[inline(always)]
-    fn sgr_ab<const N: i32>(ab: &mut SgrRow, h: &[&SgrRow], w: usize, s: u32) {
+    fn sgr_ab<BD: BitDepth, const N: i32, const SB: i32, const SA: i32>(
+        ab: &mut SgrRow,
+        h: &[&SgrRow],
+        w: usize,
+        s: u32,
+    ) {
         let one_by_x = I32x4::splat(if N == 25 { 164 } else { 455 });
         let n = I32x4::splat(N);
         let s = I32x4::splat(s as i32);
         let zero = I32x4::splat(0);
         let (rnd19, rnd11) = (I32x4::splat(1 << 19), I32x4::splat(1 << 11));
         for i in (0..w + 2).step_by(8) {
+            if BD::BPC == BPC::BPC16 {
+                // The sums of 10 and 12 bits outgrow 16 bits: they are scaled to 8 bits for
+                // `z` and kept whole for `a`.
+                let mut sum = ld16(&h[0].s, i).addl_u(ld16(&h[1].s, i));
+                let mut sq = add32(ld32(&h[0].q, i), ld32(&h[1].q, i));
+                for r in &h[2..] {
+                    sum = ld16(&r.s, i).addw_u(sum);
+                    sq = add32(sq, ld32(&r.q, i));
+                }
+                let b = I32x4::pack(sum[0].round_shr::<SB>(), sum[1].round_shr::<SB>());
+                let b2 = b.mul_wide(b);
+                let mut z = [zero; 2];
+                for k in 0..2 {
+                    let a = sq[k].round_shr::<SA>();
+                    let p = a.mul(n).sub(b2[k]).max(zero);
+                    z[k] = p.mul(s).add(rnd19).shr_u::<20>();
+                }
+                let x = x_by_x(I32x4::pack(z[0], z[1]));
+                let xk = x.mul_wide(I16x8::splat(if N == 25 { 164 } else { 455 }));
+                for k in 0..2 {
+                    // Below 2^32 as unsigned: 255 * 25 * 4095 * 164 at most.
+                    let a = xk[k].mul(sum[k]).add(rnd11).shr_u::<12>();
+                    a.store(&mut ab.q[i + 4 * k..]);
+                }
+                x.store(&mut ab.s[i..]);
+                continue;
+            }
             let mut sum = I16x8::load(&h[0].s[i..]);
             let mut sq = ld32(&h[0].q, i);
             for r in &h[1..] {
@@ -1228,26 +1425,25 @@ mod rust_simd {
     #[inline(always)]
     fn sgr_f<const S: i32>(nb: I16x8, na: [I32x4; 2], px: I16x8) -> [I32x4; 2] {
         let bx = nb.mul_wide(px);
-        let rnd = I32x4::splat(1 << (S - 1));
         [
-            na[0].sub(bx[0]).add(rnd).shr_s::<S>(),
-            na[1].sub(bx[1]).add(rnd).shr_s::<S>(),
+            na[0].sub(bx[0]).round_shr::<S>(),
+            na[1].sub(bx[1]).round_shr::<S>(),
         ]
     }
 
     /// Box sums across the padded rows `*next..=to`, into their slots of the ring.
     #[inline(always)]
-    fn sgr_fill<const THREE: bool, const FIVE: bool>(
+    fn sgr_fill<BD: BitDepth, const THREE: bool, const FIVE: bool>(
         h3: &mut [SgrRow; 5],
         h5: &mut [SgrRow; 5],
-        tmp: &[u8],
+        tmp: &[BD::Pixel],
         w: usize,
         next: &mut isize,
         to: isize,
     ) {
         while *next <= to {
             let y = (*next + 3) as usize;
-            sgr_box_h::<THREE, FIVE>(
+            sgr_box_h::<BD, THREE, FIVE>(
                 &mut h3[y % 5],
                 &mut h5[y % 5],
                 &tmp[y * REST_UNIT_STRIDE..],
@@ -1262,9 +1458,9 @@ mod rust_simd {
     /// summed across into the weighted rows of another, then each output row from those
     /// weighted onto its pixels.
     #[inline(always)]
-    fn sgr<const THREE: bool, const FIVE: bool>(
-        mut dst: impl FnMut(usize, &[u8]),
-        tmp: &[u8],
+    fn sgr<BD: BitDepth, const THREE: bool, const FIVE: bool, const SB: i32, const SA: i32>(
+        mut dst: impl FnMut(usize, &[BD::Pixel]),
+        tmp: &[BD::Pixel],
         w: usize,
         h: usize,
         sgr: &LooprestorationParamsSgr,
@@ -1282,15 +1478,15 @@ mod rust_simd {
         let ab3_at = |y: isize| (y + 1) as usize % 3;
         let ab5_at = |y: isize| (y + 1) as usize / 2 % 2;
         if THREE {
-            sgr_fill::<THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, 1);
+            sgr_fill::<BD, THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, 1);
             for y in -1..=0 {
                 let rows = [&h3[slot(y - 1)], &h3[slot(y)], &h3[slot(y + 1)]];
-                sgr_ab::<9>(&mut ab3, &rows, w, sgr.s1);
+                sgr_ab::<BD, 9, SB, SA>(&mut ab3, &rows, w, sgr.s1);
                 sgr_h3(&mut g3[ab3_at(y)], &mut h3m[ab3_at(y)], &ab3, w);
             }
         }
         if FIVE {
-            sgr_fill::<THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, 1);
+            sgr_fill::<BD, THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, 1);
             let rows = [
                 &h5[slot(-3)],
                 &h5[slot(-2)],
@@ -1298,22 +1494,22 @@ mod rust_simd {
                 &h5[slot(0)],
                 &h5[slot(1)],
             ];
-            sgr_ab::<25>(&mut ab5, &rows, w, sgr.s0);
+            sgr_ab::<BD, 25, SB, SA>(&mut ab5, &rows, w, sgr.s0);
             sgr_h65(&mut f5[ab5_at(-1)], &ab5, w);
         }
         let (w0, w1) = (I32x4::splat(sgr.w0 as i32), I32x4::splat(sgr.w1 as i32));
-        let rnd = I32x4::splat(1 << 10);
-        let mut row = [0u8; MAX_W + 8];
+        let max = I16x8::splat((1 << (8 + SB)) - 1);
+        let mut row = [0.into(); MAX_W + 8];
         for j in 0..h {
             let y = j as isize;
             if THREE {
-                sgr_fill::<THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, y + 2);
+                sgr_fill::<BD, THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, y + 2);
                 let rows = [&h3[slot(y)], &h3[slot(y + 1)], &h3[slot(y + 2)]];
-                sgr_ab::<9>(&mut ab3, &rows, w, sgr.s1);
+                sgr_ab::<BD, 9, SB, SA>(&mut ab3, &rows, w, sgr.s1);
                 sgr_h3(&mut g3[ab3_at(y + 1)], &mut h3m[ab3_at(y + 1)], &ab3, w);
             }
             if FIVE && j % 2 == 0 {
-                sgr_fill::<THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, y + 3);
+                sgr_fill::<BD, THREE, FIVE>(&mut h3, &mut h5, tmp, w, &mut next, y + 3);
                 let rows = [
                     &h5[slot(y - 1)],
                     &h5[slot(y)],
@@ -1321,12 +1517,12 @@ mod rust_simd {
                     &h5[slot(y + 2)],
                     &h5[slot(y + 3)],
                 ];
-                sgr_ab::<25>(&mut ab5, &rows, w, sgr.s0);
+                sgr_ab::<BD, 25, SB, SA>(&mut ab5, &rows, w, sgr.s0);
                 sgr_h65(&mut f5[ab5_at(y + 1)], &ab5, w);
             }
             let src = &tmp[(y + 3) as usize * REST_UNIT_STRIDE..];
             for x in (0..w).step_by(8) {
-                let px = px8(src, x + 3);
+                let px = pxl::<BD>(src, x + 3);
                 let mut v = [I32x4::splat(0); 2];
                 if FIVE {
                     let d = if j % 2 == 0 {
@@ -1349,8 +1545,15 @@ mod rust_simd {
                     let d = sgr_f::<9>(nb, na, px);
                     v = add32(v, [d[0].mul(w1), d[1].mul(w1)]);
                 }
-                let v = I32x4::pack(v[0].add(rnd).shr_s::<11>(), v[1].add(rnd).shr_s::<11>());
-                row[x..x + 8].copy_from_slice(&px.add(v).pack_u8());
+                let v = I32x4::pack(v[0].round_shr::<11>(), v[1].round_shr::<11>());
+                let out = AsBytes::as_bytes_mut(&mut row[x..x + 8]);
+                match BD::BPC {
+                    BPC::BPC8 => out.copy_from_slice(&px.add(v).pack_u8()),
+                    BPC::BPC16 => {
+                        let v = px.add_sat(v).max(I16x8::splat(0)).min(max);
+                        out.copy_from_slice(v.to_array().as_bytes())
+                    }
+                }
             }
             dst(j, &row[..w]);
         }
@@ -1369,25 +1572,29 @@ mod rust_simd {
         h: usize,
         params: &LooprestorationParams,
         edges: LrEdgeFlags,
+        bitdepth: u8,
     ) {
         // A row more than `padding` fills, for the loads past the last one's right edge.
         let mut tmp = [0.into(); (ROWS + 1) * REST_UNIT_STRIDE];
         let padded = (&mut tmp[..ROWS * REST_UNIT_STRIDE]).try_into().unwrap();
         padding::<BD>(padded, p, left, lpf, lpf_off, w, h, edges);
         let stride = p.pixel_stride::<BD>();
-        let store = |j: usize, row: &[u8]| {
+        let store = |j: usize, row: &[BD::Pixel]| {
             let p = p + j as isize * stride;
-            p.slice_mut::<BD>(row.len())
-                .as_bytes_mut()
-                .copy_from_slice(row);
+            p.slice_mut::<BD>(row.len()).copy_from_slice(row);
         };
-        sgr::<THREE, FIVE>(store, tmp.as_bytes(), w, h, params.sgr());
+        let sgr_params = params.sgr();
+        match (BD::BPC, bitdepth) {
+            (BPC::BPC8, _) => sgr::<BD, THREE, FIVE, 2, 4>(store, &tmp, w, h, sgr_params),
+            (_, 10) => sgr::<BD, THREE, FIVE, 2, 4>(store, &tmp, w, h, sgr_params),
+            _ => sgr::<BD, THREE, FIVE, 4, 8>(store, &tmp, w, h, sgr_params),
+        }
     }
 
     /// # Safety
     ///
-    /// Must be called by [`loop_restoration_filter::Fn::call`] at 8 bpc, on x86 once the CPU
-    /// flags hold SSE41.
+    /// Must be called by [`loop_restoration_filter::Fn::call`], on x86 once the CPU flags hold
+    /// SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn sgr_erased<BD: BitDepth, const THREE: bool, const FIVE: bool>(
@@ -1399,7 +1606,7 @@ mod rust_simd {
         h: c_int,
         params: &LooprestorationParams,
         edges: LrEdgeFlags,
-        _bitdepth_max: c_int,
+        bitdepth_max: c_int,
         p: FFISafeRav1dPictureDataComponentOffset,
         lpf: *const FFISafe<DisjointMut<AlignedVec64<u8>>>,
     ) {
@@ -1412,8 +1619,9 @@ mod rust_simd {
         let (w, h) = (w as usize, h as usize);
         // SAFETY: Length sliced in `loop_restoration_filter::Fn::call`.
         let left = unsafe { slice::from_raw_parts(left, h) };
+        let bitdepth = BD::from_c(bitdepth_max).bitdepth();
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
-        unsafe { sgr_128::<BD, THREE, FIVE>(p, left, lpf, lpf_off, w, h, params, edges) }
+        unsafe { sgr_128::<BD, THREE, FIVE>(p, left, lpf, lpf_off, w, h, params, edges, bitdepth) }
     }
 }
 
@@ -1429,7 +1637,10 @@ impl Rav1dLoopRestorationDSPContext {
         }
     }
 
-    /// The Rust SIMD filters at 8 bpc.
+
+
+
+    /// The Rust SIMD filters, at every bit depth.
     #[inline(always)]
     const fn init<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1437,10 +1648,13 @@ impl Rav1dLoopRestorationDSPContext {
             return self;
         }
         let _ = flags;
-        if !crate::simd128::native() || BD::BITDEPTH != 8 {
+        if !crate::simd128::native() {
             return self;
         }
-        let wiener = loop_restoration_filter::Fn::new(rust_simd::wiener_erased::<BD>);
+        let wiener = loop_restoration_filter::Fn::new(match BD::BPC {
+            BPC::BPC8 => rust_simd::wiener_erased::<BD>,
+            BPC::BPC16 => rust_simd::wiener16_erased::<BD>,
+        });
         self.wiener = [wiener; 2];
         self.sgr = [
             loop_restoration_filter::Fn::new(rust_simd::sgr_erased::<BD, false, true>),
@@ -1460,7 +1674,7 @@ mod tests {
     use super::*;
     use crate::align::AlignedVec64;
     use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
-    use crate::include::common::bitdepth::BitDepth8;
+    use crate::include::common::bitdepth::{BitDepth16, BitDepth8};
     use crate::include::dav1d::picture::Rav1dPictureDataComponent;
     use crate::with_offset::WithOffset;
 
@@ -1484,29 +1698,37 @@ mod tests {
     /// The unit's top-left, past the 3 columns the filters read to its left.
     const AT: usize = 4 * STRIDE + 64;
 
-    fn rust() -> Rav1dLoopRestorationDSPContext {
+    fn rust<BD: BitDepth>() -> Rav1dLoopRestorationDSPContext {
         rav1d_init_cpu();
         let flags = rav1d_get_cpu_flags();
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        assert!(flags.contains(CpuFlags::SSE41), "the SIMD filters need SSE4.1");
-        Rav1dLoopRestorationDSPContext::default::<BitDepth8>().init::<BitDepth8>(flags)
+        assert!(
+            flags.contains(CpuFlags::SSE41),
+            "the SIMD filters need SSE4.1"
+        );
+        Rav1dLoopRestorationDSPContext::default::<BD>().init::<BD>(flags)
     }
 
+
     /// Pixels near a base with some outliers, the way decoded planes look.
-    fn plane(rng: &mut Rng, n: usize) -> Vec<u8> {
-        let base = rng.range(0, 255);
+    fn plane(rng: &mut Rng, n: usize, bits: u8) -> Vec<u16> {
+        let max = (1 << bits) - 1;
+        let s = bits - 8;
+        let base = rng.range(0, max);
         (0..n)
             .map(|_| match rng.next() % 8 {
-                0 => rng.next() as u8,
-                _ => (base + rng.range(-12, 12)).clamp(0, 255) as u8,
+                0 => (rng.next() % (max as u32 + 1)) as u16,
+                _ => (base + (rng.range(-12, 12) << s)).clamp(0, max) as u16,
             })
             .collect()
     }
 
-    /// Coefficients in the ranges the bitstream codes.
-    fn wiener_params(rng: &mut Rng, five: bool) -> LooprestorationParams {
+    /// Coefficients in the ranges the bitstream codes, the 128 of the centre across folded in
+    /// above 8 bpc the way `lr_apply` does.
+    fn wiener_params(rng: &mut Rng, five: bool, bits: u8) -> LooprestorationParams {
         let mut params = LooprestorationParams::default();
-        for (f, centre) in [(0, 0), (1, 128)] {
+        let h_centre = if bits == 8 { 0 } else { 128 };
+        for (f, centre) in [(0, h_centre), (1, 128)] {
             let k = [
                 if five { 0 } else { rng.range(-5, 10) },
                 rng.range(-23, 8),
@@ -1546,18 +1768,58 @@ mod tests {
         params
     }
 
-    struct Unit {
-        pic: Vec<u8>,
-        lpf: Vec<u8>,
-        left: Vec<LeftPixelRow<u8>>,
+    struct Unit<BD: BitDepth> {
+        bits: u8,
+        pic: Vec<BD::Pixel>,
+        lpf: Vec<BD::Pixel>,
+        left: Vec<LeftPixelRow<BD::Pixel>>,
     }
 
-    impl Unit {
-        fn new(rng: &mut Rng) -> Self {
-            let pic = plane(rng, STRIDE * ROWS);
-            let lpf = plane(rng, STRIDE * 12);
-            let left = plane(rng, 4 * 64).chunks_exact(4).map(|c| c.try_into().unwrap()).collect();
-            Self { pic, lpf, left }
+    impl<BD: BitDepth> Unit<BD> {
+        fn new(rng: &mut Rng, bits: u8) -> Self {
+            let px = |v: Vec<u16>| {
+                v.into_iter()
+                    .map(|p| p.as_::<BD::Pixel>())
+                    .collect::<Vec<_>>()
+            };
+            let pic = px(plane(rng, STRIDE * ROWS, bits));
+            let lpf = px(plane(rng, STRIDE * 12, bits));
+            let left = px(plane(rng, 4 * 64, bits))
+                .chunks_exact(4)
+                .map(|c| c.try_into().unwrap())
+                .collect();
+            Self {
+                bits,
+                pic,
+                lpf,
+                left,
+            }
+        }
+
+        /// Overwrites the picture: flat, full-range noise or stripes of 0 and the maximum.
+        fn fill(&mut self, rng: &mut Rng) {
+            let max = (1u32 << self.bits) - 1;
+            match rng.next() % 6 {
+                0 => self.pic.fill((rng.next() % (max + 1)).as_::<BD::Pixel>()),
+                1 => self
+                    .pic
+                    .iter_mut()
+                    .for_each(|p| *p = (rng.next() % (max + 1)).as_::<BD::Pixel>()),
+                2 => self
+                    .pic
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, p)| *p = ((i as u32 & 1) * max).as_::<BD::Pixel>()),
+                _ => {}
+            }
+        }
+
+        fn lpf(&self) -> DisjointMut<AlignedVec64<u8>> {
+            let bytes = self.lpf.as_bytes();
+            let mut lpf = AlignedVec64::<u8>::new();
+            lpf.resize(bytes.len(), 0);
+            lpf.as_mut_slice().copy_from_slice(bytes);
+            DisjointMut::new(lpf)
         }
 
         /// The plane after `f` filters a `w`x`h` unit at [`AT`].
@@ -1568,35 +1830,36 @@ mod tests {
             h: usize,
             params: &LooprestorationParams,
             edges: LrEdgeFlags,
-        ) -> Vec<u8> {
-            let mut buf = AlignedVec64::<u8>::new();
-            buf.resize(self.pic.len(), 0);
+        ) -> Vec<BD::Pixel> {
+            let mut buf = AlignedVec64::<BD::Pixel>::new();
+            buf.resize(self.pic.len(), 0.as_());
             buf.as_mut_slice().copy_from_slice(&self.pic);
-            let mut lpf = AlignedVec64::<u8>::new();
-            lpf.resize(self.lpf.len(), 0);
-            lpf.as_mut_slice().copy_from_slice(&self.lpf);
-            let lpf = DisjointMut::new(lpf);
-            let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+            let lpf = self.lpf();
+            let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), STRIDE);
             let dst = WithOffset {
                 data: &comp,
                 offset: AT,
             };
-            let bd = BitDepth8::from_c(255);
-            f.call::<BitDepth8>(dst, &self.left, &lpf, 64, w as c_int, h as c_int, params, edges, bd);
+            let bd = BD::from_c((1 << self.bits) - 1);
+            f.call::<BD>(
+                dst, &self.left, &lpf, 64, w as c_int, h as c_int, params, edges, bd,
+            );
             drop(comp);
             buf.as_slice().to_vec()
         }
     }
 
-    #[test]
-    fn wiener_matches_scalar() {
-        let scalar = Rav1dLoopRestorationDSPContext::default::<BitDepth8>();
-        let rust = rust();
+    fn wiener_matches_scalar<BD: BitDepth>(bits: u8) {
+        let scalar = Rav1dLoopRestorationDSPContext::default::<BD>();
+        let rust = rust::<BD>();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         for round in 0..300 {
-            let unit = Unit::new(&mut rng);
+            let mut unit = Unit::<BD>::new(&mut rng, bits);
+            if round % 4 == 3 {
+                unit.fill(&mut rng);
+            }
             let five = round % 2 == 1;
-            let params = wiener_params(&mut rng, five);
+            let params = wiener_params(&mut rng, five, bits);
             let w = match round % 5 {
                 0 => 384,
                 1 => 64,
@@ -1610,29 +1873,38 @@ mod tests {
             let f = five as usize;
             let want = unit.run(&scalar.wiener[f], w, h, &params, edges);
             let got = unit.run(&rust.wiener[f], w, h, &params, edges);
-            assert_eq!(got, want, "{w}x{h} edges {:#x} round {round}", edges.bits());
+            assert!(
+                got == want,
+                "{bits} bits {w}x{h} edges {:#x} round {round}",
+                edges.bits()
+            );
         }
     }
 
     #[test]
-    fn sgr_matches_scalar() {
-        let scalar = Rav1dLoopRestorationDSPContext::default::<BitDepth8>();
-        let rust = rust();
+    fn wiener_matches_scalar_8bpc() {
+        wiener_matches_scalar::<BitDepth8>(8);
+    }
+
+    #[test]
+    fn wiener_matches_scalar_10bpc() {
+        wiener_matches_scalar::<BitDepth16>(10);
+    }
+
+    #[test]
+    fn wiener_matches_scalar_12bpc() {
+        wiener_matches_scalar::<BitDepth16>(12);
+    }
+
+    fn sgr_matches_scalar<BD: BitDepth>(bits: u8, step: usize) {
+        let scalar = Rav1dLoopRestorationDSPContext::default::<BD>();
+        let rust = rust::<BD>();
         let mut rng = Rng(0x6a09_e667_f3bc_c908);
-        for w in 1..=384 {
+        for w in (1..=384).step_by(step) {
             for mode in 0..3 {
-                let mut unit = Unit::new(&mut rng);
-                // Flat, full-range noise and 0/255 stripes: `z` at 0, mid-table and past 255.
-                match rng.next() % 6 {
-                    0 => unit.pic.fill(rng.next() as u8),
-                    1 => unit.pic.iter_mut().for_each(|p| *p = rng.next() as u8),
-                    2 => unit
-                        .pic
-                        .iter_mut()
-                        .enumerate()
-                        .for_each(|(i, p)| *p = (i & 1) as u8 * 255),
-                    _ => {}
-                }
+                let mut unit = Unit::<BD>::new(&mut rng, bits);
+                // Flat, full-range noise and 0/max stripes: `z` at 0, mid-table and past 255.
+                unit.fill(&mut rng);
                 let params = sgr_params(&mut rng, mode);
                 let h = match rng.next() % 3 {
                     0 => 64,
@@ -1641,9 +1913,28 @@ mod tests {
                 let edges = LrEdgeFlags::from_bits_truncate(rng.next() as u8);
                 let want = unit.run(&scalar.sgr[mode], w, h, &params, edges);
                 let got = unit.run(&rust.sgr[mode], w, h, &params, edges);
-                assert_eq!(got, want, "mode {mode} {w}x{h} edges {:#x}", edges.bits());
+                assert!(
+                    got == want,
+                    "{bits} bits mode {mode} {w}x{h} edges {:#x}",
+                    edges.bits()
+                );
             }
         }
+    }
+
+    #[test]
+    fn sgr_matches_scalar_8bpc() {
+        sgr_matches_scalar::<BitDepth8>(8, 1);
+    }
+
+    #[test]
+    fn sgr_matches_scalar_10bpc() {
+        sgr_matches_scalar::<BitDepth16>(10, 1);
+    }
+
+    #[test]
+    fn sgr_matches_scalar_12bpc() {
+        sgr_matches_scalar::<BitDepth16>(12, 1);
     }
 
     /// Best of 20 batches, in ns per call.
@@ -1661,38 +1952,33 @@ mod tests {
         best
     }
 
-    /// ns per call of a 64-row stripe, scalar and Rust.
-    #[test]
-    #[ignore]
-    fn time_lr() {
-        let dsps = [
-            ("scalar", Rav1dLoopRestorationDSPContext::default::<BitDepth8>()),
-            ("rust", rust()),
+    /// ns per call of a 64-row stripe, scalar, Rust and asm.
+    fn time_lr<BD: BitDepth>(bits: u8) {
+        let dsps = vec![
+            ("scalar", Rav1dLoopRestorationDSPContext::default::<BD>()),
+            ("rust", rust::<BD>()),
         ];
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-        let unit = Unit::new(&mut rng);
-        let mut buf = AlignedVec64::<u8>::new();
-        buf.resize(unit.pic.len(), 0);
+        let unit = Unit::<BD>::new(&mut rng, bits);
+        let mut buf = AlignedVec64::<BD::Pixel>::new();
+        buf.resize(unit.pic.len(), 0.as_());
         buf.as_mut_slice().copy_from_slice(&unit.pic);
-        let mut lpf = AlignedVec64::<u8>::new();
-        lpf.resize(unit.lpf.len(), 0);
-        lpf.as_mut_slice().copy_from_slice(&unit.lpf);
-        let lpf = DisjointMut::new(lpf);
-        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+        let lpf = unit.lpf();
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), STRIDE);
         let dst = WithOffset {
             data: &comp,
             offset: AT,
         };
-        let bd = BitDepth8::from_c(255);
+        let bd = BD::from_c((1 << bits) - 1);
         let edges = LrEdgeFlags::all();
         for (name, five) in [("wiener7", false), ("wiener5", true)] {
-            let params = wiener_params(&mut rng, five);
+            let params = wiener_params(&mut rng, five, bits);
             for w in [64, 128, 256, 384] {
-                let mut line = format!("{name} {w}x64:");
+                let mut line = format!("{bits:2}-bit {name} {w}x64:");
                 for (dsp_name, dsp) in &dsps {
                     let f = &dsp.wiener[five as usize];
                     let best = ns(20, || {
-                        f.call::<BitDepth8>(dst, &unit.left, &lpf, 64, w, 64, &params, edges, bd);
+                        f.call::<BD>(dst, &unit.left, &lpf, 64, w, 64, &params, edges, bd);
                     });
                     line += &format!("  {dsp_name} {best:7.0} ns");
                 }
@@ -1700,25 +1986,33 @@ mod tests {
             }
         }
         for w in [64, 384] {
-            let mut tmp = [0u8; (64 + 3 + 3) * REST_UNIT_STRIDE];
+            let mut tmp = [0.as_(); (64 + 3 + 3) * REST_UNIT_STRIDE];
             let best = ns(20, || {
-                padding::<BitDepth8>(&mut tmp, dst, &unit.left, &lpf, 64, w, 64, edges);
+                padding::<BD>(&mut tmp, dst, &unit.left, &lpf, 64, w, 64, edges);
             });
-            println!("padding {w}x64:  {best:7.0} ns");
+            println!("{bits:2}-bit padding {w}x64:  {best:7.0} ns");
         }
         for (name, mode) in [("sgr5", 0), ("sgr3", 1), ("sgrmix", 2)] {
             let params = sgr_params(&mut rng, mode);
             for w in [64, 128, 256, 384] {
-                let mut line = format!("{name} {w}x64:");
+                let mut line = format!("{bits:2}-bit {name} {w}x64:");
                 for (dsp_name, dsp) in &dsps {
                     let f = &dsp.sgr[mode];
                     let best = ns(20, || {
-                        f.call::<BitDepth8>(dst, &unit.left, &lpf, 64, w, 64, &params, edges, bd);
+                        f.call::<BD>(dst, &unit.left, &lpf, 64, w, 64, &params, edges, bd);
                     });
                     line += &format!("  {dsp_name} {best:7.0} ns");
                 }
                 println!("{line}");
             }
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn time_lr_all() {
+        time_lr::<BitDepth8>(8);
+        time_lr::<BitDepth16>(10);
+        time_lr::<BitDepth16>(12);
     }
 }
