@@ -840,9 +840,16 @@ mod tests {
                 let mut coeff = vec![0i32; cw * ch];
                 let n = if eob == 0 { 1 } else { eob as usize + 1 };
                 let range = [512, 4096][round as usize % 2] * scale;
-                // A 32x32 block with `eob < 136` keeps its coefficients in the top-left 16x16.
-                let (nw, nh) = if w == 32 && h == 32 && eob < 136 {
-                    (16, 16)
+                // An `eob` within the scan's first diagonals keeps the coefficients in the top-left
+                // quarter.
+                let quarter = match (w, h) {
+                    (32, 32) => eob < 136,
+                    (16, 16) => t == DCT_DCT && eob < 36,
+                    (8, 8) => t == DCT_DCT && eob < 10,
+                    _ => false,
+                };
+                let (nw, nh) = if quarter {
+                    (cw / 2, ch / 2)
                 } else {
                     (cw, ch)
                 };
@@ -1050,7 +1057,7 @@ mod tests {
                 (DCT_DCT, cw * ch - 1),
                 (ADST_ADST, cw * ch - 1),
                 (DCT_DCT, 100),
-                (DCT_DCT, 10),
+                (DCT_DCT, 9),
             ] {
                 let unassigned = *dsps[0].1.itxfm_add[tx as usize][t as usize].get() as usize
                     == *itxfm::Fn::DEFAULT.get() as usize;
@@ -1059,7 +1066,7 @@ mod tests {
                 }
                 let coeff: Vec<BD::Coef> = (0..cw * ch)
                     .map(|i| {
-                        let k = if eob == 10 { 4 } else { 16 };
+                        let k = if eob == 9 { 4 } else { 16 };
                         if eob < 136 && (i / ch >= k || i % ch >= k) {
                             0
                         } else {

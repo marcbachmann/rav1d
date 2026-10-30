@@ -25,6 +25,18 @@ enum Tx1d {
 }
 use Tx1d::*;
 
+/// Whether every coefficient lies in the top-left quarter of the block, as the scan's first
+/// diagonals: a 32x32 block, or a square DCT of 8 or 16, with `eob` short of the quarter's
+/// diagonals.
+const fn quarter(w: usize, h: usize, t: TxfmType, eob: i32) -> bool {
+    match (w, h) {
+        (32, 32) => eob < 136,
+        (16, 16) => t == DCT_DCT && eob < 36,
+        (8, 8) => t == DCT_DCT && eob < 10,
+        _ => false,
+    }
+}
+
 /// The row and the column transform of a 2-D type; the C calls them (first, second).
 const fn kinds(t: TxfmType) -> (Tx1d, Tx1d) {
     match t {
@@ -897,8 +909,9 @@ fn identity16<V: Lanes>(v: &mut [V; 16], shift: u32) {
 }
 
 #[inline(always)]
-fn tx8<V: Lanes + Butterfly, const COLS: bool>(v: &mut [V; 8], t: Tx1d) {
+fn tx8<V: Lanes + Butterfly, const COLS: bool>(v: &mut [V; 8], t: Tx1d, half: bool) {
     match t {
+        Dct if half => dct8::<_, true>(v),
         Dct => dct8::<_, false>(v),
         Adst => adst8::<_, COLS>(v),
         FlipAdst => {
@@ -910,8 +923,14 @@ fn tx8<V: Lanes + Butterfly, const COLS: bool>(v: &mut [V; 8], t: Tx1d) {
 }
 
 #[inline(always)]
-fn tx16<V: Lanes + Butterfly, const COLS: bool>(v: &mut [V; 16], t: Tx1d, shift: u32) {
+fn tx16<V: Lanes + Butterfly, const COLS: bool>(
+    v: &mut [V; 16],
+    t: Tx1d,
+    shift: u32,
+    half: bool,
+) {
     match t {
+        Dct if half => dct16::<_, true>(v),
         Dct => dct16::<_, false>(v),
         Adst => adst16::<_, COLS>(v),
         FlipAdst => {
@@ -943,8 +962,8 @@ fn tx<V: Lanes + Butterfly, const N: usize, const COLS: bool>(
 ) {
     match N {
         4 => tx4((&mut v[..4]).try_into().unwrap(), t, shift),
-        8 => tx8::<_, COLS>((&mut v[..8]).try_into().unwrap(), t),
-        16 => tx16::<_, COLS>((&mut v[..16]).try_into().unwrap(), t, shift),
+        8 => tx8::<_, COLS>((&mut v[..8]).try_into().unwrap(), t, half),
+        16 => tx16::<_, COLS>((&mut v[..16]).try_into().unwrap(), t, shift, half),
         32 => tx32((&mut v[..32]).try_into().unwrap(), t, half),
         64 => dct64((&mut v[..64]).try_into().unwrap()),
         _ => unreachable!(),
@@ -1086,8 +1105,8 @@ fn cols_128<BD: BitDepth, const W: usize, const H: usize, const G: usize>(
 /// time, each group's 8x8 turned around into its column vectors, then each group's columns into
 /// the picture. The column vectors are an array the compiler keeps in registers where they fit,
 /// with no scratch in between. A side of 4 fills half the lanes; a side of 64 has 32
-/// coefficients. A 32x32 block with `eob < 136` has every coefficient in its top-left 16x16 (the
-/// asm's tier), so half the rows and inputs are skipped.
+/// coefficients. A block whose coefficients all lie in its top-left quarter ([`quarter`]) skips
+/// half the rows and inputs.
 #[inline(always)]
 fn add_block<
     BD: BitDepth,
@@ -1110,14 +1129,14 @@ fn add_block<
     let shift = row_shift(W, H);
     let (cw, ch) = (W.min(32), H.min(32));
     let coeff = &mut coeff[..cw * ch];
-    let half = W == 32 && H == 32 && eob < 136;
-    let (w, h) = if half { (16, 16) } else { (cw, ch) };
+    let half = quarter(W, H, TYPE, eob);
+    let (w, h) = if half { (cw / 2, ch / 2) } else { (cw, ch) };
     let rect = W * 2 == H || H * 2 == W;
     let zero = I16x8::splat(0);
     let mut groups = [[zero; H]; G];
     let mut y0 = 0;
     #[cfg(target_arch = "x86_64")]
-    if WIDE && ch >= 16 {
+    if WIDE && h >= 16 {
         while y0 < h {
             wide::rows::<W, H, G>(coeff, ch, y0, w, rect, rows, shift, half, &mut groups);
             y0 += 16;
@@ -1176,8 +1195,10 @@ fn tx10<D: Dwords, const N: usize>(v: &mut [Row10<D>; N], t: Tx1d, half: bool) {
                 _ => adst4(v),
             }
         }
+        (8, Dct) if half => dct8::<_, true>((&mut v[..8]).try_into().unwrap()),
         (8, Dct) => dct8::<_, false>((&mut v[..8]).try_into().unwrap()),
         (8, _) => adst8::<_, false>((&mut v[..8]).try_into().unwrap()),
+        (16, Dct) if half => dct16::<_, true>((&mut v[..16]).try_into().unwrap()),
         (16, Dct) => dct16::<_, false>((&mut v[..16]).try_into().unwrap()),
         (16, _) => adst16::<_, false>((&mut v[..16]).try_into().unwrap()),
         (32, _) if half => dct32::<_, true>((&mut v[..32]).try_into().unwrap()),
@@ -1265,14 +1286,14 @@ fn add_block10<
     let shift = row_shift(W, H);
     let (cw, ch) = (W.min(32), H.min(32));
     let coeff = &mut coeff[..cw * ch];
-    let half = W == 32 && H == 32 && eob < 136;
-    let (w, h) = if half { (16, 16) } else { (cw, ch) };
+    let half = quarter(W, H, TYPE, eob);
+    let (w, h) = if half { (cw / 2, ch / 2) } else { (cw, ch) };
     let rect = W * 2 == H || H * 2 == W;
     let mut groups = [[I16x8::splat(0); H]; G];
     let mut y0 = 0;
     while y0 < h {
         #[cfg(target_arch = "x86_64")]
-        if WIDE && H >= 8 {
+        if WIDE && h >= 8 {
             use crate::simd128::I32x8;
             let mut o = [I32x8::splat(0); W];
             if rows10(coeff, ch, y0, w, rect, rows, half, &mut o) {
@@ -1292,7 +1313,7 @@ fn add_block10<
         let zero = I32x4::splat(0);
         let (mut lo, mut hi) = ([zero; W], [zero; W]);
         let set_lo = rows10(coeff, ch, y0, w, rect, rows, half, &mut lo);
-        let set_hi = H > 4 && rows10(coeff, ch, y0 + 4, w, rect, rows, half, &mut hi);
+        let set_hi = H > 4 && y0 + 4 < h && rows10(coeff, ch, y0 + 4, w, rect, rows, half, &mut hi);
         if set_lo || set_hi {
             let mut v = [I16x8::splat(0); W];
             for x in 0..W {
