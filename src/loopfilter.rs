@@ -8,7 +8,7 @@ use strum::FromRepr;
 
 use crate::align::{Align16, AlignedVec2};
 use crate::cpu::CpuFlags;
-use crate::disjoint_mut::DisjointMut;
+use crate::disjoint_mut::{DisjointMut, DisjointMutGuard};
 use crate::ffi_safe::FFISafe;
 #[cfg(all(
     feature = "asm",
@@ -18,7 +18,8 @@ use crate::include::common::bitdepth::bd_fn;
 use crate::include::common::bitdepth::{AsPrimitive, BitDepth, DynPixel};
 use crate::include::common::intops::iclip;
 use crate::include::dav1d::picture::{
-    FFISafeRav1dPictureDataComponentOffset, Rav1dPictureDataComponentOffset,
+    FFISafeRav1dPictureDataComponentOffset, Rav1dPictureDataComponentInner,
+    Rav1dPictureDataComponentOffset,
 };
 use crate::internal::Rav1dFrameData;
 use crate::lf_mask::Av1FilterLUT;
@@ -852,38 +853,49 @@ mod rust_simd {
         }
     }
 
+    /// One guard over `n` rows of `w` pixels from `dst`, the stride, and where the first row
+    /// starts in the guard: the rows' bytes for [`U8x16::load_rows`].
+    #[inline(always)]
+    fn rows_mut<'a, BD: BitDepth>(
+        dst: Rav1dPictureDataComponentOffset<'a>,
+        n: usize,
+        w: usize,
+    ) -> (
+        DisjointMutGuard<'a, Rav1dPictureDataComponentInner, [BD::Pixel]>,
+        isize,
+        usize,
+    ) {
+        let stride = dst.pixel_stride::<BD>();
+        let last = (n as isize - 1) * stride;
+        let lo = last.min(0);
+        let rows = (dst + lo).slice_mut::<BD>(last.unsigned_abs() + w);
+        (rows, stride, lo.unsigned_abs())
+    }
+
     /// [`group_v`] at 8 bpc: sixteen columns as bytes.
     #[inline(always)]
     fn group_v8<BD: BitDepth, const MAX: usize>(dst: Rav1dPictureDataComponentOffset, p: Params8) {
+        let r = reach(MAX);
         let stride = dst.pixel_stride::<BD>();
-        let r = reach(MAX) as isize;
+        let (mut rows, stride, start) = rows_mut::<BD>(dst - r as isize * stride, 2 * r, 16);
         let mut px = [U8x16::splat(0); 14];
-        for k in -r..r {
-            let row = (dst + k * stride).slice::<BD>(16);
-            px[(7 + k) as usize] = U8x16::load(row.as_bytes());
-        }
+        U8x16::load_rows(&mut px[7 - r..7 + r], rows.as_bytes(), start, stride);
         filter8::<MAX>(&mut px, p);
         let w = if MAX == 16 { 6 } else { r.min(3) };
-        for k in -w..w {
-            let mut row = (dst + k * stride).slice_mut::<BD>(16);
-            px[(7 + k) as usize].store(row.as_bytes_mut());
-        }
+        let start = start.wrapping_add_signed((r - w) as isize * stride);
+        U8x16::store_rows(&px[7 - w..7 + w], rows.as_bytes_mut(), start, stride);
     }
 
     /// [`group_h`] at 8 bpc: sixteen rows of 8 (or 16) bytes turned into columns.
     #[inline(always)]
     fn group_h8<BD: BitDepth, const MAX: usize>(dst: Rav1dPictureDataComponentOffset, p: Params8) {
-        let stride = dst.pixel_stride::<BD>();
         let (n, x0) = if MAX == 16 { (2, -8) } else { (1, -4) };
+        let (mut rows, stride, start) = rows_mut::<BD>(dst + x0, 16, 8 * n);
         let mut win = [[U8x16::splat(0); 8]; 2];
         for (w, win) in win.iter_mut().enumerate().take(n) {
-            let x = x0 + 8 * w as isize;
-            let mut rows = [U8x16::splat(0); 16];
-            for (r, v) in rows.iter_mut().enumerate() {
-                let row = (dst + (r as isize * stride + x)).slice::<BD>(8);
-                *v = U8x16::load_lo(row.as_bytes());
-            }
-            *win = transpose16x8(&rows);
+            let mut v = [U8x16::splat(0); 16];
+            U8x16::load_rows_lo(&mut v, rows.as_bytes(), start + 8 * w, stride);
+            *win = transpose16x8(&v);
         }
         let mut px = [U8x16::splat(0); 14];
         for k in -7..7isize {
@@ -900,12 +912,8 @@ mod rust_simd {
             }
         }
         for (w, win) in win.iter().enumerate().take(n) {
-            let x = x0 + 8 * w as isize;
-            for (i, v) in transpose8x16(win).into_iter().enumerate() {
-                let mut a = (dst + ((2 * i) as isize * stride + x)).slice_mut::<BD>(8);
-                let mut b = (dst + ((2 * i + 1) as isize * stride + x)).slice_mut::<BD>(8);
-                v.store_halves(a.as_bytes_mut(), b.as_bytes_mut());
-            }
+            let v = transpose8x16(win);
+            U8x16::store_rows_halves(&v, rows.as_bytes_mut(), start + 8 * w, stride);
         }
     }
 

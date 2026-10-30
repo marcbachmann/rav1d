@@ -231,6 +231,65 @@ pub fn transpose8x8<V: Lanes>(v: &mut [V; 8]) {
     }
 }
 
+/// Asserts that `n` rows of `w` bytes, row `r` at `start + r * stride`, lie in `len` bytes: the
+/// rows lie between the first and the last, so those two are all it checks.
+#[inline(always)]
+fn rows_fit(len: usize, start: usize, stride: isize, n: usize, w: usize) {
+    let last = (n as isize - 1)
+        .checked_mul(stride)
+        .and_then(|o| o.checked_add(start as isize));
+    let fits = |s: usize| s.checked_add(w).is_some_and(|e| e <= len);
+    assert!(n > 0 && fits(start) && last.is_some_and(|l| l >= 0 && fits(l as usize)));
+}
+
+/// Rows of a picture as lanes, the block bounds-checked once instead of row by row.
+impl U8x16 {
+    /// `v[r]` from the sixteen bytes at `b[start + r * stride..]`.
+    #[inline(always)]
+    pub fn load_rows(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
+        rows_fit(b.len(), start, stride, v.len(), 16);
+        let p = b.as_ptr().wrapping_add(start);
+        for (r, v) in v.iter_mut().enumerate() {
+            // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
+            *v = unsafe { Self::load_at(p.offset(r as isize * stride)) };
+        }
+    }
+
+    /// [`Self::load_rows`] of eight bytes, in the low halves.
+    #[inline(always)]
+    pub fn load_rows_lo(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
+        rows_fit(b.len(), start, stride, v.len(), 8);
+        let p = b.as_ptr().wrapping_add(start);
+        for (r, v) in v.iter_mut().enumerate() {
+            // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
+            *v = unsafe { Self::load_lo_at(p.offset(r as isize * stride)) };
+        }
+    }
+
+    /// [`Self::load_rows`] back.
+    #[inline(always)]
+    pub fn store_rows(v: &[Self], b: &mut [u8], start: usize, stride: isize) {
+        rows_fit(b.len(), start, stride, v.len(), 16);
+        let p = b.as_mut_ptr().wrapping_add(start);
+        for (r, v) in v.iter().enumerate() {
+            // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
+            unsafe { v.store_at(p.offset(r as isize * stride)) };
+        }
+    }
+
+    /// The halves of `v[i]` into rows `2 * i` and `2 * i + 1` of eight bytes.
+    #[inline(always)]
+    pub fn store_rows_halves(v: &[Self], b: &mut [u8], start: usize, stride: isize) {
+        rows_fit(b.len(), start, stride, 2 * v.len(), 8);
+        let p = b.as_mut_ptr().wrapping_add(start);
+        for (i, v) in v.iter().enumerate() {
+            let r = 2 * i as isize;
+            // SAFETY: Rows `r` and `r + 1` lie in `b`, checked by `rows_fit`.
+            unsafe { v.store_halves_at(p.offset(r * stride), p.offset((r + 1) * stride)) };
+        }
+    }
+}
+
 /// Sixteen rows of eight bytes, each in the low half of `r[i]`, as eight columns of sixteen:
 /// pairs of rows interleaved into 16-bit elements, then [`transpose8x8`]'s rounds on those.
 #[inline(always)]
@@ -1034,21 +1093,38 @@ mod imp {
             Self(unsafe { _mm_loadu_si128(b[..16].as_ptr().cast()) })
         }
 
+        /// # Safety
+        ///
+        /// The 16 bytes at `p` are readable.
         #[inline(always)]
-        pub fn load_lo(b: &[u8]) -> Self {
-            Self(unsafe { _mm_loadl_epi64(b[..8].as_ptr().cast()) })
+        pub unsafe fn load_at(p: *const u8) -> Self {
+            Self(unsafe { _mm_loadu_si128(p.cast()) })
         }
 
+        /// # Safety
+        ///
+        /// The 8 bytes at `p` are readable.
         #[inline(always)]
-        pub fn store(self, d: &mut [u8]) {
-            unsafe { _mm_storeu_si128(d[..16].as_mut_ptr().cast(), self.0) }
+        pub unsafe fn load_lo_at(p: *const u8) -> Self {
+            Self(unsafe { _mm_loadl_epi64(p.cast()) })
         }
 
+        /// # Safety
+        ///
+        /// The 16 bytes at `p` are writable.
         #[inline(always)]
-        pub fn store_halves(self, lo: &mut [u8], hi: &mut [u8]) {
+        pub unsafe fn store_at(self, p: *mut u8) {
+            unsafe { _mm_storeu_si128(p.cast(), self.0) }
+        }
+
+        /// # Safety
+        ///
+        /// The 8 bytes at `lo` and `hi` are writable.
+        #[inline(always)]
+        pub unsafe fn store_halves_at(self, lo: *mut u8, hi: *mut u8) {
             unsafe {
-                _mm_storel_epi64(lo[..8].as_mut_ptr().cast(), self.0);
-                _mm_storeh_pd(hi[..8].as_mut_ptr().cast(), _mm_castsi128_pd(self.0));
+                _mm_storel_epi64(lo.cast(), self.0);
+                _mm_storeh_pd(hi.cast(), _mm_castsi128_pd(self.0));
             }
         }
 
@@ -1761,21 +1837,38 @@ mod imp {
             Self(unsafe { vld1q_u8(b[..16].as_ptr()) })
         }
 
+        /// # Safety
+        ///
+        /// The 16 bytes at `p` are readable.
         #[inline(always)]
-        pub fn load_lo(b: &[u8]) -> Self {
-            Self(unsafe { vcombine_u8(vld1_u8(b[..8].as_ptr()), vdup_n_u8(0)) })
+        pub unsafe fn load_at(p: *const u8) -> Self {
+            Self(unsafe { vld1q_u8(p) })
         }
 
+        /// # Safety
+        ///
+        /// The 8 bytes at `p` are readable.
         #[inline(always)]
-        pub fn store(self, d: &mut [u8]) {
-            unsafe { vst1q_u8(d[..16].as_mut_ptr(), self.0) }
+        pub unsafe fn load_lo_at(p: *const u8) -> Self {
+            Self(unsafe { vcombine_u8(vld1_u8(p), vdup_n_u8(0)) })
         }
 
+        /// # Safety
+        ///
+        /// The 16 bytes at `p` are writable.
         #[inline(always)]
-        pub fn store_halves(self, lo: &mut [u8], hi: &mut [u8]) {
+        pub unsafe fn store_at(self, p: *mut u8) {
+            unsafe { vst1q_u8(p, self.0) }
+        }
+
+        /// # Safety
+        ///
+        /// The 8 bytes at `lo` and `hi` are writable.
+        #[inline(always)]
+        pub unsafe fn store_halves_at(self, lo: *mut u8, hi: *mut u8) {
             unsafe {
-                vst1_u8(lo[..8].as_mut_ptr(), vget_low_u8(self.0));
-                vst1_u8(hi[..8].as_mut_ptr(), vget_high_u8(self.0));
+                vst1_u8(lo, vget_low_u8(self.0));
+                vst1_u8(hi, vget_high_u8(self.0));
             }
         }
 
@@ -2465,24 +2558,42 @@ mod imp {
             Self(unsafe { v128_load(b[..16].as_ptr().cast()) })
         }
 
+        /// # Safety
+        ///
+        /// The 16 bytes at `p` are readable.
         #[inline(always)]
-        pub fn load_lo(b: &[u8]) -> Self {
-            // SAFETY: 8 bytes are in bounds; the load takes unaligned pointers.
-            Self(unsafe { v128_load64_zero(b[..8].as_ptr().cast()) })
+        pub unsafe fn load_at(p: *const u8) -> Self {
+            // SAFETY: The caller's; the load takes unaligned pointers.
+            Self(unsafe { v128_load(p.cast()) })
         }
 
+        /// # Safety
+        ///
+        /// The 8 bytes at `p` are readable.
         #[inline(always)]
-        pub fn store(self, d: &mut [u8]) {
-            // SAFETY: 16 bytes are in bounds; the store takes unaligned pointers.
-            unsafe { v128_store(d[..16].as_mut_ptr().cast(), self.0) }
+        pub unsafe fn load_lo_at(p: *const u8) -> Self {
+            // SAFETY: The caller's; the load takes unaligned pointers.
+            Self(unsafe { v128_load64_zero(p.cast()) })
         }
 
+        /// # Safety
+        ///
+        /// The 16 bytes at `p` are writable.
         #[inline(always)]
-        pub fn store_halves(self, lo: &mut [u8], hi: &mut [u8]) {
-            // SAFETY: 8 bytes each are in bounds; the stores take unaligned pointers.
+        pub unsafe fn store_at(self, p: *mut u8) {
+            // SAFETY: The caller's; the store takes unaligned pointers.
+            unsafe { v128_store(p.cast(), self.0) }
+        }
+
+        /// # Safety
+        ///
+        /// The 8 bytes at `lo` and `hi` are writable.
+        #[inline(always)]
+        pub unsafe fn store_halves_at(self, lo: *mut u8, hi: *mut u8) {
+            // SAFETY: The caller's; the stores take unaligned pointers.
             unsafe {
-                v128_store64_lane::<0>(self.0, lo[..8].as_mut_ptr().cast());
-                v128_store64_lane::<1>(self.0, hi[..8].as_mut_ptr().cast());
+                v128_store64_lane::<0>(self.0, lo.cast());
+                v128_store64_lane::<1>(self.0, hi.cast());
             }
         }
 
@@ -3116,20 +3227,46 @@ mod imp {
             Self(b[..16].try_into().unwrap())
         }
 
+        /// # Safety
+        ///
+        /// The 16 bytes at `p` are readable.
         #[inline(always)]
-        pub fn load_lo(b: &[u8]) -> Self {
-            Self(std::array::from_fn(|i| if i < 8 { b[i] } else { 0 }))
+        pub unsafe fn load_at(p: *const u8) -> Self {
+            // SAFETY: The caller's.
+            Self(unsafe { p.cast::<[u8; 16]>().read_unaligned() })
         }
 
+        /// # Safety
+        ///
+        /// The 8 bytes at `p` are readable.
         #[inline(always)]
-        pub fn store(self, d: &mut [u8]) {
-            d[..16].copy_from_slice(&self.0);
+        pub unsafe fn load_lo_at(p: *const u8) -> Self {
+            // SAFETY: The caller's.
+            let lo = unsafe { p.cast::<[u8; 8]>().read_unaligned() };
+            Self(std::array::from_fn(|i| if i < 8 { lo[i] } else { 0 }))
         }
 
+        /// # Safety
+        ///
+        /// The 16 bytes at `p` are writable.
         #[inline(always)]
-        pub fn store_halves(self, lo: &mut [u8], hi: &mut [u8]) {
-            lo[..8].copy_from_slice(&self.0[..8]);
-            hi[..8].copy_from_slice(&self.0[8..]);
+        pub unsafe fn store_at(self, p: *mut u8) {
+            // SAFETY: The caller's.
+            unsafe { p.cast::<[u8; 16]>().write_unaligned(self.0) }
+        }
+
+        /// # Safety
+        ///
+        /// The 8 bytes at `lo` and `hi` are writable.
+        #[inline(always)]
+        pub unsafe fn store_halves_at(self, lo: *mut u8, hi: *mut u8) {
+            let a: [u8; 8] = self.0[..8].try_into().unwrap();
+            let b: [u8; 8] = self.0[8..].try_into().unwrap();
+            // SAFETY: The caller's.
+            unsafe {
+                lo.cast::<[u8; 8]>().write_unaligned(a);
+                hi.cast::<[u8; 8]>().write_unaligned(b);
+            }
         }
 
         #[inline(always)]
