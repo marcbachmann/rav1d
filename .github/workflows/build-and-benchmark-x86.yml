@@ -5,24 +5,29 @@ on:
       - 'main'
   pull_request:
 jobs:
-    benchmark-on-self-hosted-x86-64:
-        runs-on: [self-hosted, linux, X64]
+    benchmark-on-ubuntu-latest:
+        runs-on: ubuntu-latest
         steps:
+            - name: install perf
+              run: |
+                sudo apt-get update
+                sudo apt-get install -y linux-tools-common linux-tools-$(uname -r)
+                sudo sysctl kernel.perf_event_paranoid=1
             - name: git checkout
               uses: actions/checkout@v4
             - name: install rust toolchain
               id: toolchain
               uses: dtolnay/rust-toolchain@master
               with:
-                toolchain: 1.87.0 # specific version for consistent perf
+                toolchain: stable # shared runners: compare instructions, not cycles
                 target: x86_64-unknown-linux-gnu
                 components: clippy
             - name: release build this PR
-              run: nice cargo +${{ steps.toolchain.outputs.name }} build --release
+              run: cargo +${{ steps.toolchain.outputs.name }} build --release
             - name: release build main branch
               run: |
                 git fetch --depth 1 origin main && git checkout origin/main
-                nice cargo +${{ steps.toolchain.outputs.name }} build --release --target-dir target.main
+                cargo +${{ steps.toolchain.outputs.name }} build --release --target-dir target.main
             - name: benchmark on chimera 8-bit test data
               run: |
                 mkdir -p `dirname $LOCAL_FILE`
