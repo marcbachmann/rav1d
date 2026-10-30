@@ -196,9 +196,12 @@ fn padding<BD: BitDepth>(
 
     for (i, y) in (y_start..2).enumerate() {
         let top = top + i as isize * stride;
-        let top = top.data.slice_as::<_, BD::Pixel>((top.offset.., ..x_end));
+        // From `x_start` on, as the 2 pixels left of the row may be another thread's.
+        let top = top
+            .data
+            .slice_as::<_, BD::Pixel>((top.offset + x_start.., ..x_end - x_start));
         for x in x_start..x_end {
-            tmp[x + y * TMP_STRIDE] = top[x].as_::<i16>();
+            tmp[x + y * TMP_STRIDE] = top[x - x_start].as_::<i16>();
         }
     }
     for y in 0..h {
@@ -219,12 +222,13 @@ fn padding<BD: BitDepth>(
         let bottom = bottom + i as isize * stride;
         // This is a fallback `fn`, so perf is not as important here, so an extra branch
         // here should be okay.
+        let (at, n) = (bottom.offset + x_start, x_end - x_start);
         let bottom = match bottom.data {
-            PicOrBuf::Pic(pic) => &*pic.slice::<BD, _>((bottom.offset.., ..x_end)),
-            PicOrBuf::Buf(buf) => &*buf.slice_as((bottom.offset.., ..x_end)),
+            PicOrBuf::Pic(pic) => &*pic.slice::<BD, _>((at.., ..n)),
+            PicOrBuf::Buf(buf) => &*buf.slice_as((at.., ..n)),
         };
         for x in x_start..x_end {
-            tmp[x] = bottom[x].as_::<i16>();
+            tmp[x] = bottom[x - x_start].as_::<i16>();
         }
     }
 }
