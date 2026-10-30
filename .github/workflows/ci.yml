@@ -1,0 +1,493 @@
+name: ci
+on:
+  push:
+    branches:
+      - 'main'
+  pull_request:
+jobs:
+  test-on-ubuntu-latest:
+    strategy:
+      matrix:
+        target: [
+          "x86_64-unknown-linux-gnu",
+          "i686-unknown-linux-gnu"
+        ]
+        build: [
+          {name: "release", flags: "--release", timeout_multiplier: 1}
+        ]
+        # Test with negative strides, threads and framedelay
+        variant: [
+          "",
+          "-n",
+          "-f 1",
+          "-f 2"
+        ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: refresh apt package lists
+        run: sudo apt-get update
+      - name: install prerequisites
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: meson gcc-multilib
+          version: 4.0 # version of cache to load
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable # x86 and x86_64 feature detection are stable
+          target: ${{ matrix.target }}
+          components: clippy
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cargo build for ${{ matrix.target }} ${{ matrix.build.name }}
+        run: |
+          cargo +${{ steps.toolchain.outputs.name }} build --target ${{ matrix.target }} ${{ matrix.build.flags }}
+      - name: Clippy
+        run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
+      - name: meson test for ${{ matrix.target }} ${{ matrix.build.name }}
+        run: |
+          .github/workflows/test.sh \
+              -r target/${{ matrix.target }}/${{ matrix.build.name }}/dav1d \
+              -s target/${{ matrix.target }}/${{ matrix.build.name }}/seek_stress \
+              -t ${{ matrix.build.timeout_multiplier }} \
+              ${{ matrix.variant }}
+      - name: copy log files
+        if: ${{ !cancelled() }}
+        run: |
+          cp ${{ github.workspace }}/build/meson-logs/testlog.txt \
+             ${{ github.workspace }}/build/meson-logs/testlog-${{ matrix.target }}-${{ matrix.build.name }}.txt
+      - name: upload build artifacts
+        # don't upload artifacts for all the test variants to keep names unique
+        if: ${{ !cancelled() && matrix.variant == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-test-logs-${{ matrix.target }}-${{ matrix.build.name }}
+          path: |
+             ${{ github.workspace }}/build/meson-logs/testlog-*.txt
+  cargo-test-on-ubuntu-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable # consumers build on stable, no #![feature] on x86_64
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo +${{ steps.toolchain.outputs.name }} check --workspace --all-targets --features capi,encoder
+      - name: cargo test lib
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --lib
+      - name: cargo test lib with encoder
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --lib --features encoder
+      - name: cargo test integration tests
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --features capi --tests
+  test-on-macos-x86_64:
+    runs-on: macos-15-intel # select an x86_64 image
+    steps:
+      - name: install prerequisites
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: brew install meson
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable # x86_64 feature detection is stable
+          target: x86_64-apple-darwin
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cargo build for x86_64-apple-darwin
+        run: |
+          cargo +${{ steps.toolchain.outputs.name }} build --release
+      - name: meson test for x86_64-apple-darwin
+        run: |
+          .github/workflows/test.sh \
+              -r target/release/dav1d \
+              -s target/release/seek_stress
+      - name: copy log files
+        if: ${{ !cancelled() }}
+        run: |
+          cp ${{ github.workspace }}/build/meson-logs/testlog.txt \
+              ${{ github.workspace }}/build/meson-logs/testlog-x86_64-apple-darwin.txt
+      - name: upload build artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-test-logs-x86_64-apple-darwin
+          path: |
+              ${{ github.workspace }}/build/meson-logs/testlog-*.txt
+  test-on-windows-2022:
+    runs-on: windows-2022
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable # x86_64 feature detection is stable
+          target: x86_64-pc-windows-msvc
+      - name: cargo build
+        run: cargo +${{ steps.toolchain.outputs.name }} build --release
+  argon-on-ubuntu-latest:
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        target: [
+          "x86_64-unknown-linux-gnu"
+        ]
+        build: [ # we do release with overflow checks since debug takes forever
+          # release build with overflow checks
+          {name: "release", flags: "--release"}
+        ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: refresh apt package lists
+        run: sudo apt-get update
+      - name: install prerequisites
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: meson
+          version: 4.0 # version of cache to load
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable # x86_64 feature detection is stable
+          target: ${{ matrix.target }}
+          components: clippy
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cache argon test vectors
+        id: cache-argon
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/argon
+          key: argon_coveragetool_av1_base_and_extended_profiles_v2.1.1.zip
+          restore-keys: | # it is perfectly fine to restore from other branches
+            argon_coveragetool_av1_base_and_extended_profiles_v2.1.1.zip
+      - name: cargo build for ${{ matrix.target }} ${{ matrix.build.name }}
+        run: |
+          cargo +${{ steps.toolchain.outputs.name }} build --target ${{ matrix.target }} ${{ matrix.build.flags }}
+        env:
+          RUSTFLAGS: "-C overflow-checks=on"
+      - name: Clippy
+        run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
+      - name: download, check, and unpack argon test vectors
+        if: ${{ steps.cache-argon.outputs.cache-hit != 'true' }}
+        run: | # delete the downloaded .zip to avoid out-of-diskspace errors
+          curl --silent -O $ARGON_URL
+          curl --silent -O $ARGON_URL_MD5
+          md5sum --check argon_coveragetool_av1_base_and_extended_profiles_v2.1.1.zip.md5sum
+          unzip -q argon_coveragetool_av1_base_and_extended_profiles_v2.1.1.zip
+          rm argon_coveragetool_av1_base_and_extended_profiles_v2.1.1.zip
+          mv argon_coveragetool_av1_base_and_extended_profiles_v2.1 tests/argon
+        env:
+          ARGON_URL: https://aom-cwg-av1-argon-streams-public.s3.us-east-1.amazonaws.com/argon_coveragetool_av1_base_and_extended_profiles_v2.1.1.zip
+          ARGON_URL_MD5: https://aom-cwg-av1-argon-streams-public.s3.us-east-1.amazonaws.com/argon_coveragetool_av1_base_and_extended_profiles_v2.1.1.zip.md5sum
+      - name: run argon tests for ${{ matrix.target }} ${{ matrix.build.name }}
+        run: |
+          tests/dav1d_argon.bash -d target/${{ matrix.target }}/${{ matrix.build.name }}/dav1d -j `nproc`
+  test-on-ubuntu-arm:
+    strategy:
+      matrix:
+        # Test with negative strides, threads and framedelay
+        variant: [
+          "",
+          "-n",
+          "-f 1",
+          "-f 2"
+        ]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: refresh apt package lists
+        run: sudo apt-get update
+      - name: install prerequisites
+        run: sudo apt-get install -y meson
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable # aarch64 feature detection is stable
+          components: clippy
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cargo build release
+        run: cargo +${{ steps.toolchain.outputs.name }} build --release
+      - name: Clippy
+        run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
+      - name: cargo test lib
+        if: ${{ matrix.variant == '' }}
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --lib
+      - name: meson test
+        run: |
+          .github/workflows/test.sh \
+              -r target/release/dav1d \
+              -s target/release/seek_stress \
+              -t 1 \
+              ${{ matrix.variant }}
+      - name: upload build artifacts
+        if: ${{ !cancelled() && matrix.variant == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-test-logs-aarch64-unknown-linux-gnu
+          path: |
+             ${{ github.workspace }}/build/meson-logs/testlog.txt
+  test-on-macos-aarch64:
+    strategy:
+      matrix:
+        build: [
+          {name: "release", cargo_flags: "--release",  timeout_multiplier: 1}
+        ]
+    runs-on: macos-15
+    steps:
+      - name: install prerequisites
+        run: |
+          brew install meson
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable # aarch64 feature detection is stable
+          target: aarch64-apple-darwin
+          components: clippy
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cargo ${{ matrix.build.name }} build for aarch64-apple-darwin
+        run:  cargo +${{ steps.toolchain.outputs.name }} build ${{ matrix.build.cargo_flags }}
+      - name: Clippy
+        run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
+      - name: cargo test lib
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --lib
+      - name: test ${{ matrix.build.name }} build without frame delay
+        run: |
+          .github/workflows/test.sh \
+            -r ./target/${{ startsWith(matrix.build.name, 'release') && 'release' || matrix.build.name }}/dav1d \
+            -s ./target/${{ startsWith(matrix.build.name, 'release') && 'release' || matrix.build.name }}/seek_stress \
+            -t ${{ matrix.build.timeout_multiplier }}
+        # release tests run quickly so we test negative strides and frame delays
+      - name: test release build with negative stride
+        if: ${{ startsWith(matrix.build.name, 'release') }}
+        run: |
+          .github/workflows/test.sh \
+            -r ./target/release/dav1d \
+            -s ./target/release/seek_stress \
+            -t ${{ matrix.build.timeout_multiplier }} \
+            -n
+      - name: test release build with frame delay of 1
+        if: ${{ startsWith(matrix.build.name, 'release') }}
+        run: |
+          .github/workflows/test.sh \
+            -r ./target/release/dav1d \
+            -s ./target/release/seek_stress \
+            -t ${{ matrix.build.timeout_multiplier }} \
+            -f 1
+      - name: test release build with frame delay of 2
+        if: ${{ startsWith(matrix.build.name, 'release') }}
+        run: |
+          .github/workflows/test.sh \
+            -r ./target/release/dav1d \
+            -s ./target/release/seek_stress \
+            -t ${{ matrix.build.timeout_multiplier }} \
+            -f 2
+      - name: copy log files
+        if: ${{ !cancelled() }}
+        run: |
+          cp ${{ github.workspace }}/build/meson-logs/testlog.txt \
+              ${{ github.workspace }}/build/meson-logs/testlog-aarch64-apple-darwin-${{ matrix.build.name }}.txt
+      - name: upload build artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-test-logs-aarch64-apple-darwin-${{ matrix.build.name }}
+          path: |
+            ${{ github.workspace }}/build/meson-logs/testlog-*.txt
+  test-in-android-emulator:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    steps:
+      - name: add NDK toolchain to path
+        run: |
+            echo "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # aarch64 feature detection is stable
+          toolchain: stable
+          target: aarch64-linux-android
+          components: clippy
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cargo build for aarch64-linux-android
+        run: |
+            cargo +${{ steps.toolchain.outputs.name }} build --target aarch64-linux-android --release
+        env:
+          AR: llvm-ar
+          CC: aarch64-linux-android26-clang
+          RUSTFLAGS: "-C linker=aarch64-linux-android26-clang -L $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/17/lib/linux/aarch64 -L $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/26"
+  test-on-ubuntu-latest-with-qemu:
+    strategy:
+      matrix:
+        # targets without a GitHub-hosted runner of their own
+        include:
+          - target: "armv7-unknown-linux-gnueabihf"
+            linker: "arm-linux-gnueabihf-gcc"
+            wrapper: "qemu-arm-static"
+            packages: "g++-arm-linux-gnueabihf libc6-dev-armhf-cross"
+            # arm feature detection is unstable
+            # should be the same as rust-toolchain.toml
+            toolchain: nightly-2026-02-05
+          - target: "riscv64gc-unknown-linux-gnu"
+            linker: "riscv64-linux-gnu-gcc"
+            wrapper: "qemu-riscv64-static"
+            packages: "g++-riscv64-linux-gnu libc6-dev-riscv64-cross"
+            # riscv64 feature detection is unstable
+            # should be the same as rust-toolchain.toml
+            toolchain: nightly-2026-02-05
+    runs-on: ubuntu-22.04
+    name: test on ${{ matrix.target }}
+    steps:
+      - name: install prerequisites
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: ${{ matrix.packages }} qemu-user-static meson
+          version: 3.0 # version of cache to load
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        id: toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          target: ${{ matrix.target }}
+          components: clippy
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: cargo build for ${{ matrix.target }}
+        run: |
+          RUSTFLAGS="-C target-feature=+crt-static -C linker=${{ matrix.linker }}" \
+            cargo +${{ steps.toolchain.outputs.name }} build --release --target ${{ matrix.target }}
+      - name: Clippy
+        run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
+      - name: run tests
+        run: |
+            .github/workflows/test.sh -t 4 \
+              -r target/${{ matrix.target }}/release/dav1d \
+              -s target/${{ matrix.target }}/release/seek_stress \
+              -w "${{ matrix.wrapper }}"
+      - name: upload build artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-test-logs-${{ matrix.target }}
+          path: |
+             ${{ github.workspace }}/build/meson-logs/testlog.txt
+  cargo-fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - name: git checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: cache rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        continue-on-error: true # the tree is not rustfmt-clean yet (30 files)
+        run: cargo fmt --check
+  benchmark-on-ubuntu-latest:
+      runs-on: ubuntu-latest
+      steps:
+          - name: install perf
+            run: |
+              sudo apt-get update
+              sudo apt-get install -y linux-tools-common linux-tools-$(uname -r)
+              sudo sysctl kernel.perf_event_paranoid=1
+          - name: git checkout
+            uses: actions/checkout@v4
+          - name: install rust toolchain
+            id: toolchain
+            uses: dtolnay/rust-toolchain@master
+            with:
+              toolchain: stable # shared runners: compare instructions, not cycles
+              target: x86_64-unknown-linux-gnu
+              components: clippy
+          - name: release build this PR
+            run: cargo +${{ steps.toolchain.outputs.name }} build --release
+          - name: release build main branch
+            run: |
+              git fetch --depth 1 origin main && git checkout origin/main
+              cargo +${{ steps.toolchain.outputs.name }} build --release --target-dir target.main
+          - name: benchmark on chimera 8-bit test data
+            run: |
+              mkdir -p `dirname $LOCAL_FILE`
+              [ ! -f "$LOCAL_FILE" ] && curl -s -o $LOCAL_FILE $REMOTE_URL
+              perf stat -r3 -- target/release/dav1d -q -i $LOCAL_FILE -o /dev/null
+
+              # generate diff vs. main branch
+              input=$(basename $LOCAL_FILE)
+              perf record -o perf.data.$input      -- target/release/dav1d -q -i $LOCAL_FILE -o /dev/null
+              perf record -o perf.data.$input.main -- target.main/release/dav1d -q -i $LOCAL_FILE -o /dev/null
+              perf diff perf.data.$input.main perf.data.$input | head -n 100
+            env:
+              REMOTE_URL: http://download.opencontent.netflix.com.s3.amazonaws.com/AV1/Chimera/Old/Chimera-AV1-8bit-1280x720-3363kbps.ivf
+              LOCAL_FILE: /tmp/rav1d/Chimera-AV1-8bit-1280x720-3363kbps.ivf
+          - name: benchmark on chimera 10-bit test data
+            run: |
+              mkdir -p `dirname $LOCAL_FILE`
+              [ ! -f "$LOCAL_FILE" ] && curl -s -o $LOCAL_FILE $REMOTE_URL
+              perf stat -r3 -- target/release/dav1d -q -i $LOCAL_FILE -o /dev/null
+
+              # generate diff vs. main branch
+              input=$(basename $LOCAL_FILE)
+              perf record -o perf.data.$input      -- target/release/dav1d -q -i $LOCAL_FILE -o /dev/null
+              perf record -o perf.data.$input.main -- target.main/release/dav1d -q -i $LOCAL_FILE -o /dev/null
+              perf diff perf.data.$input.main perf.data.$input | head -n 100
+            env:
+              REMOTE_URL: http://download.opencontent.netflix.com.s3.amazonaws.com/AV1/Chimera/Old/Chimera-AV1-10bit-1920x1080-6191kbps.ivf
+              LOCAL_FILE: /tmp/rav1d/Chimera-AV1-10bit-1920x1080-6191kbps.ivf
+          - name: upload benchmark data
+            uses: actions/upload-artifact@v4
+            with:
+              name: perf-data
+              path:  ${{ github.workspace }}/perf.data.*
