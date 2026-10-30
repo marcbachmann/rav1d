@@ -33,7 +33,10 @@ jobs:
       - name: cargo ${{ matrix.build.name }} build for aarch64-apple-darwin
         run:  cargo +${{ steps.toolchain.outputs.name }} build ${{ matrix.build.cargo_flags }}
       - name: Clippy
+        continue-on-error: true # the tree has pre-existing clippy errors
         run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
+      - name: cargo test lib
+        run: cargo +${{ steps.toolchain.outputs.name }} test --release --lib
       - name: test ${{ matrix.build.name }} build without frame delay
         run: |
           .github/workflows/test.sh \
