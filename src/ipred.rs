@@ -467,9 +467,8 @@ unsafe extern "C" fn ipred_cfl_128_c_erased<BD: BitDepth>(
     cfl_pred(dst, width, height, dc, ac, alpha, bd)
 }
 
-/// The intra predictions with the block width in the type, on `u8` or `u16` pixels. DC is a
-/// fixed-length sum of the edge and rows stored from a constant array, both of which the compiler
-/// vectorizes on every target; smooth and CfL run on [`I16x8`].
+/// The intra predictions with the block width in the type, on `u8` or `u16` pixels, over
+/// [`I16x8`]. DC sums its edges into lanes and stores its rows from a constant array.
 mod rust_simd {
     use std::mem::size_of;
 
@@ -598,9 +597,18 @@ mod rust_simd {
         FromBytes::mut_slice_from(b).unwrap()
     }
 
+    /// `px[..N]` summed into the lanes, `N` a power of two from 4. Up to 64 + 64 of them fit
+    /// the lanes as `u16` to 12 bpc.
     #[inline(always)]
-    fn sum<P: Pix, const N: usize>(px: &[P]) -> u32 {
-        px[..N].iter().map(|&p| p.into()).sum()
+    fn lanes<P: Pix, const N: usize>(px: &[P]) -> I16x8 {
+        if N == 4 {
+            return P::load4(px);
+        }
+        let mut v = P::load8(px);
+        for i in 1..N / 8 {
+            v = v.add(P::load8(&px[8 * i..]));
+        }
+        v
     }
 
     /// `half` is the DC_128 value, half the pixel range.
@@ -610,13 +618,14 @@ mod rust_simd {
         off: usize,
         half: u32,
     ) -> P {
-        let top = || sum::<P, W>(&topleft[off + 1..]);
-        let left = || sum::<P, H>(&topleft[off - H..]);
+        let top = || lanes::<P, W>(&topleft[off + 1..]);
+        let left = || lanes::<P, H>(&topleft[off - H..]);
         let dc = match DcGen::from_repr(GEN) {
-            Some(DcGen::Top) => top() + (W >> 1) as u32 >> W.trailing_zeros(),
-            Some(DcGen::Left) => left() + (H >> 1) as u32 >> H.trailing_zeros(),
+            Some(DcGen::Top) => top().hsum_u() + (W >> 1) as u32 >> W.trailing_zeros(),
+            Some(DcGen::Left) => left().hsum_u() + (H >> 1) as u32 >> H.trailing_zeros(),
             Some(DcGen::TopLeft) => {
-                let dc = top() + left() + ((W + H) >> 1) as u32 >> (W + H).trailing_zeros();
+                let sum = top().add(left()).hsum_u();
+                let dc = sum + ((W + H) >> 1) as u32 >> (W + H).trailing_zeros();
                 // 1/3 and 1/5 in fixed point, finer for the larger sums of `u16` pixels.
                 let (third, fifth, shift) =
                     if size_of::<P>() == 1 { (0x5556, 0x3334, 16) } else { (0xaaab, 0x6667, 17) };
@@ -647,12 +656,32 @@ mod rust_simd {
             }
             return;
         }
-        // One borrow for the block: its rows are the chunks of a slice ending at the last row.
+        // One borrow for the block, ending at the last row: the rows above it are exact chunks.
         let stride = stride as usize;
         let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
-        for r in px_mut::<P>(block.as_bytes_mut()).chunks_mut(stride) {
+        let (rows, last) = px_mut::<P>(block.as_bytes_mut()).split_at_mut((H - 1) * stride);
+        for r in rows.chunks_exact_mut(stride) {
             r[..W].copy_from_slice(&row);
         }
+        last.copy_from_slice(&row);
+    }
+
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn dc_128<BD: BitDepth, const GEN: u8>(
+        dst: Rav1dPictureDataComponentOffset,
+        topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
+        off: usize,
+        width: c_int,
+        height: c_int,
+        half: u32,
+    ) {
+        with_px!(BD, |P| {
+            let topleft = px::<P>(topleft.as_bytes());
+            by_size!(width, height, |W, H| dc::<BD, P, W, H, GEN>(dst, topleft, off, half))
+        })
     }
 
     /// A block's SMOOTH constants: its bottom-left and top-right pixels and the bases below.
@@ -1434,8 +1463,9 @@ mod rust_simd {
     ///
     /// # Safety
     ///
-    /// Must be called by [`angular_ipred::Fn::call`].
+    /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_dc_erased<BD: BitDepth, const GEN: u8>(
         _dst_ptr: *mut DynPixel,
         _stride: ptrdiff_t,
@@ -1454,15 +1484,8 @@ mod rust_simd {
         // SAFETY: `fn angular_ipred::Fn::call` makes `topleft` `topleft_off` from the beginning of the array.
         let topleft = unsafe { reconstruct_topleft::<BD>(topleft, topleft_off) };
         let half = (bitdepth_max + 1) as u32 >> 1;
-        with_px!(BD, |P| {
-            let topleft = px::<P>(topleft.as_bytes());
-            by_size!(width, height, |W, H| dc::<BD, P, W, H, GEN>(
-                dst,
-                topleft,
-                topleft_off,
-                half
-            ))
-        })
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe { dc_128::<BD, GEN>(dst, topleft, topleft_off, width, height, half) }
     }
 
     /// `MODE` is [`SMOOTH`], [`SMOOTH_V`] or [`SMOOTH_H`].
@@ -3395,12 +3418,6 @@ impl Rav1dIntraPredDSPContext {
     const fn init_rust_simd<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
         use self::rust_simd::*;
 
-        let a = &mut self.intra_pred;
-        a[DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::TopLeft as u8 }>);
-        a[TOP_DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::Top as u8 }>);
-        a[LEFT_DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::Left as u8 }>);
-        a[DC_128_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, DC_128>);
-
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if !flags.contains(CpuFlags::SSE41) {
             return self;
@@ -3410,6 +3427,10 @@ impl Rav1dIntraPredDSPContext {
             return self;
         }
         let a = &mut self.intra_pred;
+        a[DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::TopLeft as u8 }>);
+        a[TOP_DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::Top as u8 }>);
+        a[LEFT_DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::Left as u8 }>);
+        a[DC_128_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, DC_128>);
         a[SMOOTH_PRED as usize] = angular_ipred::Fn::new(ipred_smooth_erased::<BD, SMOOTH>);
         a[SMOOTH_V_PRED as usize] = angular_ipred::Fn::new(ipred_smooth_erased::<BD, SMOOTH_V>);
         a[SMOOTH_H_PRED as usize] = angular_ipred::Fn::new(ipred_smooth_erased::<BD, SMOOTH_H>);

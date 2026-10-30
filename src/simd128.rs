@@ -1121,6 +1121,19 @@ mod imp {
             unsafe { _mm_movemask_epi8(self.0) != 0 }
         }
 
+        /// The sum of the lanes as `u16`.
+        #[inline(always)]
+        pub fn hsum_u(self) -> u32 {
+            unsafe {
+                let lo = _mm_cvtepu16_epi32(self.0);
+                let hi = _mm_cvtepu16_epi32(_mm_srli_si128::<8>(self.0));
+                let s = _mm_add_epi32(lo, hi);
+                let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b01_00_11_10>(s));
+                let s = _mm_add_epi32(s, _mm_shuffle_epi32::<0b10_11_00_01>(s));
+                _mm_cvtsi128_si32(s) as u32
+            }
+        }
+
         /// The first set lane of the masks `self` then `o`, 16 if none is.
         #[inline(always)]
         pub fn first_set2(self, o: Self) -> u32 {
@@ -1861,6 +1874,12 @@ mod imp {
         #[inline(always)]
         pub fn any(self) -> bool {
             unsafe { vmaxvq_u16(u(self.0)) != 0 }
+        }
+
+        /// The sum of the lanes as `u16`.
+        #[inline(always)]
+        pub fn hsum_u(self) -> u32 {
+            unsafe { vaddlvq_u16(u(self.0)) }
         }
 
         /// The first set lane of the masks `self` then `o`, 16 if none is.
@@ -2704,6 +2723,16 @@ mod imp {
             v128_any_true(self.0)
         }
 
+        /// The sum of the lanes as `u16`.
+        #[inline(always)]
+        pub fn hsum_u(self) -> u32 {
+            let s = u32x4_extadd_pairwise_u16x8(self.0);
+            u32x4_extract_lane::<0>(s)
+                + u32x4_extract_lane::<1>(s)
+                + u32x4_extract_lane::<2>(s)
+                + u32x4_extract_lane::<3>(s)
+        }
+
         /// The first set lane of the masks `self` then `o`, 16 if none is.
         #[inline(always)]
         pub fn first_set2(self, o: Self) -> u32 {
@@ -3414,6 +3443,12 @@ mod imp {
         #[inline(always)]
         pub fn any(self) -> bool {
             self.0.iter().any(|&m| m != 0)
+        }
+
+        /// The sum of the lanes as `u16`.
+        #[inline(always)]
+        pub fn hsum_u(self) -> u32 {
+            self.0.iter().map(|&v| v as u16 as u32).sum()
         }
 
         /// The first set lane of the masks `self` then `o`, 16 if none is.
