@@ -907,6 +907,9 @@ mod rust_simd {
         let (wv, hv) = (W - 4 * w_pad, h - 4 * h_pad);
         let stride = y_src.pixel_stride::<BD>();
         let lw = wv << SS_HOR as u8;
+        // The sum as the rows are made, in 32 bits: the vectors, then the padding.
+        let mut wide = [I32x4::splat(0); 2];
+        let mut pad = 0;
         for (y, row) in ac.chunks_exact_mut(W).take(hv).enumerate() {
             let src = y_src + (y as isize * stride << SS_VER as u8);
             let r0 = src.slice::<BD>(lw);
@@ -915,40 +918,30 @@ mod rust_simd {
             let r1 = r1.as_deref().map_or(&[][..], |r| px::<P>(r.as_bytes()));
             let mut x = 0;
             while x + 8 <= wv {
-                luma::<P, SS_HOR, SS_VER, false>(r0, r1, x).store(&mut row[x..]);
+                let v = luma::<P, SS_HOR, SS_VER, false>(r0, r1, x);
+                v.store(&mut row[x..]);
+                wide = v.addw_u(wide);
                 x += 8;
             }
             if x < wv {
-                luma::<P, SS_HOR, SS_VER, true>(r0, r1, x).store_lo(&mut row[x..]);
+                let v = luma::<P, SS_HOR, SS_VER, true>(r0, r1, x);
+                v.store_lo(&mut row[x..]);
+                wide = v.addw_u(wide);
             }
             let last = row[wv - 1];
             row[wv..].fill(last);
+            pad += (W - wv) as u32 * last as u32;
+        }
+        if hv < h {
+            let last: u32 = ac[(hv - 1) * W..hv * W].iter().map(|&v| v as u32).sum();
+            pad += (h - hv) as u32 * last;
         }
         for y in hv..h {
             ac.copy_within((hv - 1) * W..hv * W, y * W);
         }
-
-        // A lane adds values below `8 << bitdepth` in 16 bits: 32 of them at 8 bpc, one above.
-        let group = if size_of::<P>() == 1 { 32 * 32 } else { 32 };
-        let mut wide = [I32x4::splat(0); 2];
-        for g in ac.chunks(group) {
-            let mut acc = [I16x8::splat(0); 4];
-            let mut quads = g.chunks_exact(32);
-            for q in &mut quads {
-                for i in 0..4 {
-                    acc[i] = acc[i].add(I16x8::load(&q[8 * i..]));
-                }
-            }
-            for (i, c) in quads.remainder().chunks_exact(8).enumerate() {
-                acc[i] = acc[i].add(I16x8::load(c));
-            }
-            for v in acc {
-                wide = v.addw_u(wide);
-            }
-        }
         let mut lanes = [0; 4];
         wide[0].add(wide[1]).store(&mut lanes);
-        let sum = lanes.iter().sum::<i32>() as u32;
+        let sum = lanes.iter().sum::<i32>() as u32 + pad;
         let log2sz = W.trailing_zeros() + h.trailing_zeros();
         let mean = I16x8::splat((sum + (1 << log2sz >> 1) >> log2sz) as i16);
         for c in ac.chunks_exact_mut(8) {
@@ -1133,19 +1126,25 @@ mod rust_simd {
     /// The length of a scratch column, a block side and the 8 lanes a step may write past it.
     const TS: usize = 64 + 8;
 
-    /// The `W` columns of `t`, `H` pixels each, as the rows of `out`, `os` apart.
+    /// The first `cols` of the `W` columns of `t`, `H` pixels each, as the rows of `out`, `os`
+    /// apart; with 8 columns a step, up to `cols` rounded up to 8.
     #[inline(always)]
-    fn transpose_cols<P: Pix, const W: usize, const H: usize>(t: &[[P; TS]; W], out: &mut [P], os: usize) {
+    fn transpose_cols<P: Pix, const W: usize, const H: usize>(
+        t: &[[P; TS]; W],
+        cols: usize,
+        out: &mut [P],
+        os: usize,
+    ) {
         if W % 8 != 0 || H % 8 != 0 {
             for (y, row) in out.chunks_mut(os).take(H).enumerate() {
-                for x in 0..W {
+                for x in 0..cols {
                     row[x] = t[x][y];
                 }
             }
             return;
         }
         for y in (0..H).step_by(8) {
-            for x in (0..W).step_by(8) {
+            for x in (0..cols).step_by(8) {
                 // A loop, not a closure: a closure would not inherit the kernel's target features.
                 let mut v = [I16x8::splat(0); 8];
                 for i in 0..8 {
@@ -1170,7 +1169,7 @@ mod rust_simd {
     ) {
         let mut t = [[P::default(); TS]; W];
         dir_rows::<P, H, STEP>(t.as_flattened_mut(), TS, W, e, max, dy);
-        transpose_cols::<P, W, H>(&t, block, stride);
+        transpose_cols::<P, W, H>(&t, W, block, stride);
     }
 
     /// Two-tap interpolation of 8 pixels from `e[i..]`, the steps 2 apart where upsampled.
@@ -1185,8 +1184,8 @@ mod rust_simd {
 
     /// Z2 from its edge, top-left pixel at 64. A row takes the left edge up to the column where
     /// the top edge starts. Down a column the left edge is read in a straight line with one
-    /// fraction, so the left part runs per column into a scratch turned into rows; the top part
-    /// runs per row.
+    /// fraction, so the left part runs per column into a scratch turned into the block's rows;
+    /// the top part then runs per row over the rest of it.
     #[inline(always)]
     fn z2<P: Pix, const W: usize, const H: usize>(
         block: &mut [P],
@@ -1216,7 +1215,9 @@ mod rust_simd {
         let mut left_cols = 0;
         for y in 0..H {
             let base = xpos(y) >> 6;
-            let s = if base >= 0 { 0 } else { ((-base) as usize).div_ceil(inc_x).min(W) };
+            // `-base` over `inc_x` rounded up, as a shift.
+            let up = up_above as usize;
+            let s = if base >= 0 { 0 } else { ((-base) as usize + up >> up).min(W) };
             for x in left_cols..s {
                 y0[x] = y;
             }
@@ -1234,24 +1235,23 @@ mod rust_simd {
                 t[x][y..y + 8].copy_from_slice(&dir8_at(&r, j, frac, up_left));
             }
         }
-        let mut left = [[P::default(); 64]; H];
         if left_cols != 0 {
-            transpose_cols::<P, W, H>(&t, left.as_flattened_mut(), 64);
+            transpose_cols::<P, W, H>(&t, left_cols, block, stride);
         }
 
         for (y, row) in block.chunks_mut(stride).enumerate() {
             let s = split[y];
-            let mut px = [P::default(); 64 + 8];
-            if s < W {
-                let pos = xpos(y);
-                let frac = I16x8::splat(((pos & 0x3e) << 9) as i16);
-                for x in (s & !7..W).step_by(8) {
-                    let i = (TL as isize + (pos >> 6) + (inc_x * x) as isize) as usize;
-                    px[x..x + 8].copy_from_slice(&dir8_at(&e, i, frac, up_above));
-                }
+            if s == W {
+                continue;
             }
-            px[..s].copy_from_slice(&left[y][..s]);
-            row[..W].copy_from_slice(&px[..W]);
+            let mut px = [P::default(); 64 + 8];
+            let pos = xpos(y);
+            let frac = I16x8::splat(((pos & 0x3e) << 9) as i16);
+            for x in (s & !7..W).step_by(8) {
+                let i = (TL as isize + (pos >> 6) + (inc_x * x) as isize) as usize;
+                px[x..x + 8].copy_from_slice(&dir8_at(&e, i, frac, up_above));
+            }
+            row[s..W].copy_from_slice(&px[s..W]);
         }
     }
 
@@ -3825,6 +3825,9 @@ mod tests {
             ("z1", Z1_PRED, 45 | 1 << 10),
             ("z2", Z2_PRED, 135 | 1 << 10),
             ("z3", Z3_PRED, 225 | 1 << 10),
+            ("z1 unfiltered", Z1_PRED, 45),
+            ("z2 unfiltered", Z2_PRED, 135),
+            ("z3 unfiltered", Z3_PRED, 225),
         ] {
             for (w, h) in [(4, 4), (8, 8), (16, 8), (16, 16), (32, 32), (64, 64)] {
                 line(name, w, h, &|dsp| {
