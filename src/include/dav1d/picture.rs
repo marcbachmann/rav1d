@@ -422,29 +422,37 @@ impl<'a> Rav1dPictureDataComponentOffset<'a> {
         let stride = self.pixel_stride::<BD>();
         let len = self.data.pixel_len::<BD>();
         // Row starts are linear in `y`, so the first and the last row bound all the others.
-        let fits = rows.is_empty()
-            || cols.is_empty()
-            || match (
+        // `(lo, hi)`: the pixels from the first row's start to the last row's end.
+        let range = if rows.is_empty() || cols.is_empty() {
+            Some((self.offset as isize, self.offset as isize))
+        } else {
+            match (
                 row_start(self.offset, stride, rows.start, cols.start),
                 row_start(self.offset, stride, rows.end - 1, cols.start),
                 cols.end.checked_sub(cols.start),
             ) {
-                (Some(a), Some(b), Some(w)) => {
-                    a.min(b) >= 0
-                        && a.max(b)
-                            .checked_add(w)
-                            .is_some_and(|end| end as usize <= len)
-                }
-                _ => false,
-            };
-        if !fits {
+                (Some(a), Some(b), Some(w)) => a
+                    .max(b)
+                    .checked_add(w)
+                    .filter(|&end| a.min(b) >= 0 && end as usize <= len)
+                    .map(|end| (a.min(b), end)),
+                _ => None,
+            }
+        };
+        let Some((lo, hi)) = range else {
             out_of_bounds(rows, cols, self.offset, len);
-        }
+        };
+        #[cfg(debug_assertions)]
+        let _ = (lo, hi);
         PicBlock {
             #[cfg(debug_assertions)]
             at: self,
             #[cfg(not(debug_assertions))]
             origin: self.data.as_mut_ptr::<BD>().wrapping_add(self.offset),
+            #[cfg(not(debug_assertions))]
+            lo: lo.wrapping_sub(self.offset as isize),
+            #[cfg(not(debug_assertions))]
+            span: (hi - lo) as usize,
             stride,
             rows: (rows.start, rows.end),
             cols: (cols.start, cols.end),
@@ -456,8 +464,9 @@ impl<'a> Rav1dPictureDataComponentOffset<'a> {
 /// The rows of a block in a picture component, its whole footprint checked once by
 /// [`Rav1dPictureDataComponentOffset::block`] to lie in the component's allocation.
 ///
-/// Release builds then borrow its rows without bounds checks. Like [`DisjointMut::index_mut`],
-/// that is not `unsafe` to call but relies on correct use, which only debug builds check:
+/// Release builds then check a row with one compare, against the pixels from the footprint's
+/// first row to its last, so a row never leaves the allocation. Like [`DisjointMut::index_mut`]
+/// in release, the rest relies on correct use, which only debug builds check:
 /// - the `n` pixels at `(x, y)` lie in the footprint: `y` in its rows, `x..x + n` in its
 ///   columns. Kernels declare the footprint from the block size they loop over.
 /// - a borrowed row overlaps no mutable borrow of the same pixels while held.
@@ -471,10 +480,22 @@ pub struct PicBlock<'a, BD: BitDepth> {
     #[cfg(not(debug_assertions))]
     /// Pixel `(0, 0)` of the block; only the footprint is known to be in bounds.
     origin: *mut BD::Pixel,
+    /// The footprint's pixels in the allocation, `origin + lo..origin + lo + span`.
+    #[cfg(not(debug_assertions))]
+    lo: isize,
+    #[cfg(not(debug_assertions))]
+    span: usize,
     stride: isize,
     rows: (isize, isize),
     cols: (isize, isize),
     phantom: PhantomData<(&'a Rav1dPictureDataComponent, BD)>,
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(never)]
+#[cold]
+fn row_out_of_bounds() -> ! {
+    panic!("row out of its block's pixels");
 }
 
 #[cfg(debug_assertions)]
@@ -500,7 +521,12 @@ impl<'a, BD: BitDepth> PicBlock<'a, BD> {
             inside,
             "{n} pixels at ({x}, {y}) outside block rows {top}..{bottom} columns {left}..{right}"
         );
-        y.wrapping_mul(self.stride).wrapping_add(x)
+        let i = y.wrapping_mul(self.stride).wrapping_add(x);
+        #[cfg(not(debug_assertions))]
+        if i.wrapping_sub(self.lo) as usize > self.span.wrapping_sub(n) || n > self.span {
+            row_out_of_bounds();
+        }
+        i
     }
 
     /// `n` pixels of row `y` from column `x`.
@@ -510,8 +536,8 @@ impl<'a, BD: BitDepth> PicBlock<'a, BD> {
         let i = self.at(y, x, n);
         #[cfg(debug_assertions)]
         return (self.at + i).slice::<BD>(n);
-        // SAFETY: `block` checked that the footprint lies in the allocation, and `i`'s `n`
-        // pixels lie in the footprint (the caller's part, checked in debug builds).
+        // SAFETY: `block` checked that the footprint's pixels lie in the allocation, and `at`
+        // that `i`'s `n` pixels lie in the footprint's.
         #[cfg(not(debug_assertions))]
         unsafe {
             std::slice::from_raw_parts(self.origin.wrapping_offset(i), n)
@@ -1130,5 +1156,27 @@ mod tests {
             .with_offset::<BitDepth8>()
             .block::<BitDepth8>(0..2, 0..8);
         let _ = b.row(0, 1, 8);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    #[should_panic(expected = "row out of its block's pixels")]
+    fn block_row_past_its_pixels_refused_in_release() {
+        let mut buf = plane::<BitDepth8>();
+        let pic = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), S);
+        let b = pic
+            .with_offset::<BitDepth8>()
+            .block::<BitDepth8>(0..1, 0..8);
+        let _ = b.row(H as isize, 0, 8);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    #[should_panic(expected = "row out of its block's pixels")]
+    fn block_row_before_its_pixels_refused_in_release() {
+        let mut buf = plane::<BitDepth8>();
+        let pic = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), S);
+        let b = (pic.with_offset::<BitDepth8>() + S).block::<BitDepth8>(0..1, 0..8);
+        let _ = b.row(-1, 0, 8);
     }
 }
