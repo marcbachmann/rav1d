@@ -723,7 +723,9 @@ fn add_temporal_candidate(
     let last = *cnt;
     if r#ref.r#ref[1] == -1 {
         if let Some((globalmv_ctx, gmv)) = globalmv {
-            *globalmv_ctx = ((mv.x - gmv[0].x).abs() | (mv.y - gmv[0].y).abs() >= 16) as i32;
+            *globalmv_ctx = ((mv.x as i32 - gmv[0].x as i32).abs()
+                | (mv.y as i32 - gmv[0].y as i32).abs()
+                >= 16) as i32;
         }
 
         for cand in &mut mvstack[..last] {
@@ -1574,7 +1576,9 @@ fn save_tmvs_rust(
             let block = |i: usize| {
                 let mv = cand_b.mv.mv[i];
                 let r#ref = cand_b.r#ref.r#ref[i];
-                if r#ref > 0 && ref_sign[r#ref as usize - 1] != 0 && mv.y.abs() | mv.x.abs() < 4096
+                if r#ref > 0
+                    && ref_sign[r#ref as usize - 1] != 0
+                    && mv.y.unsigned_abs() | mv.x.unsigned_abs() < 4096
                 {
                     Some(RefMvsTemporalBlock {
                         mv: mv.into_unaligned(),
