@@ -1212,12 +1212,18 @@ mod rust_simd {
     /// scaled by `1 << 9` so that the rounding multiply-high divides by 64.
     #[inline(always)]
     fn dir8<P: Pix, const STEP: usize>(e: &[P], i: usize, frac: I16x8) -> [P; 8] {
+        P::px8(dir8v::<P, STEP>(e, i, frac))
+    }
+
+    /// [`dir8`] in the lanes.
+    #[inline(always)]
+    fn dir8v<P: Pix, const STEP: usize>(e: &[P], i: usize, frac: I16x8) -> I16x8 {
         let (a, b) = if STEP == 1 {
             (P::load8(&e[i..]), P::load8(&e[i + 1..]))
         } else {
             P::pairs::<false>(&e[i..])
         };
-        P::px8(a.add(b.sub(a).mulhrs(frac)))
+        a.add(b.sub(a).mulhrs(frac))
     }
 
     /// `n` rows of `W` pixels `os` apart in `out`, row `r` read from `e` at `(r + 1) * d / 64`
@@ -1232,7 +1238,8 @@ mod rust_simd {
         d: usize,
     ) {
         let last = e[max];
-        e[max + 1..].fill(last);
+        // A row reads up to `STEP * W + 8` pixels on from a base below `max`.
+        e[max + 1..(max + STEP * W + 9).min(EXT)].fill(last);
         for r in 0..n {
             let pos = (r + 1) * d;
             let base = pos >> 6;
@@ -1408,13 +1415,10 @@ mod rust_simd {
         })
     }
 
-    /// The length of a scratch column, a block side and the 8 lanes a step may write past it.
-    const TS: usize = 64 + 8;
-
     /// The first `cols` of the `W` columns of `t`, `H` pixels each, as the rows of `out`, `os`
     /// apart; with 8 columns a step, up to `cols` rounded up to 8.
     #[inline(always)]
-    fn transpose_cols<P: Pix, const W: usize, const H: usize, O: Rows<P>>(
+    fn transpose_cols<P: Pix, const W: usize, const H: usize, const TS: usize, O: Rows<P>>(
         t: &[[P; TS]; W],
         cols: usize,
         out: &mut O,
@@ -1452,44 +1456,52 @@ mod rust_simd {
         dy: usize,
         max: usize,
     ) {
-        let mut t = [[P::default(); TS]; W];
-        let mut s = Scratch { buf: t.as_flattened_mut(), stride: TS };
+        let mut t = [[P::default(); H]; W];
+        let mut s = Scratch { buf: t.as_flattened_mut(), stride: H };
         dir_rows::<P, H, STEP, _>(&mut s, W, e, max, dy);
-        transpose_cols::<P, W, H, _>(&t, W, block);
+        transpose_cols::<P, W, H, H, _>(&t, W, block);
     }
 
     /// Two-tap interpolation of 8 pixels from `e[i..]`, the steps 2 apart where upsampled.
     #[inline(always)]
     fn dir8_at<P: Pix>(e: &[P], i: usize, frac: I16x8, upsampled: bool) -> [P; 8] {
+        P::px8(dir8v_at(e, i, frac, upsampled))
+    }
+
+    #[inline(always)]
+    fn dir8v_at<P: Pix>(e: &[P], i: usize, frac: I16x8, upsampled: bool) -> I16x8 {
         if upsampled {
-            dir8::<P, 2>(e, i, frac)
+            dir8v::<P, 2>(e, i, frac)
         } else {
-            dir8::<P, 1>(e, i, frac)
+            dir8v::<P, 1>(e, i, frac)
         }
     }
 
+    /// Room for Z2's edge, top-left pixel at 64, and the lanes a row reads past its end.
+    const Z2E: usize = 64 + 64 + 1 + 16;
+
     /// Z2 from its edge, top-left pixel at 64. A row takes the left edge up to the column where
     /// the top edge starts. Down a column the left edge is read in a straight line with one
-    /// fraction, so the left part runs per column into a scratch turned into the block's rows;
-    /// the top part then runs per row over the rest of it.
+    /// fraction, so the left part runs per column into a scratch of columns `TS >= max(H, 8)`
+    /// long turned into the block's rows; the top part then runs per row over the rest of it.
     #[inline(always)]
-    fn z2<P: Pix, const W: usize, const H: usize, O: Rows<P>>(
+    fn z2<P: Pix, const W: usize, const H: usize, const TS: usize, O: Rows<P>>(
         block: &mut O,
-        edge: &[P; 64 + 64 + 1],
+        e: &[P; Z2E],
         dx: usize,
         dy: usize,
         up_above: bool,
         up_left: bool,
     ) {
-        // The top edge with `TL` at the top-left pixel and the left edge reversed, `r[PAD + j]`
-        // the pixel `j` below it; the pads take the lanes before a row's or column's start.
-        const TL: usize = 80;
+        // The left edge reversed, `r[PAD + j]` the pixel `j` below the top-left one; the pad
+        // takes the lanes before a column's start, as the 16 pixels left of `TL` do for a row.
+        const TL: usize = 64;
         const PAD: usize = 16;
-        let mut e = [P::default(); TL + 65 + 16];
-        e[TL - 64..][..129].copy_from_slice(edge);
         let mut r = [P::default(); PAD + 128];
-        for (j, r) in r[PAD..][..65].iter_mut().enumerate() {
-            *r = edge[64 - j];
+        // A column reads up to `inc_y * H + 16` pixels down.
+        let n = (H << up_left as usize) + 16;
+        for (j, r) in r[PAD..][..n.min(65)].iter_mut().enumerate() {
+            *r = e[64 - j];
         }
         let (inc_x, inc_y) = (1 + up_above as usize, 1 + up_left as usize);
         let xpos = |y: usize| ((inc_x as isize) << 6) - (dx * (y + 1)) as isize;
@@ -1520,23 +1532,38 @@ mod rust_simd {
                 t[x][y..y + 8].copy_from_slice(&dir8_at(&r, j, frac, up_left));
             }
         }
-        if left_cols != 0 {
-            transpose_cols::<P, W, H, _>(&t, left_cols, block);
-        }
 
-        for y in 0..H {
-            let s = split[y];
-            if s == W {
-                continue;
+        // By 8x8 tiles, the left part transposed out of `t`, the two parts blended where a
+        // row's split falls inside the tile, each row stored whole.
+        let (lanes, rows) = (W.min(8), H.min(8));
+        let lane = I16x8::load(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        for y in (0..H).step_by(8) {
+            for x in (0..W).step_by(8) {
+                let mut l = [I16x8::splat(0); 8];
+                if x < left_cols {
+                    for i in 0..lanes {
+                        l[i] = P::load8(&t[x + i][y..]);
+                    }
+                    transpose8x8(&mut l);
+                }
+                for i in 0..rows {
+                    let s = split[y + i];
+                    let p = if s >= x + lanes {
+                        l[i]
+                    } else {
+                        let pos = xpos(y + i);
+                        let frac = I16x8::splat(((pos & 0x3e) << 9) as i16);
+                        let j = (TL as isize + (pos >> 6) + (inc_x * x) as isize) as usize;
+                        let top = dir8v_at(e, j, frac, up_above);
+                        if s <= x {
+                            top
+                        } else {
+                            I16x8::select(I16x8::splat((s - x) as i16).gt(lane), l[i], top)
+                        }
+                    };
+                    block.put(y + i, x, &P::px8(p)[..lanes]);
+                }
             }
-            let mut px = [P::default(); 64 + 8];
-            let pos = xpos(y);
-            let frac = I16x8::splat(((pos & 0x3e) << 9) as i16);
-            for x in (s & !7..W).step_by(8) {
-                let i = (TL as isize + (pos >> 6) + (inc_x * x) as isize) as usize;
-                px[x..x + 8].copy_from_slice(&dir8_at(&e, i, frac, up_above));
-            }
-            block.put(y, s, &px[s..W]);
         }
     }
 
@@ -1553,9 +1580,9 @@ mod rust_simd {
         max_height: c_int,
         bd: BD,
     ) {
-        let mut edge = [0.into(); 64 + 64 + 1];
+        let mut edge = [0.into(); Z2E];
         let (dx, dy, up_above, up_left) = z2_edge::<BD, true>(
-            &mut edge,
+            (&mut edge[..64 + 64 + 1]).try_into().unwrap(),
             topleft,
             off,
             width,
@@ -1568,8 +1595,8 @@ mod rust_simd {
         let (dx, dy) = (dx as usize, dy as usize);
         let block = &mut Block::<BD>::new(dst, width as usize, height as usize);
         with_px!(BD, |P| {
-            let edge = edge_px::<P, { 64 + 64 + 1 }>(edge.as_bytes_mut());
-            by_size!(width, height, |W, H| z2::<P, W, H, _>(
+            let edge = edge_px::<P, Z2E>(edge.as_bytes_mut());
+            by_size!(width, height, |W, H| z2::<P, W, H, { if H > 8 { H } else { 8 } }, _>(
                 block, edge, dx, dy, up_above, up_left
             ))
         })
