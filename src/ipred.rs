@@ -590,6 +590,50 @@ mod rust_simd {
         FromBytes::mut_slice_from(b).unwrap()
     }
 
+    /// Where a kernel writes its rows: `px` at row `y`, column `x`.
+    trait Rows<P> {
+        fn put(&mut self, y: usize, x: usize, px: &[P]);
+    }
+
+    /// A block of the picture, each row borrowed on its own as it is written: one borrow
+    /// over the block would also take the pixels between its rows, which belong to other
+    /// blocks that other threads may be writing.
+    struct Block<'a, BD> {
+        dst: Rav1dPictureDataComponentOffset<'a>,
+        stride: isize,
+        _bd: std::marker::PhantomData<BD>,
+    }
+
+    impl<'a, BD: BitDepth> Block<'a, BD> {
+        #[inline(always)]
+        fn new(dst: Rav1dPictureDataComponentOffset<'a>) -> Self {
+            let stride = dst.pixel_stride::<BD>();
+            Self { dst, stride, _bd: std::marker::PhantomData }
+        }
+    }
+
+    impl<BD: BitDepth, P: Pix> Rows<P> for Block<'_, BD> {
+        #[inline(always)]
+        fn put(&mut self, y: usize, x: usize, px: &[P]) {
+            let at = self.dst + (y as isize * self.stride + x as isize);
+            let mut row = at.slice_mut::<BD>(px.len());
+            px_mut::<P>(row.as_bytes_mut()).copy_from_slice(px);
+        }
+    }
+
+    /// Rows `stride` apart in a scratch buffer.
+    struct Scratch<'a, P> {
+        buf: &'a mut [P],
+        stride: usize,
+    }
+
+    impl<P: Pix> Rows<P> for Scratch<'_, P> {
+        #[inline(always)]
+        fn put(&mut self, y: usize, x: usize, px: &[P]) {
+            self.buf[y * self.stride + x..][..px.len()].copy_from_slice(px);
+        }
+    }
+
     /// `px[..N]` summed into the lanes, `N` a power of two from 4. Up to 64 + 64 of them fit
     /// the lanes as `u16` to 12 bpc.
     #[inline(always)]
@@ -645,20 +689,9 @@ mod rust_simd {
         half: u32,
     ) {
         let row = [dc_value::<P, W, H, GEN>(topleft, off, half); W];
-        let stride = dst.pixel_stride::<BD>();
-        if stride < W as isize {
-            for y in 0..H {
-                let dst = dst + y as isize * stride;
-                px_mut::<P>(dst.slice_mut::<BD>(W).as_bytes_mut()).copy_from_slice(&row);
-            }
-            return;
-        }
-        // One borrow for the block, its rows by offset: chunks of the stride would divide by it.
-        let stride = stride as usize;
-        let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
-        let block = px_mut::<P>(block.as_bytes_mut());
+        let mut block = Block::<BD>::new(dst);
         for y in 0..H {
-            block[y * stride..][..W].copy_from_slice(&row);
+            block.put(y, 0, &row);
         }
     }
 
@@ -735,11 +768,9 @@ mod rust_simd {
         I16x8::from_u8x8(w).mul(I16x8::splat(1 << k))
     }
 
-    /// `block` has a stride of at least `W`.
     #[inline(always)]
-    fn smooth<P: Pix, const W: usize, const MODE: u8>(
-        block: &mut [P],
-        stride: usize,
+    fn smooth<P: Pix, const W: usize, const MODE: u8, O: Rows<P>>(
+        block: &mut O,
         topleft: &[P],
         off: usize,
         h: usize,
@@ -764,13 +795,12 @@ mod rust_simd {
             // Two rows a vector.
             let dt = P::load8(&std::array::from_fn::<_, 8, _>(|i| top[i % 4])).sub(c.bottom);
             let wh = weights(&std::array::from_fn::<_, 8, _>(|i| w_hor[i % 4]), k);
-            for (y, rows) in block.chunks_mut(2 * stride).enumerate() {
-                let y = 2 * y;
+            for y in (0..h).step_by(2) {
                 let wv = weights(&std::array::from_fn::<_, 8, _>(|i| w_ver[y + i / 4]), k);
                 let l = P::load8(&std::array::from_fn::<_, 8, _>(|i| left(y + i / 4)));
                 let p = blend::<P, MODE>(c, dt, wv, wh, l.sub(c.right));
-                rows[..4].copy_from_slice(&p[..4]);
-                rows[stride..][..4].copy_from_slice(&p[4..]);
+                block.put(y, 0, &p[..4]);
+                block.put(y + 1, 0, &p[4..]);
             }
             return;
         }
@@ -780,11 +810,11 @@ mod rust_simd {
             dt[i] = P::load8(&top[8 * i..]).sub(c.bottom);
             wh[i] = weights(&w_hor[8 * i..], k);
         }
-        for (y, row) in block.chunks_mut(stride).enumerate() {
+        for y in 0..h {
             let wv = I16x8::splat((w_ver[y] as i16) << k);
             let dl = I16x8::splat(left(y).into() as i16).sub(c.right);
             for i in 0..W / 8 {
-                row[8 * i..][..8].copy_from_slice(&blend::<P, MODE>(c, dt[i], wv, wh[i], dl));
+                block.put(y, 8 * i, &blend::<P, MODE>(c, dt[i], wv, wh[i], dl));
             }
         }
     }
@@ -800,16 +830,15 @@ mod rust_simd {
         w: c_int,
         h: usize,
     ) {
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((h - 1) * stride + w as usize);
+        let b = &mut Block::<BD>::new(dst);
         with_px!(BD, |P| {
-            let (b, t) = (px_mut::<P>(block.as_bytes_mut()), px::<P>(topleft.as_bytes()));
+            let t = px::<P>(topleft.as_bytes());
             match w {
-                4 => smooth::<P, 4, MODE>(b, stride, t, off, h),
-                8 => smooth::<P, 8, MODE>(b, stride, t, off, h),
-                16 => smooth::<P, 16, MODE>(b, stride, t, off, h),
-                32 => smooth::<P, 32, MODE>(b, stride, t, off, h),
-                64 => smooth::<P, 64, MODE>(b, stride, t, off, h),
+                4 => smooth::<P, 4, MODE, _>(b, t, off, h),
+                8 => smooth::<P, 8, MODE, _>(b, t, off, h),
+                16 => smooth::<P, 16, MODE, _>(b, t, off, h),
+                32 => smooth::<P, 32, MODE, _>(b, t, off, h),
+                64 => smooth::<P, 64, MODE, _>(b, t, off, h),
                 _ => unreachable!(),
             }
         })
@@ -819,12 +848,10 @@ mod rust_simd {
     pub const PRED_H: u8 = 1;
     pub const PRED_PAETH: u8 = 2;
 
-    /// V_PRED, H_PRED or PAETH_PRED by `MODE`. `block` has a stride of at least `W`; its rows
-    /// are taken by offset, as chunks of the stride would divide by it.
+    /// V_PRED, H_PRED or PAETH_PRED by `MODE`.
     #[inline(always)]
-    fn copy_rows<P: Pix, const W: usize, const MODE: u8>(
-        block: &mut [P],
-        stride: usize,
+    fn copy_rows<P: Pix, const W: usize, const MODE: u8, O: Rows<P>>(
+        block: &mut O,
         topleft: &[P],
         off: usize,
         h: usize,
@@ -832,13 +859,13 @@ mod rust_simd {
         let top: [P; W] = topleft[off + 1..][..W].try_into().unwrap();
         if MODE == PRED_V {
             for y in 0..h {
-                block[y * stride..][..W].copy_from_slice(&top);
+                block.put(y, 0, &top);
             }
             return;
         }
         if MODE == PRED_H {
             for y in 0..h {
-                block[y * stride..][..W].fill(topleft[off - 1 - y]);
+                block.put(y, 0, &[topleft[off - 1 - y]; W]);
             }
             return;
         }
@@ -854,13 +881,12 @@ mod rust_simd {
         for y in 0..h {
             let l = I16x8::splat(topleft[off - 1 - y].into() as i16);
             let tdiff = l.sub(tl).abs();
-            let row = &mut block[y * stride..][..W];
             for i in 0..W.div_ceil(8) {
                 let tldiff = t[i].add(l).sub(tl).sub(tl).abs();
                 let not_left = ldiff[i].gt(tdiff).or(ldiff[i].gt(tldiff));
                 let p = I16x8::select(not_left, I16x8::select(tdiff.gt(tldiff), tl, t[i]), l);
                 let k = W.min(8);
-                row[8 * i..][..k].copy_from_slice(&P::px8(p)[..k]);
+                block.put(y, 8 * i, &P::px8(p)[..k]);
             }
         }
     }
@@ -876,16 +902,15 @@ mod rust_simd {
         w: c_int,
         h: usize,
     ) {
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((h - 1) * stride + w as usize);
+        let b = &mut Block::<BD>::new(dst);
         with_px!(BD, |P| {
-            let (b, t) = (px_mut::<P>(block.as_bytes_mut()), px::<P>(topleft.as_bytes()));
+            let t = px::<P>(topleft.as_bytes());
             match w {
-                4 => copy_rows::<P, 4, MODE>(b, stride, t, off, h),
-                8 => copy_rows::<P, 8, MODE>(b, stride, t, off, h),
-                16 => copy_rows::<P, 16, MODE>(b, stride, t, off, h),
-                32 => copy_rows::<P, 32, MODE>(b, stride, t, off, h),
-                64 => copy_rows::<P, 64, MODE>(b, stride, t, off, h),
+                4 => copy_rows::<P, 4, MODE, _>(b, t, off, h),
+                8 => copy_rows::<P, 8, MODE, _>(b, t, off, h),
+                16 => copy_rows::<P, 16, MODE, _>(b, t, off, h),
+                32 => copy_rows::<P, 32, MODE, _>(b, t, off, h),
+                64 => copy_rows::<P, 64, MODE, _>(b, t, off, h),
                 _ => unreachable!(),
             }
         })
@@ -895,9 +920,8 @@ mod rust_simd {
     /// and left of it, its 8 outputs in the lanes; the left two come from the block before.
     /// The sums fit in 16 bits to 10 bpc. The row above a pair of rows is kept in `top`.
     #[inline(always)]
-    fn filter_intra<P: Pix, const W: usize>(
-        block: &mut [P],
-        stride: usize,
+    fn filter_intra<P: Pix, const W: usize, O: Rows<P>>(
+        block: &mut O,
         topleft: &[P],
         off: usize,
         h: usize,
@@ -933,8 +957,8 @@ mod rust_simd {
                     acc = acc.add(tv[i].mul(I16x8::splat(p[i] as i16)));
                 }
                 let o = P::px8(acc.shr_s::<4>().max(zero).min(max));
-                block[y * stride + x..][..4].copy_from_slice(&o[..4]);
-                block[(y + 1) * stride + x..][..4].copy_from_slice(&o[4..]);
+                block.put(y, x, &o[..4]);
+                block.put(y + 1, x, &o[4..]);
                 top[x..x + 4].copy_from_slice(&o[4..]);
                 p0 = p[4];
                 (p5, p6) = (o[3].into(), o[7].into());
@@ -955,16 +979,15 @@ mod rust_simd {
         filt_idx: c_int,
         max: i16,
     ) {
-        let taps = &dav1d_filter_intra_taps[(filt_idx & 511) as usize].0;
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((h - 1) * stride + w as usize);
+        let taps = &DAV1D_FILTER_INTRA_TAPS[(filt_idx & 511) as usize].0;
+        let b = &mut Block::<BD>::new(dst);
         with_px!(BD, |P| {
-            let (b, t) = (px_mut::<P>(block.as_bytes_mut()), px::<P>(topleft.as_bytes()));
+            let t = px::<P>(topleft.as_bytes());
             match w {
-                4 => filter_intra::<P, 4>(b, stride, t, off, h, taps, max),
-                8 => filter_intra::<P, 8>(b, stride, t, off, h, taps, max),
-                16 => filter_intra::<P, 16>(b, stride, t, off, h, taps, max),
-                32 => filter_intra::<P, 32>(b, stride, t, off, h, taps, max),
+                4 => filter_intra::<P, 4, _>(b, t, off, h, taps, max),
+                8 => filter_intra::<P, 8, _>(b, t, off, h, taps, max),
+                16 => filter_intra::<P, 16, _>(b, t, off, h, taps, max),
+                32 => filter_intra::<P, 32, _>(b, t, off, h, taps, max),
                 _ => unreachable!(),
             }
         })
@@ -982,9 +1005,8 @@ mod rust_simd {
 
     /// `block` has a stride of at least `W`.
     #[inline(always)]
-    fn cfl<P: Pix, const W: usize, const H: usize, const GEN: u8>(
-        block: &mut [P],
-        stride: usize,
+    fn cfl<P: Pix, const W: usize, const H: usize, const GEN: u8, O: Rows<P>>(
+        block: &mut O,
         topleft: &[P],
         off: usize,
         ac: &[i16; SCRATCH_AC_TXTP_LEN],
@@ -997,20 +1019,18 @@ mod rust_simd {
         let neg = alpha < 0;
         let alpha = I16x8::splat((alpha.unsigned_abs() << 9) as i16);
         let ac = &ac[..W * H];
-        // The rows by offset: a zip of chunks of the stride would divide by it.
         if W == 4 {
             for y in (0..H).step_by(2) {
                 let p = cfl_px::<P>(I16x8::load(&ac[4 * y..]), alpha, neg, dc, max);
-                block[y * stride..][..4].copy_from_slice(&p[..4]);
-                block[(y + 1) * stride..][..4].copy_from_slice(&p[4..]);
+                block.put(y, 0, &p[..4]);
+                block.put(y + 1, 0, &p[4..]);
             }
             return;
         }
         for y in 0..H {
-            let row = &mut block[y * stride..][..W];
             for i in 0..W / 8 {
                 let p = cfl_px::<P>(I16x8::load(&ac[W * y + 8 * i..]), alpha, neg, dc, max);
-                row[8 * i..][..8].copy_from_slice(&p);
+                block.put(y, 8 * i, &p);
             }
         }
     }
@@ -1029,13 +1049,11 @@ mod rust_simd {
         alpha: c_int,
         bitdepth_max: c_int,
     ) {
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((height as usize - 1) * stride + width as usize);
+        let b = &mut Block::<BD>::new(dst);
         with_px!(BD, |P| {
-            let (b, t) = (px_mut::<P>(block.as_bytes_mut()), px::<P>(topleft.as_bytes()));
-            by_size!(width, height, |W, H| cfl::<P, W, H, GEN>(
+            let t = px::<P>(topleft.as_bytes());
+            by_size!(width, height, |W, H| cfl::<P, W, H, GEN, _>(
                 b,
-                stride,
                 t,
                 off,
                 ac,
@@ -1171,9 +1189,8 @@ mod rust_simd {
     /// with steps of `STEP`: the directional prediction along an edge whose last pixel is
     /// `e[max]`. The edge is padded with that pixel, which the rows past it take.
     #[inline(always)]
-    fn dir_rows<P: Pix, const W: usize, const STEP: usize>(
-        out: &mut [P],
-        os: usize,
+    fn dir_rows<P: Pix, const W: usize, const STEP: usize, O: Rows<P>>(
+        out: &mut O,
         n: usize,
         e: &mut [P; EXT],
         max: usize,
@@ -1181,17 +1198,17 @@ mod rust_simd {
     ) {
         let last = e[max];
         e[max + 1..].fill(last);
-        for (r, row) in out.chunks_mut(os).take(n).enumerate() {
+        for r in 0..n {
             let pos = (r + 1) * d;
             let base = pos >> 6;
             if base >= max {
-                row[..W].fill(last);
+                out.put(r, 0, &[last; W]);
                 continue;
             }
             let frac = I16x8::splat(((pos & 0x3e) << 9) as i16);
             for x in (0..W).step_by(8) {
                 let k = (W - x).min(8);
-                row[x..x + k].copy_from_slice(&dir8::<P, STEP>(e, base + STEP * x, frac)[..k]);
+                out.put(r, x, &dir8::<P, STEP>(e, base + STEP * x, frac)[..k]);
             }
         }
     }
@@ -1343,19 +1360,17 @@ mod rust_simd {
         let (dx, max, upsample) =
             z1_edge::<BD, true>(&mut e, topleft, off, width, height, angle, bd);
         let (w, h, dx) = (width as usize, height as usize, dx as usize);
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((h - 1) * stride + w);
+        let block = &mut Block::<BD>::new(dst);
         with_px!(BD, |P| {
             let e = edge_px::<P, EXT>(e.as_bytes_mut());
-            let block = px_mut::<P>(block.as_bytes_mut());
             match (w, upsample) {
-                (4, false) => dir_rows::<P, 4, 1>(block, stride, h, e, max, dx),
-                (8, false) => dir_rows::<P, 8, 1>(block, stride, h, e, max, dx),
-                (16, false) => dir_rows::<P, 16, 1>(block, stride, h, e, max, dx),
-                (32, false) => dir_rows::<P, 32, 1>(block, stride, h, e, max, dx),
-                (64, false) => dir_rows::<P, 64, 1>(block, stride, h, e, max, dx),
-                (4, true) => dir_rows::<P, 4, 2>(block, stride, h, e, max, dx),
-                (8, true) => dir_rows::<P, 8, 2>(block, stride, h, e, max, dx),
+                (4, false) => dir_rows::<P, 4, 1, _>(block, h, e, max, dx),
+                (8, false) => dir_rows::<P, 8, 1, _>(block, h, e, max, dx),
+                (16, false) => dir_rows::<P, 16, 1, _>(block, h, e, max, dx),
+                (32, false) => dir_rows::<P, 32, 1, _>(block, h, e, max, dx),
+                (64, false) => dir_rows::<P, 64, 1, _>(block, h, e, max, dx),
+                (4, true) => dir_rows::<P, 4, 2, _>(block, h, e, max, dx),
+                (8, true) => dir_rows::<P, 8, 2, _>(block, h, e, max, dx),
                 _ => unreachable!(),
             }
         })
@@ -1367,17 +1382,18 @@ mod rust_simd {
     /// The first `cols` of the `W` columns of `t`, `H` pixels each, as the rows of `out`, `os`
     /// apart; with 8 columns a step, up to `cols` rounded up to 8.
     #[inline(always)]
-    fn transpose_cols<P: Pix, const W: usize, const H: usize>(
+    fn transpose_cols<P: Pix, const W: usize, const H: usize, O: Rows<P>>(
         t: &[[P; TS]; W],
         cols: usize,
-        out: &mut [P],
-        os: usize,
+        out: &mut O,
     ) {
         if W % 8 != 0 || H % 8 != 0 {
-            for (y, row) in out.chunks_mut(os).take(H).enumerate() {
+            for y in 0..H {
+                let mut row = [P::default(); W];
                 for x in 0..cols {
                     row[x] = t[x][y];
                 }
+                out.put(y, 0, &row[..cols]);
             }
             return;
         }
@@ -1390,7 +1406,7 @@ mod rust_simd {
                 }
                 transpose8x8(&mut v);
                 for (i, v) in v.into_iter().enumerate() {
-                    out[(y + i) * os + x..][..8].copy_from_slice(&P::px8(v));
+                    out.put(y + i, x, &P::px8(v));
                 }
             }
         }
@@ -1398,16 +1414,16 @@ mod rust_simd {
 
     /// Z3 is Z1 along the left edge read upwards, its columns the rows of `t`.
     #[inline(always)]
-    fn z3<P: Pix, const W: usize, const H: usize, const STEP: usize>(
-        block: &mut [P],
-        stride: usize,
+    fn z3<P: Pix, const W: usize, const H: usize, const STEP: usize, O: Rows<P>>(
+        block: &mut O,
         e: &mut [P; EXT],
         dy: usize,
         max: usize,
     ) {
         let mut t = [[P::default(); TS]; W];
-        dir_rows::<P, H, STEP>(t.as_flattened_mut(), TS, W, e, max, dy);
-        transpose_cols::<P, W, H>(&t, W, block, stride);
+        let mut s = Scratch { buf: t.as_flattened_mut(), stride: TS };
+        dir_rows::<P, H, STEP, _>(&mut s, W, e, max, dy);
+        transpose_cols::<P, W, H, _>(&t, W, block);
     }
 
     /// Two-tap interpolation of 8 pixels from `e[i..]`, the steps 2 apart where upsampled.
@@ -1425,9 +1441,8 @@ mod rust_simd {
     /// fraction, so the left part runs per column into a scratch turned into the block's rows;
     /// the top part then runs per row over the rest of it.
     #[inline(always)]
-    fn z2<P: Pix, const W: usize, const H: usize>(
-        block: &mut [P],
-        stride: usize,
+    fn z2<P: Pix, const W: usize, const H: usize, O: Rows<P>>(
+        block: &mut O,
         edge: &[P; 64 + 64 + 1],
         dx: usize,
         dy: usize,
@@ -1474,10 +1489,10 @@ mod rust_simd {
             }
         }
         if left_cols != 0 {
-            transpose_cols::<P, W, H>(&t, left_cols, block, stride);
+            transpose_cols::<P, W, H, _>(&t, left_cols, block);
         }
 
-        for (y, row) in block.chunks_mut(stride).enumerate() {
+        for y in 0..H {
             let s = split[y];
             if s == W {
                 continue;
@@ -1489,7 +1504,7 @@ mod rust_simd {
                 let i = (TL as isize + (pos >> 6) + (inc_x * x) as isize) as usize;
                 px[x..x + 8].copy_from_slice(&dir8_at(&e, i, frac, up_above));
             }
-            row[s..W].copy_from_slice(&px[s..W]);
+            block.put(y, s, &px[s..W]);
         }
     }
 
@@ -1522,13 +1537,11 @@ mod rust_simd {
             bd,
         );
         let (dx, dy) = (dx as usize, dy as usize);
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((height as usize - 1) * stride + width as usize);
+        let block = &mut Block::<BD>::new(dst);
         with_px!(BD, |P| {
             let edge = edge_px::<P, { 64 + 64 + 1 }>(edge.as_bytes_mut());
-            let block = px_mut::<P>(block.as_bytes_mut());
-            by_size!(width, height, |W, H| z2::<P, W, H>(
-                block, stride, edge, dx, dy, up_above, up_left
+            by_size!(width, height, |W, H| z2::<P, W, H, _>(
+                block, edge, dx, dy, up_above, up_left
             ))
         })
     }
@@ -1550,19 +1563,18 @@ mod rust_simd {
         let mut left = [0.into(); 64 + 64];
         let (dy, left_off, max, upsample) =
             z3_edge::<BD, true>(&mut left, topleft, off, width, height, angle, bd);
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((height as usize - 1) * stride + width as usize);
+        let block = &mut Block::<BD>::new(dst);
         with_px!(BD, |P| {
             let left = px::<P>(left.as_bytes());
             let mut e = [P::default(); EXT];
             for (i, e) in e[..=max].iter_mut().enumerate() {
                 *e = left[left_off - i];
             }
-            let (e, block) = (&mut e, px_mut::<P>(block.as_bytes_mut()));
+            let e = &mut e;
             by_size!(width, height, |W, H| if upsample {
-                z3::<P, W, H, 2>(block, stride, e, dy, max)
+                z3::<P, W, H, 2, _>(block, e, dy, max)
             } else {
-                z3::<P, W, H, 1>(block, stride, e, dy, max)
+                z3::<P, W, H, 1, _>(block, e, dy, max)
             })
         })
     }
