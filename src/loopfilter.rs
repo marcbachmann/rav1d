@@ -1325,8 +1325,8 @@ mod rust_simd {
     }
 
     /// [`Bytes::spread4`] of the first `n` levels from `lvl[start]`, `stride` apart, the others 0.
-    /// Across rows one byte at a time: the bytes between belong to blocks other threads may be
-    /// writing.
+    /// One byte at a time: the bytes between, even within a row's entries, belong to levels
+    /// other threads may be writing.
     #[inline(always)]
     fn levels8<B: Bytes>(
         lvl: &DisjointMut<AlignedVec2<u8>>,
@@ -1335,17 +1335,8 @@ mod rust_simd {
         n: usize,
     ) -> B {
         let mut l = [0; 8];
-        if stride == 4 {
-            // Along a horizontal edge the levels are one row's entries, whose other bytes are
-            // written together with them: one borrow.
-            let row = &*lvl.index(start..start + 4 * n - 3);
-            for (j, l) in l.iter_mut().enumerate().take(n) {
-                *l = row[4 * j];
-            }
-        } else {
-            for (j, l) in l.iter_mut().enumerate().take(n) {
-                *l = *lvl.index(start + j * stride);
-            }
+        for (j, l) in l.iter_mut().enumerate().take(n) {
+            *l = *lvl.index(start + j * stride);
         }
         B::spread4(u64::from_le_bytes(l))
     }
