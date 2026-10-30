@@ -191,28 +191,213 @@ fn ctx_refill_bytes(buf: &[u8], mut dif: EcWin, mut c: c_int) -> (EcWin, c_int, 
     (dif, (EC_WIN_SIZE as c_int) - 24 - c, read)
 }
 
+/// The decoder state the symbol decoders work on: in a [`MsacContext`], or in the locals of a
+/// [`MsacLocal`].
+trait Ec {
+    fn dif(&self) -> EcWin;
+    fn rng(&self) -> c_uint;
+    fn cnt(&self) -> c_int;
+    fn set_dif(&mut self, dif: EcWin);
+    fn set_rng(&mut self, rng: c_uint);
+    fn set_cnt(&mut self, cnt: c_int);
+    fn update_cdf(&self) -> bool;
+    fn refill(&mut self);
+}
+
+impl Ec for MsacContext {
+    #[inline(always)]
+    fn dif(&self) -> EcWin {
+        self.state.dif
+    }
+
+    #[inline(always)]
+    fn rng(&self) -> c_uint {
+        self.state.rng
+    }
+
+    #[inline(always)]
+    fn cnt(&self) -> c_int {
+        self.state.cnt
+    }
+
+    #[inline(always)]
+    fn set_dif(&mut self, dif: EcWin) {
+        self.state.dif = dif;
+    }
+
+    #[inline(always)]
+    fn set_rng(&mut self, rng: c_uint) {
+        self.state.rng = rng;
+    }
+
+    #[inline(always)]
+    fn set_cnt(&mut self, cnt: c_int) {
+        self.state.cnt = cnt;
+    }
+
+    #[inline(always)]
+    fn update_cdf(&self) -> bool {
+        self.state.allow_update_cdf()
+    }
+
+    #[inline(always)]
+    fn refill(&mut self) {
+        ctx_refill(self);
+    }
+}
+
+/// A [`MsacContext`] whose window, range and count live in locals until it is dropped, so a
+/// loop decoding many symbols keeps them in registers: in the context, every symbol's state
+/// passes through memory, a store-to-load forward on the chain from one symbol to the next.
+pub struct MsacLocal<'a> {
+    dif: EcWin,
+    rng: c_uint,
+    cnt: c_int,
+    update_cdf: bool,
+    s: &'a mut MsacContext,
+}
+
+impl MsacContext {
+    #[inline(always)]
+    pub fn local(&mut self) -> MsacLocal<'_> {
+        MsacLocal {
+            dif: self.state.dif,
+            rng: self.state.rng,
+            cnt: self.state.cnt,
+            update_cdf: self.state.allow_update_cdf(),
+            s: self,
+        }
+    }
+}
+
+impl Drop for MsacLocal<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        self.s.state.dif = self.dif;
+        self.s.state.rng = self.rng;
+        self.s.state.cnt = self.cnt;
+    }
+}
+
+impl Ec for MsacLocal<'_> {
+    #[inline(always)]
+    fn dif(&self) -> EcWin {
+        self.dif
+    }
+
+    #[inline(always)]
+    fn rng(&self) -> c_uint {
+        self.rng
+    }
+
+    #[inline(always)]
+    fn cnt(&self) -> c_int {
+        self.cnt
+    }
+
+    #[inline(always)]
+    fn set_dif(&mut self, dif: EcWin) {
+        self.dif = dif;
+    }
+
+    #[inline(always)]
+    fn set_rng(&mut self, rng: c_uint) {
+        self.rng = rng;
+    }
+
+    #[inline(always)]
+    fn set_cnt(&mut self, cnt: c_int) {
+        self.cnt = cnt;
+    }
+
+    #[inline(always)]
+    fn update_cdf(&self) -> bool {
+        self.update_cdf
+    }
+
+    #[inline(always)]
+    fn refill(&mut self) {
+        self.s.state.dif = self.dif;
+        self.s.state.cnt = self.cnt;
+        ctx_refill(self.s);
+        self.dif = self.s.state.dif;
+        self.cnt = self.s.state.cnt;
+    }
+}
+
+impl MsacLocal<'_> {
+    pub fn rng(&self) -> c_uint {
+        self.rng
+    }
+
+    #[inline(always)]
+    pub fn symbol_adapt4(&mut self, cdf: &mut [u16], n_symbols: u8) -> u8 {
+        debug_assert!(n_symbols < 4);
+        decode_symbol_adapt::<_, 4>(self, cdf, n_symbols) % 4
+    }
+
+    #[inline(always)]
+    pub fn symbol_adapt8(&mut self, cdf: &mut [u16], n_symbols: u8) -> u8 {
+        debug_assert!(n_symbols < 8);
+        decode_symbol_adapt::<_, 8>(self, cdf, n_symbols) % 8
+    }
+
+    #[inline(always)]
+    pub fn symbol_adapt16(&mut self, cdf: &mut [u16], n_symbols: u8) -> u8 {
+        debug_assert!(n_symbols < 16);
+        decode_symbol_adapt::<_, 16>(self, cdf, n_symbols) % 16
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), inline)]
+    #[cfg_attr(target_arch = "x86_64", inline(always))]
+    pub fn bool_adapt(&mut self, cdf: &mut [u16; 2]) -> bool {
+        rav1d_msac_decode_bool_adapt_rust(self, cdf)
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), inline)]
+    #[cfg_attr(target_arch = "x86_64", inline(always))]
+    pub fn bool_equi(&mut self) -> bool {
+        rav1d_msac_decode_bool_equi_rust(self)
+    }
+
+    /// Return value uses `n` bits.
+    #[inline]
+    pub fn bools(&mut self, n: u8) -> c_uint {
+        let mut v = 0;
+        for _ in 0..n {
+            v = v << 1 | self.bool_equi() as c_uint;
+        }
+        v
+    }
+
+    #[inline(always)]
+    pub fn hi_tok(&mut self, cdf: &mut [u16; 4]) -> u8 {
+        decode_hi_tok(self, cdf)
+    }
+}
+
 #[inline]
-fn ctx_norm(s: &mut MsacContext, dif: EcWin, rng: c_uint) {
+fn ctx_norm<S: Ec>(s: &mut S, dif: EcWin, rng: c_uint) {
     ctx_norm_by(s, dif, rng, 15 ^ (31 ^ clz(rng)));
 }
 
 #[inline]
-fn ctx_norm_by(s: &mut MsacContext, dif: EcWin, rng: c_uint, d: c_int) {
-    let cnt = s.cnt;
+fn ctx_norm_by<S: Ec>(s: &mut S, dif: EcWin, rng: c_uint, d: c_int) {
+    let cnt = s.cnt();
     debug_assert!(rng <= 65535);
-    s.dif = dif << d;
-    s.rng = rng << d;
-    s.cnt = cnt - d;
+    s.set_dif(dif << d);
+    s.set_rng(rng << d);
+    s.set_cnt(cnt - d);
     // unsigned compare avoids redundant refills at eob
     if (cnt as u32) < (d as u32) {
-        ctx_refill(s);
+        s.refill();
     }
 }
 
 #[cfg_attr(target_arch = "x86_64", inline(always))]
-fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
-    let r = s.rng;
-    let dif = s.dif;
+fn rav1d_msac_decode_bool_equi_rust<S: Ec>(s: &mut S) -> bool {
+    let r = s.rng();
+    let dif = s.dif();
     debug_assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
     let (bit, dif, v) = split_at(dif, r, (r >> 8 << 7) + EC_MIN_PROB);
     // Half of an `r` of at least 0x8000 is at least 0x3ffc, so the shift is 0, 1 or 2, read off
@@ -224,9 +409,9 @@ fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
 }
 
 #[cfg_attr(target_arch = "x86_64", inline(always))]
-fn rav1d_msac_decode_bool_rust(s: &mut MsacContext, f: c_uint) -> bool {
-    let r = s.rng;
-    let dif = s.dif;
+fn rav1d_msac_decode_bool_rust<S: Ec>(s: &mut S, f: c_uint) -> bool {
+    let r = s.rng();
+    let dif = s.dif();
     debug_assert!(dif >> (EC_WIN_SIZE - 16) < r as EcWin);
     let v = ((r >> 8) * (f >> EC_PROB_SHIFT) >> (7 - EC_PROB_SHIFT)) + EC_MIN_PROB;
     let (bit, dif, v) = split_at(dif, r, v);
@@ -267,11 +452,11 @@ pub fn rav1d_msac_decode_subexp(s: &mut MsacContext, r#ref: c_uint, n: c_uint, m
 /// Return value is in the range `0..=n_symbols`.
 ///
 /// `n_symbols` is in the range `0..16`, so it is really a `u4`.
-fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_symbols: u8) -> u8 {
-    let c = (s.dif >> (EC_WIN_SIZE - 16)) as c_uint;
-    let r = s.rng >> 8;
+fn rav1d_msac_decode_symbol_adapt_rust<S: Ec>(s: &mut S, cdf: &mut [u16], n_symbols: u8) -> u8 {
+    let c = (s.dif() >> (EC_WIN_SIZE - 16)) as c_uint;
+    let r = s.rng() >> 8;
     let mut u;
-    let mut v = s.rng;
+    let mut v = s.rng();
     let mut val = 0;
     assert!(n_symbols < 16);
     assert!(cdf[n_symbols as usize] <= 32);
@@ -285,13 +470,13 @@ fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_s
         }
         val += 1;
     }
-    assert!(u <= s.rng);
+    assert!(u <= s.rng());
     ctx_norm(
         s,
-        s.dif.wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
+        s.dif().wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
         u - v,
     );
-    if s.allow_update_cdf() {
+    if s.update_cdf() {
         let count = cdf[n_symbols as usize];
         let rate = 4 + (count >> 4) + (n_symbols > 2) as u16;
         let val = val as usize;
@@ -311,18 +496,18 @@ fn rav1d_msac_decode_symbol_adapt_rust(s: &mut MsacContext, cdf: &mut [u16], n_s
 /// branches on the data, all in general registers: the bounds fall, so the symbol is how many of
 /// them lie above the window, and the pair around it is picked from the bounds by index.
 #[inline(always)]
-fn rav1d_msac_decode_symbol_adapt_unrolled<const N: usize>(
-    s: &mut MsacContext,
+fn rav1d_msac_decode_symbol_adapt_unrolled<S: Ec, const N: usize>(
+    s: &mut S,
     cdf: &mut [u16],
     n_symbols: u8,
 ) -> u8 {
     let n = n_symbols as usize;
     debug_assert!(n <= N);
-    let c = (s.dif >> (EC_WIN_SIZE - 16)) as c_uint;
-    let r = s.rng >> 8;
+    let c = (s.dif() >> (EC_WIN_SIZE - 16)) as c_uint;
+    let r = s.rng() >> 8;
     // `rng`, then the bounds, then 0: the symbol's pair is `[val]` and `[val + 1]`.
     let mut bounds = [0; 17];
-    bounds[0] = s.rng;
+    bounds[0] = s.rng();
     let mut val = 0;
     for i in 0..N {
         let v = if i < n {
@@ -337,10 +522,10 @@ fn rav1d_msac_decode_symbol_adapt_unrolled<const N: usize>(
     let (u, v) = (bounds[val], bounds[val + 1]);
     ctx_norm(
         s,
-        s.dif.wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
+        s.dif().wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
         u - v,
     );
-    if s.allow_update_cdf() {
+    if s.update_cdf() {
         let count = cdf[n];
         let rate = 4 + (count >> 4) + (n > 2) as u16;
         for i in 0..N {
@@ -363,18 +548,14 @@ const MSAC_SIMD: bool = cfg!(any(
 ));
 
 #[inline(always)]
-fn decode_symbol_adapt<const LANES: usize>(
-    s: &mut MsacContext,
-    cdf: &mut [u16],
-    n_symbols: u8,
-) -> u8 {
+fn decode_symbol_adapt<S: Ec, const LANES: usize>(s: &mut S, cdf: &mut [u16], n_symbols: u8) -> u8 {
     // On aarch64 up to 7 symbols decode faster in general registers than in a vector.
     if LANES == 4 && cfg!(target_arch = "aarch64") {
-        rav1d_msac_decode_symbol_adapt_unrolled::<3>(s, cdf, n_symbols)
+        rav1d_msac_decode_symbol_adapt_unrolled::<_, 3>(s, cdf, n_symbols)
     } else if LANES == 8 && cfg!(target_arch = "aarch64") {
-        rav1d_msac_decode_symbol_adapt_unrolled::<7>(s, cdf, n_symbols)
+        rav1d_msac_decode_symbol_adapt_unrolled::<_, 7>(s, cdf, n_symbols)
     } else if MSAC_SIMD {
-        rav1d_msac_decode_symbol_adapt_simd::<LANES>(s, cdf, n_symbols)
+        rav1d_msac_decode_symbol_adapt_simd::<_, LANES>(s, cdf, n_symbols)
     } else {
         rav1d_msac_decode_symbol_adapt_rust(s, cdf, n_symbols)
     }
@@ -416,8 +597,8 @@ fn rng_then_bounds<const M: usize>(rng: c_uint, vs: &[I16x8; 2]) -> [i16; M] {
 /// bound 0, so lanes past it are never read; like the asm, the adaptation leaves them alone only
 /// while they hold 0, as every CDF table's padding does.
 #[inline(always)]
-fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
-    s: &mut MsacContext,
+fn rav1d_msac_decode_symbol_adapt_simd<S: Ec, const LANES: usize>(
+    s: &mut S,
     cdf: &mut [u16],
     n_symbols: u8,
 ) -> u8 {
@@ -428,12 +609,12 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
     } else {
         I16x8::splat
     };
-    let c = splat((s.dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
+    let c = splat((s.dif() >> (EC_WIN_SIZE - 16)) as u16 as i16);
     #[cfg(not(target_arch = "aarch64"))]
-    let r = splat((s.rng & 0xff00) as u16 as i16);
+    let r = splat((s.rng() & 0xff00) as u16 as i16);
     // `rng >> 8` less 128, the doubling multiply-high's operand.
     #[cfg(target_arch = "aarch64")]
-    let r = splat((s.rng & 0x7f00) as u16 as i16);
+    let r = splat((s.rng() & 0x7f00) as u16 as i16);
     let zero = I16x8::splat(0);
     let (mut cdfs, mut at_or_past, mut vs) = ([zero; 2], [zero; 2], [zero; 2]);
     for k in 0..LANES.div_ceil(8) {
@@ -502,7 +683,7 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
     let (u, v) = if LANES <= 8 {
         let packed = vs[0].to_u128();
         let (lo, hi) = (packed as u64, (packed >> 64) as u64);
-        let rng = s.rng as u16 as u64;
+        let rng = s.rng() as u16 as u64;
         let (us, vs) = if val < 4 {
             (lo << 16 | rng, lo)
         } else {
@@ -511,17 +692,17 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
         let shift = 16 * (val & 3);
         ((us >> shift) as u16, (vs >> shift) as u16)
     } else {
-        bound_pair(s.rng, vs)
+        bound_pair(s.rng(), vs)
     };
     #[cfg(not(target_arch = "aarch64"))]
-    let (u, v) = bound_pair(s.rng, vs);
+    let (u, v) = bound_pair(s.rng(), vs);
     let (u, v) = (u as c_uint, v as c_uint);
     ctx_norm(
         s,
-        s.dif.wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
+        s.dif().wrapping_sub((v as EcWin) << (EC_WIN_SIZE - 16)),
         u - v,
     );
-    if s.allow_update_cdf() {
+    if s.update_cdf() {
         let count = cdf[n];
         let rate = 4 + (count >> 4) as u32 + (n_symbols > 2) as u32;
         let ones = I16x8::splat(-1);
@@ -557,9 +738,9 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
 }
 
 #[cfg_attr(target_arch = "x86_64", inline(always))]
-fn rav1d_msac_decode_bool_adapt_rust(s: &mut MsacContext, cdf: &mut [u16; 2]) -> bool {
+fn rav1d_msac_decode_bool_adapt_rust<S: Ec>(s: &mut S, cdf: &mut [u16; 2]) -> bool {
     let bit = rav1d_msac_decode_bool_rust(s, cdf[0] as c_uint);
-    if s.allow_update_cdf() {
+    if s.update_cdf() {
         let count = cdf[1];
         let rate = 4 + (count >> 4);
         // Both steps, then a select: a branch on the decoded bit mispredicts as often as it is random.
@@ -574,17 +755,17 @@ fn rav1d_msac_decode_bool_adapt_rust(s: &mut MsacContext, cdf: &mut [u16; 2]) ->
 }
 
 /// Return value is in the range `0..=15`.
-fn rav1d_msac_decode_hi_tok_rust(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
-    let mut tok_br = decode_symbol_adapt::<4>(s, cdf, 3);
+fn rav1d_msac_decode_hi_tok_rust<S: Ec>(s: &mut S, cdf: &mut [u16; 4]) -> u8 {
+    let mut tok_br = decode_symbol_adapt::<_, 4>(s, cdf, 3);
     let mut tok = 3 + tok_br;
     if tok_br == 3 {
-        tok_br = decode_symbol_adapt::<4>(s, cdf, 3);
+        tok_br = decode_symbol_adapt::<_, 4>(s, cdf, 3);
         tok = 6 + tok_br;
         if tok_br == 3 {
-            tok_br = decode_symbol_adapt::<4>(s, cdf, 3);
+            tok_br = decode_symbol_adapt::<_, 4>(s, cdf, 3);
             tok = 9 + tok_br;
             if tok_br == 3 {
-                tok = 12 + decode_symbol_adapt::<4>(s, cdf, 3);
+                tok = 12 + decode_symbol_adapt::<_, 4>(s, cdf, 3);
             }
         }
     }
@@ -594,21 +775,23 @@ fn rav1d_msac_decode_hi_tok_rust(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
 /// [`rav1d_msac_decode_hi_tok_rust`] as one loop over its up to four symbols, with the CDF in a
 /// register and the decoder state in locals, as in the asm.
 #[inline(always)]
-fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
-    let update = s.allow_update_cdf();
+fn rav1d_msac_decode_hi_tok_simd<S: Ec>(s: &mut S, cdf: &mut [u16; 4]) -> u8 {
+    let update = s.update_cdf();
     let zero = I16x8::splat(0);
     let ones = I16x8::splat(-1);
     let min_probs = I16x8::load(&EC_MIN_PROBS[15 - 3..]);
     let count_lane = I16x8::load(&[0, 0, 0, -1, 0, 0, 0, 0]);
     let mut cdfv = I16x8::load_u16_lo(cdf);
     let mut count = cdf[3];
-    let (mut dif, mut rng) = (s.dif, s.rng);
+    let (mut dif, mut rng) = (s.dif(), s.rng());
     let mut tok = 3;
     loop {
         let c = I16x8::splat_lo((dif >> (EC_WIN_SIZE - 16)) as u16 as i16);
         let p = cdfv.and(I16x8::splat(-64));
         #[cfg(not(target_arch = "aarch64"))]
-        let scaled = p.add(p).mulhi_u(I16x8::splat_lo((rng & 0xff00) as u16 as i16));
+        let scaled = p
+            .add(p)
+            .mulhi_u(I16x8::splat_lo((rng & 0xff00) as u16 as i16));
         // The doubling multiply-high of `rng >> 8` less 128, as in the symbol decoder: one
         // multiply on the path `rng` carries from one symbol to the next.
         #[cfg(target_arch = "aarch64")]
@@ -638,12 +821,12 @@ fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
         let d = 15 ^ (31 ^ clz(rng));
         dif <<= d;
         rng <<= d;
-        let cnt = s.cnt;
-        s.cnt = cnt - d;
+        let cnt = s.cnt();
+        s.set_cnt(cnt - d);
         if (cnt as u32) < (d as u32) {
-            s.dif = dif;
-            ctx_refill(s);
-            dif = s.dif;
+            s.set_dif(dif);
+            s.refill();
+            dif = s.dif();
         }
         tok += val as u8;
         if val < 3 || tok == 15 {
@@ -653,8 +836,8 @@ fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
     if update {
         cdfv.store_u16_lo(cdf);
     }
-    s.dif = dif;
-    s.rng = rng;
+    s.set_dif(dif);
+    s.set_rng(rng);
     tok
 }
 
@@ -682,7 +865,7 @@ impl MsacContext {
 #[inline(always)]
 pub fn rav1d_msac_decode_symbol_adapt4(s: &mut MsacContext, cdf: &mut [u16], n_symbols: u8) -> u8 {
     debug_assert!(n_symbols < 4);
-    let ret = decode_symbol_adapt::<4>(s, cdf, n_symbols);
+    let ret = decode_symbol_adapt::<_, 4>(s, cdf, n_symbols);
     debug_assert!(ret < 4);
     ret as u8 % 4
 }
@@ -693,7 +876,7 @@ pub fn rav1d_msac_decode_symbol_adapt4(s: &mut MsacContext, cdf: &mut [u16], n_s
 #[inline(always)]
 pub fn rav1d_msac_decode_symbol_adapt8(s: &mut MsacContext, cdf: &mut [u16], n_symbols: u8) -> u8 {
     debug_assert!(n_symbols < 8);
-    let ret = decode_symbol_adapt::<8>(s, cdf, n_symbols);
+    let ret = decode_symbol_adapt::<_, 8>(s, cdf, n_symbols);
     debug_assert!(ret < 8);
     ret as u8 % 8
 }
@@ -704,7 +887,7 @@ pub fn rav1d_msac_decode_symbol_adapt8(s: &mut MsacContext, cdf: &mut [u16], n_s
 #[inline(always)]
 pub fn rav1d_msac_decode_symbol_adapt16(s: &mut MsacContext, cdf: &mut [u16], n_symbols: u8) -> u8 {
     debug_assert!(n_symbols < 16);
-    let ret = decode_symbol_adapt::<16>(s, cdf, n_symbols);
+    let ret = decode_symbol_adapt::<_, 16>(s, cdf, n_symbols);
     debug_assert!(ret < 16);
     ret as u8 % 16
 }
@@ -729,7 +912,13 @@ pub fn rav1d_msac_decode_bool(s: &mut MsacContext, f: c_uint) -> bool {
 
 /// Return value is in the range `0..16`.
 #[inline(always)]
+#[cfg_attr(not(any(test, feature = "encoder")), expect(dead_code))]
 pub fn rav1d_msac_decode_hi_tok(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 {
+    decode_hi_tok(s, cdf)
+}
+
+#[inline(always)]
+fn decode_hi_tok<S: Ec>(s: &mut S, cdf: &mut [u16; 4]) -> u8 {
     // On aarch64 the four calls of the unrolled scalar decoder beat the vector loop.
     let ret = if MSAC_SIMD && !cfg!(target_arch = "aarch64") {
         rav1d_msac_decode_hi_tok_simd(s, cdf)
@@ -806,17 +995,17 @@ mod tests {
                 let va = rav1d_msac_decode_symbol_adapt_rust(&mut a, &mut ca[..=n as usize], n);
                 let vb = match lanes {
                     4 if i % 2 == 0 => {
-                        rav1d_msac_decode_symbol_adapt_unrolled::<3>(&mut b, &mut cb[..4], n)
+                        rav1d_msac_decode_symbol_adapt_unrolled::<_, 3>(&mut b, &mut cb[..4], n)
                     }
                     8 if i % 2 == 0 => {
-                        rav1d_msac_decode_symbol_adapt_unrolled::<7>(&mut b, &mut cb[..8], n)
+                        rav1d_msac_decode_symbol_adapt_unrolled::<_, 7>(&mut b, &mut cb[..8], n)
                     }
                     16 if i % 2 == 0 => {
-                        rav1d_msac_decode_symbol_adapt_unrolled::<15>(&mut b, &mut cb, n)
+                        rav1d_msac_decode_symbol_adapt_unrolled::<_, 15>(&mut b, &mut cb, n)
                     }
-                    4 => rav1d_msac_decode_symbol_adapt_simd::<4>(&mut b, &mut cb[..4], n),
-                    8 => rav1d_msac_decode_symbol_adapt_simd::<8>(&mut b, &mut cb[..8], n),
-                    _ => rav1d_msac_decode_symbol_adapt_simd::<16>(&mut b, &mut cb, n),
+                    4 => rav1d_msac_decode_symbol_adapt_simd::<_, 4>(&mut b, &mut cb[..4], n),
+                    8 => rav1d_msac_decode_symbol_adapt_simd::<_, 8>(&mut b, &mut cb[..8], n),
+                    _ => rav1d_msac_decode_symbol_adapt_simd::<_, 16>(&mut b, &mut cb, n),
                 };
                 let at = format!("round {round} symbol {i}: {lanes} lanes, n {n}, cdf {cdf:?}");
                 assert_eq!(va, vb, "{at}");
@@ -908,19 +1097,23 @@ mod tests {
                     black_box(match (kind, lanes) {
                         (0, _) => rav1d_msac_decode_symbol_adapt_rust(&mut s, cdf, n),
                         (1, 4) => {
-                            rav1d_msac_decode_symbol_adapt_simd::<4>(&mut s, &mut cdf[..4], n)
+                            rav1d_msac_decode_symbol_adapt_simd::<_, 4>(&mut s, &mut cdf[..4], n)
                         }
-                        (3, 4) => {
-                            rav1d_msac_decode_symbol_adapt_unrolled::<3>(&mut s, &mut cdf[..4], n)
-                        }
-                        (3, 8) => {
-                            rav1d_msac_decode_symbol_adapt_unrolled::<7>(&mut s, &mut cdf[..8], n)
-                        }
-                        (3, _) => rav1d_msac_decode_symbol_adapt_unrolled::<15>(&mut s, cdf, n),
+                        (3, 4) => rav1d_msac_decode_symbol_adapt_unrolled::<_, 3>(
+                            &mut s,
+                            &mut cdf[..4],
+                            n,
+                        ),
+                        (3, 8) => rav1d_msac_decode_symbol_adapt_unrolled::<_, 7>(
+                            &mut s,
+                            &mut cdf[..8],
+                            n,
+                        ),
+                        (3, _) => rav1d_msac_decode_symbol_adapt_unrolled::<_, 15>(&mut s, cdf, n),
                         (1, 8) => {
-                            rav1d_msac_decode_symbol_adapt_simd::<8>(&mut s, &mut cdf[..8], n)
+                            rav1d_msac_decode_symbol_adapt_simd::<_, 8>(&mut s, &mut cdf[..8], n)
                         }
-                        (1, _) => rav1d_msac_decode_symbol_adapt_simd::<16>(&mut s, cdf, n),
+                        (1, _) => rav1d_msac_decode_symbol_adapt_simd::<_, 16>(&mut s, cdf, n),
                         (_, 4) => rav1d_msac_decode_symbol_adapt4(&mut s, &mut cdf[..4], n),
                         (_, 8) => rav1d_msac_decode_symbol_adapt8(&mut s, &mut cdf[..8], n),
                         _ => rav1d_msac_decode_symbol_adapt16(&mut s, cdf, n),
@@ -939,11 +1132,7 @@ mod tests {
         let cdfs: Vec<[u16; 4]> = (0..64)
             .map(|_| random_cdf(&mut rng, 3, false)[..4].try_into().unwrap())
             .collect();
-        for (kind, name) in [
-            (0, "rust 4 calls"),
-            (1, "rust loop"),
-            (2, "dispatched"),
-        ] {
+        for (kind, name) in [(0, "rust 4 calls"), (1, "rust loop"), (2, "dispatched")] {
             time(&format!("hi_tok {name}"), SYMBOLS, || {
                 let mut s = context(&data, true);
                 let mut cdfs = cdfs.clone();
