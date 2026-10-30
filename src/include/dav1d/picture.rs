@@ -187,6 +187,12 @@ impl Rav1dPictureDataComponentInner {
     }
 }
 
+// SAFETY: The pixels are memory an allocator handed out for the picture, which it takes back on
+// any thread; they are only reached through the `DisjointMut` around this, which checks borrows.
+unsafe impl Send for Rav1dPictureDataComponentInner {}
+// SAFETY: As for `Send`: a `&Self` reads only `ptr`, `len` and `stride`.
+unsafe impl Sync for Rav1dPictureDataComponentInner {}
+
 // SAFETY: We only store the raw pointer, so we never materialize a `&mut`.
 unsafe impl AsMutPtr for Rav1dPictureDataComponentInner {
     type Target = u8;

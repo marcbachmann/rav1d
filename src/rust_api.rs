@@ -422,6 +422,9 @@ pub struct Picture {
     by_rows: bool,
 }
 
+// A picture from `rows_picture` lends no `&[u8]` while it is written: `plane` refuses it.
+static_assertions::assert_impl_all!(Picture: Send, Sync);
+
 /// Frame component.
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
 pub enum PlanarImageComponent {
