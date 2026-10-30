@@ -396,16 +396,21 @@ fn drops_data_read_in_place_with_the_decoder() {
         assert!(Arc::try_unwrap(frame).is_ok(), "the data outlived the decoder");
     }
 
-    // A second frame sent before the first one's picture is taken waits as pending data.
-    let (first, second) = (Arc::new(frames[0].to_vec()), Arc::new(frames[1].to_vec()));
+    // Frames sent while the first one's picture is not taken: the decoder holds the next, and
+    // the one after waits as pending data.
+    let shared: Vec<_> = frames[..3].iter().map(|f| Arc::new(f.to_vec())).collect();
     let mut decoder = Open::new(true, false).decoder();
-    decoder.send_data_owned(Shared(first.clone()), None, None, None).unwrap();
-    let sent = decoder.send_data_owned(Shared(second.clone()), None, None, None);
-    assert_eq!(sent, Err(Rav1dError::TryAgain));
-    assert!(Arc::strong_count(&second) > 1);
+    let sent: Vec<_> = shared
+        .iter()
+        .map(|f| decoder.send_data_owned(Shared(f.clone()), None, None, None))
+        .take_while(|s| s.is_ok())
+        .collect();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert!(shared.iter().skip(1).all(|f| Arc::strong_count(f) > 1));
     drop(decoder);
-    assert!(Arc::try_unwrap(first).is_ok(), "the data outlived the decoder");
-    assert!(Arc::try_unwrap(second).is_ok(), "the pending data outlived the decoder");
+    for frame in shared {
+        assert!(Arc::try_unwrap(frame).is_ok(), "the held or pending data outlived the decoder");
+    }
 
     let broken = Arc::new(vec![0x12, 0x00, 0x0a, 0x0a, 0xff, 0xff, 0xff, 0xff]);
     let mut decoder = Open::new(true, false).decoder();
