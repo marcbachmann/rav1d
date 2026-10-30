@@ -3970,6 +3970,175 @@ mod tests {
         }
     }
 
+    /// Sets the 8x8 window of the output at `at`, from 3 rows above and 3 columns left, to `max`
+    /// where `dir * k(j, i) > 0`, else 0: with `k(j, i)` the sign of the taps on window pixel
+    /// `(j, i)`, that output at the end of its range.
+    fn extreme_window<BD: BitDepth>(
+        p: &mut [BD::Pixel],
+        at: usize,
+        max: i32,
+        dir: i32,
+        k: impl Fn(usize, usize) -> i32,
+    ) {
+        for j in 0..8 {
+            for i in 0..8 {
+                p[at + j * S + i - 3 * S - 3] =
+                    if dir * k(j, i) > 0 { max } else { 0 }.as_::<BD::Pixel>();
+            }
+        }
+    }
+
+    /// A random `(ab)` or `(gd)` pair of a valid warp: multiples of 64 with
+    /// `4 * |a| + ky * |b| < 0x10000`.
+    fn warp_pair(rng: &mut Rng, ky: i32) -> (i32, i32) {
+        loop {
+            let (a, b) = (rng.range(-512, 511) * 64, rng.range(-512, 511) * 64);
+            if 4 * a.abs() + ky * b.abs() < 0x10000 {
+                return (a, b);
+            }
+        }
+    }
+
+    /// Warps with one output's pixels at the end of its range: `prep`'s second-pass sums reach
+    /// 32802 (10 bpc) and 32827 (12 bpc) before `PREP_BIAS` is taken off.
+    fn warp_extreme_bd<BD: BitDepth>(max: i32) {
+        let (scalar, tiers) = dsps::<BD>();
+        let bd = BD::from_c(max);
+        let mut rng = Rng(0x0ddb_1a5e_5eed_d123 ^ max as u64);
+        let wf = |m: i32| &DAV1D_MC_WARP_FILTER[(64 + (m + 512 >> 10)) as usize];
+        let pos = |f: &[i8; 8]| f.iter().map(|&t| t.max(0) as i32).sum::<i32>();
+        let top = (0..193).max_by_key(|&i| pos(&WARP_FILTER[i])).unwrap() as i32;
+        for it in 0..3000 {
+            let (abcd, mx, my) = if it < 256 {
+                ([0; 4], (top - 64) << 10, (top - 64) << 10)
+            } else {
+                let ((a, b), (g, d)) = (warp_pair(&mut rng, 7), warp_pair(&mut rng, 4));
+                let mx = (rng.range(0, 0xffff) - 4 * a - 7 * b) & !0x3f;
+                let my = (rng.range(0, 0xffff) - 4 * g - 4 * d) & !0x3f;
+                ([a, b, g, d].map(|v| v as i16), mx, my)
+            };
+            let [a, b, g, d] = abcd.map(|v| v as i32);
+            let (oy, ox) = (rng.range(0, 7), rng.range(0, 7));
+            let dir = if it & 1 == 0 { 1 } else { -1 };
+            let (mut sbuf, off) = src_plane::<BD>(&mut rng, 8, 8, max);
+            let fv = wf(my + oy * d + ox * g);
+            let fh = |j: usize| wf(mx + (oy + j as i32) * b + ox * a);
+            let at = off + oy as usize * S + ox as usize;
+            extreme_window::<BD>(&mut sbuf, at, max, dir, |j, i| {
+                fh(j)[i] as i32 * fv[j] as i32
+            });
+            let mut sbuf = aligned(&sbuf);
+            let sp = Rav1dPictureDataComponent::wrap_buf::<BD>(sbuf.as_mut_slice(), S);
+            let src = sp.with_offset::<BD>() + off;
+            let fill = pixels::<BD>(
+                &mut rng,
+                (S * 8).next_multiple_of(RAV1D_PICTURE_GUARANTEED_MULTIPLE),
+                max,
+            );
+            let run = |dsp: &Rav1dMCDSPContext| {
+                let mut buf = aligned(&fill);
+                let dp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), S);
+                dsp.warp8x8
+                    .call::<BD>(dp.with_offset::<BD>() + 5usize, src, &abcd, mx, my, bd);
+                let mut t = vec![3i16; 8 * 24];
+                dsp.warp8x8t.call::<BD>(&mut t, 24, src, &abcd, mx, my, bd);
+                (dp.bytes(), t)
+            };
+            let want = run(&scalar);
+            for (tier, dsp) in &tiers {
+                let got = run(dsp);
+                let at = format!("{tier} {max} {abcd:?} {mx} {my} ({oy}, {ox}) {dir}");
+                assert!(got.0 == want.0, "warp put {at}");
+                assert!(got.1 == want.1, "warp prep {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn warp_extreme_8bpc() {
+        warp_extreme_bd::<BitDepth8>(255);
+    }
+
+    #[test]
+    fn warp_extreme_10bpc() {
+        warp_extreme_bd::<BitDepth16>(1023);
+    }
+
+    #[test]
+    fn warp_extreme_12bpc() {
+        warp_extreme_bd::<BitDepth16>(4095);
+    }
+
+    /// The 8-tap filters with one output's pixels at the end of its range: `prep`'s two-pass
+    /// sums reach 36956 (10 bpc) and 36983 (12 bpc) before `PREP_BIAS` is taken off.
+    fn mc_extreme_bd<BD: BitDepth>(max: i32) {
+        let (scalar, tiers) = dsps::<BD>();
+        let bd = BD::from_c(max);
+        let mut rng = Rng(0x5eed_8a9_e7e3_e11e ^ max as u64);
+        let id = [0, 0, 0, 1, 0, 0, 0, 0];
+        for (w, h) in [(2, 8), (4, 4), (8, 8), (16, 8), (32, 16)] {
+            for &f in &FILTERS[..9] {
+                let (ht, vt) = f.hv();
+                for (mx, my) in (0..16usize)
+                    .flat_map(|x| (0..16usize).map(move |y| (x, y)))
+                    .skip(1)
+                {
+                    let fh = get_filter(mx, w, ht).unwrap_or(&id);
+                    let fv = get_filter(my, h, vt).unwrap_or(&id);
+                    let (oy, ox) = (rng.range(0, h as i32 - 1), rng.range(0, w as i32 - 1));
+                    let dir = if rng.next() & 1 == 0 { 1 } else { -1 };
+                    let (mut sbuf, off) = src_plane::<BD>(&mut rng, w, h, max);
+                    let at = off + oy as usize * S + ox as usize;
+                    extreme_window::<BD>(&mut sbuf, at, max, dir, |j, i| {
+                        fh[i] as i32 * fv[j] as i32
+                    });
+                    let mut sbuf = aligned(&sbuf);
+                    let sp = Rav1dPictureDataComponent::wrap_buf::<BD>(sbuf.as_mut_slice(), S);
+                    let src = sp.with_offset::<BD>() + off;
+                    let fill = pixels::<BD>(
+                        &mut rng,
+                        (S * h).next_multiple_of(RAV1D_PICTURE_GUARANTEED_MULTIPLE),
+                        max,
+                    );
+                    let (wi, hi, mxi, myi) = (w as i32, h as i32, mx as i32, my as i32);
+                    let run = |dsp: &Rav1dMCDSPContext| {
+                        let mut buf = aligned(&fill);
+                        let dp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), S);
+                        dsp.mc[f].call::<BD>(dp.with_offset::<BD>(), src, wi, hi, mxi, myi, bd);
+                        let mut t = vec![7i16; w * h + 16];
+                        dsp.mct[f].call::<BD>(&mut t, src, wi, hi, mxi, myi, bd);
+                        (dp.bytes(), t)
+                    };
+                    let want = run(&scalar);
+                    for (tier, dsp) in &tiers {
+                        let got = run(dsp);
+                        let at = format!(
+                            "{tier} {max} {} {w}x{h} mx {mx} my {my} ({oy}, {ox}) {dir}",
+                            f as usize
+                        );
+                        assert!(got.0 == want.0, "put {at}");
+                        assert!(got.1 == want.1, "prep {at}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mc_extreme_8bpc() {
+        mc_extreme_bd::<BitDepth8>(255);
+    }
+
+    #[test]
+    fn mc_extreme_10bpc() {
+        mc_extreme_bd::<BitDepth16>(1023);
+    }
+
+    #[test]
+    fn mc_extreme_12bpc() {
+        mc_extreme_bd::<BitDepth16>(4095);
+    }
+
     #[test]
     fn warp_8bpc() {
         warp_bd::<BitDepth8>(255);
