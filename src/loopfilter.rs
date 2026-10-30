@@ -273,7 +273,7 @@ fn loop_filter<BD: BitDepth>(
 }
 
 /// [`loop_filter_sb128_rust`] sixteen lines of an edge at a time at 8 bpc, in byte lanes as
-/// dav1d's asm (on AVX2 in sixteen-bit lanes), and eight at a time at 10 bits: four (two) 4-line
+/// dav1d's asm, and eight at a time at 10 bits (sixteen on AVX2): four (two) 4-line
 /// segments, each with its own levels and filter length. Every lane takes the narrow filter and
 /// the flat filters the group's longest length needs, and masks per lane pick its result, as the
 /// C's branches would. Along a vertical edge the lines are rows, turned into lanes by transposes;
@@ -1348,6 +1348,11 @@ mod rust_simd {
         wh: c_int,
         bd: BD,
     ) {
+        if BD::BITDEPTH == 8 {
+            return filter_sb::<BD, U8x16, { HV }, { YUV }>(
+                dst, vmask, lvl, b4_stride, lut, wh, bd,
+            );
+        }
         filter_sb::<BD, I16x16, { HV }, { YUV }>(dst, vmask, lvl, b4_stride, lut, wh, bd)
     }
 
@@ -1522,7 +1527,7 @@ impl Rav1dLoopFilterDSPContext {
         }
     }
 
-    /// The Rust SIMD filters at 8 bpc, on sixteen lanes once the CPU flags hold AVX2.
+    /// The Rust SIMD filters, at 10 bits on sixteen lanes once the CPU flags hold AVX2.
     #[inline(always)]
     const fn init<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
         use HV::*;
