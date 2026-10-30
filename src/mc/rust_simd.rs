@@ -458,7 +458,15 @@ impl<BD: BitDepth> Out<'_, '_, BD> {
     }
 }
 
+/// `rnd` with `PREP_BIAS` taken off a sum that `sh` then shifts. A `prep` sum leaves `i16`
+/// (up to 36983 at 12 bpc) only before the bias is off, never after (within +-28794).
+#[inline(always)]
+fn prep_rnd<BD: BitDepth>(rnd: i32, sh: u32) -> i32 {
+    rnd - ((BD::PREP_BIAS as i32) << sh)
+}
+
 /// Where `mc_8tap` stores its rows: the picture (`put`) or the compound buffer (`prep`).
+/// `prep`'s kernels take `PREP_BIAS` off in their rounding (`prep_rnd`).
 trait Sink<BD: BitDepth> {
     const PREP: bool;
     fn emit<V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, max: i16);
@@ -492,7 +500,6 @@ impl<BD: BitDepth> Sink<BD> for PrepRows<'_> {
 
     #[inline(always)]
     fn emit<V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, _: i16) {
-        let v = v.sub(V::splat(BD::PREP_BIAS));
         let i = y * self.w + x;
         if V::ROWS == 2 {
             v.store_row::<0>(&mut self.t[i..]);
@@ -679,7 +686,11 @@ fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const T6: bool>(
     let f = *fh;
     let k = taps::<T6>(&f);
     // `put`: `(sum + 32 + hrnd) >> 6`, `prep`: `(sum + hrnd) >> hsh`.
-    let (rnd, sh) = if S::PREP { (hrnd, hsh) } else { (32 + hrnd, 6) };
+    let (rnd, sh) = if S::PREP {
+        (prep_rnd::<BD>(hrnd, hsh), hsh)
+    } else {
+        (32 + hrnd, 6)
+    };
     if V::ROWS == 2 {
         for x in (0..w).step_by(n) {
             let row = Rows::<BD, PW, true, T6> {
@@ -730,7 +741,11 @@ fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const T6: bool>(
     let hsh = 6 - ib;
     let hrnd = 1 << (hsh - 1);
     let k = taps::<T6>(fv);
-    let (rnd, sh) = if S::PREP { (hrnd, hsh) } else { (32, 6) };
+    let (rnd, sh) = if S::PREP {
+        (prep_rnd::<BD>(hrnd, hsh), hsh)
+    } else {
+        (32, 6)
+    };
     let y0 = T6 as isize - 3;
     for x in (0..w).step_by(n) {
         let row = Rows::<BD, PW, false, false> {
@@ -771,7 +786,7 @@ fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const H6: bool, co
     let kh = taps::<H6>(fh);
     let kv = taps::<V6>(fv);
     let (rnd, sh) = if S::PREP {
-        (32, 6)
+        (prep_rnd::<BD>(32, 6), 6)
     } else {
         (1 << (5 + ib), 6 + ib)
     };
@@ -1242,7 +1257,7 @@ pub fn warp<BD: BitDepth, V: Vw>(
 fn warp_rnd<BD: BitDepth>(prep: bool, bd: BD) -> (i32, u32) {
     let ib = bd.get_intermediate_bits() as u32;
     if prep {
-        (64, 7)
+        (prep_rnd::<BD>(64, 7), 7)
     } else {
         (1 << (6 + ib), 7 + ib)
     }
@@ -1307,11 +1322,6 @@ fn warp_v<BD: BitDepth, V: Vw>(
         let mut k = warp_filters::<V>(my + y as i32 * abcd[3] as i32, abcd[2] as i32);
         V::transpose8(&mut k);
         let v = V::maddv8(&mid[y..y + 8], &k, rnd, sh);
-        let v = if prep {
-            v.sub(V::splat(BD::PREP_BIAS))
-        } else {
-            v
-        };
         out.emit::<V, 0>(v, 0, y, w, max);
     }
 }
@@ -3984,6 +3994,44 @@ mod tests {
             for i in 0..8 {
                 p[at + j * S + i - 3 * S - 3] =
                     if dir * k(j, i) > 0 { max } else { 0 }.as_::<BD::Pixel>();
+            }
+        }
+    }
+
+    /// `prep_rnd`'s premise: from any filters of the tables and pixels, the two-pass `prep`
+    /// sums are within `i16` once `PREP_BIAS` is off, and their first passes before.
+    #[test]
+    fn prep_sums_fit_i16() {
+        let ends = |f: &[i8; 8], (lo, hi): (i32, i32)| {
+            f.iter().fold((0, 0), |(a, b), &t| {
+                let t = t as i32;
+                if t > 0 {
+                    (a + t * lo, b + t * hi)
+                } else {
+                    (a + t * hi, b + t * lo)
+                }
+            })
+        };
+        let rs = |(a, b): (i32, i32), sh: u32| (a + (1 << sh >> 1) >> sh, b + (1 << sh >> 1) >> sh);
+        let fits = |(a, b): (i32, i32), bias: i32| {
+            i16::try_from(a - bias).is_ok() && i16::try_from(b - bias).is_ok()
+        };
+        for (max, ib) in [(1023, 4), (4095, 2)] {
+            let subpel = || DAV1D_MC_SUBPEL_FILTERS.0.iter().flatten();
+            for fh in subpel() {
+                let mid = rs(ends(fh, (0, max)), 6 - ib);
+                assert!(fits(mid, 0) && fits(mid, 8192));
+                for fv in subpel() {
+                    assert!(fits(rs(ends(fv, mid), 6), 8192));
+                }
+            }
+            let mid = WARP_FILTER.iter().fold((0, 0), |(lo, hi), f| {
+                let (a, b) = rs(ends(f, (0, max)), 7 - ib);
+                (lo.min(a), hi.max(b))
+            });
+            assert!(fits(mid, 0));
+            for fv in &WARP_FILTER {
+                assert!(fits(rs(ends(fv, mid), 7), 8192));
             }
         }
     }
