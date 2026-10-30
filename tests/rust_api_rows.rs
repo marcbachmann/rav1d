@@ -730,13 +730,21 @@ fn parses_a_sequence_header_alone() {
     let mut checked = 0;
     for file in streams().iter().step_by(16) {
         let data = std::fs::read(file).unwrap();
-        let Some(&frame) = ivf_frames(&data).first() else { continue };
+        let frames = ivf_frames(&data);
+        let Some(&frame) = frames.first() else { continue };
         let Ok(seq) = parse_sequence_header(frame) else { continue };
-        let mut decoder = Decoder::with_settings(&Settings::new()).unwrap();
-        if decoder.send_data(frame.into(), None, None, None).is_err() {
-            continue;
+        let mut decoder = Open::new(true, false).decoder();
+        let mut first = None;
+        for frame in frames.iter().take(8) {
+            if decoder.send_data((*frame).into(), None, None, None).is_err() {
+                break;
+            }
+            if let Ok(picture) = decoder.get_picture() {
+                first = Some(picture);
+                break;
+            }
         }
-        let Ok(picture) = decoder.get_picture() else { continue };
+        let Some(picture) = first else { continue };
         let decoded = picture.sequence_header().unwrap();
         let f = file.display();
         assert_eq!((seq.max_width, seq.max_height), (decoded.max_width, decoded.max_height), "{f}");
