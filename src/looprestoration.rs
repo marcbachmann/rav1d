@@ -22,7 +22,7 @@ use crate::include::dav1d::picture::{
     FFISafeRav1dPictureDataComponentOffset, Rav1dPictureDataComponentOffset,
 };
 use crate::strided::Strided as _;
-use crate::tables::dav1d_sgr_x_by_x;
+use crate::tables::DAV1D_SGR_X_BY_X;
 use crate::wrap_fn_ptr::wrap_fn_ptr;
 
 bitflags! {
@@ -667,7 +667,7 @@ fn selfguided_filter<BD: BitDepth>(
 
             let p = cmp::max(a * n - b * b, 0) as c_uint;
             let z = (p * s + (1 << 19)) >> 20;
-            let x = dav1d_sgr_x_by_x[cmp::min(z, 255) as usize] as c_uint;
+            let x = DAV1D_SGR_X_BY_X[cmp::min(z, 255) as usize] as c_uint;
 
             // This is where we invert A and B, so that B is of size coef.
             aa[i] = ((x * bb[i].as_::<c_uint>() * sgr_one_by_x + (1 << 11)) >> 12) as c_int;
@@ -1139,11 +1139,11 @@ mod rust_simd {
         }
     }
 
-    /// `dav1d_sgr_x_by_x[z]` for `z` in 0..=255 (or more): a 64-entry lookup, then the steps of
+    /// `DAV1D_SGR_X_BY_X[z]` for `z` in 0..=255 (or more): a 64-entry lookup, then the steps of
     /// the table's flat tail.
     #[inline(always)]
     fn x_by_x(z: I16x8) -> I16x8 {
-        let lut: &[u8; 64] = dav1d_sgr_x_by_x.0[..64].try_into().unwrap();
+        let lut: &[u8; 64] = DAV1D_SGR_X_BY_X.0[..64].try_into().unwrap();
         let mut x = z
             .lookup64(lut)
             .add(z.gt(I16x8::splat(63)).and(I16x8::splat(4)));

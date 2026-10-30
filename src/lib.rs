@@ -5,7 +5,6 @@
 )]
 #![allow(clippy::derivable_impls, clippy::erasing_op, clippy::ptr_eq)]
 #![expect(
-    clippy::arc_with_non_send_sync,
     clippy::borrow_deref_ref,
     clippy::borrowed_box,
     clippy::cast_abs_to_unsigned,
@@ -38,7 +37,6 @@
     clippy::needless_return,
     clippy::neg_multiply,
     clippy::nonminimal_bool,
-    clippy::option_map_unit_fn,
     clippy::partialeq_to_none,
     clippy::precedence,
     clippy::redundant_closure,

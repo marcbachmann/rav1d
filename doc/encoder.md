@@ -14,8 +14,7 @@ image-processing (`src/engine/avif/aom.rs`). It must:
   costs 48 MB plus 48 bytes a pixel, and a picture coded as one frame costs about 47 bytes a
   pixel: a 4000×3000 screenshot is about 600 MB. The encoder streams: what it holds grows with
   the width of the image and the size of the output, not with its area (see [Memory](#memory));
-- build without cmake, libclang, llvm-tools or a C library. Only nasm stays, which rav1d's
-  assembly already needs.
+- build without cmake, libclang, llvm-tools, nasm or a C library: rav1d is Rust only.
 
 Being bit-exact with libaom is **not** a goal. The output only has to be a conformant AV1
 stream that meets the quality gates (see [Quality](#quality)). Without bit-exactness,

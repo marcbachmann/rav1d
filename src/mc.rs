@@ -22,7 +22,7 @@ use crate::levels::Filter2d;
 use crate::pic_or_buf::PicOrBuf;
 use crate::strided::Strided as _;
 use crate::tables::{
-    dav1d_mc_subpel_filters, dav1d_mc_warp_filter, dav1d_obmc_masks, dav1d_resize_filter,
+    DAV1D_MC_SUBPEL_FILTERS, DAV1D_MC_WARP_FILTER, DAV1D_OBMC_MASKS, DAV1D_RESIZE_FILTER,
 };
 use crate::with_offset::WithOffset;
 use crate::wrap_fn_ptr::wrap_fn_ptr;
@@ -123,7 +123,7 @@ fn get_filter(m: usize, d: usize, filter_type: Rav1dFilterMode) -> Option<&'stat
     } else {
         3 + (filter_type as u8 & 1)
     };
-    Some(&dav1d_mc_subpel_filters[i as usize][m])
+    Some(&DAV1D_MC_SUBPEL_FILTERS[i as usize][m])
 }
 
 #[inline(never)]
@@ -704,7 +704,7 @@ fn blend_v_rust<BD: BitDepth>(
     w: usize,
     h: usize,
 ) {
-    let mask = &dav1d_obmc_masks.0[w..];
+    let mask = &DAV1D_OBMC_MASKS.0[w..];
     let tmp = &tmp[..w * h];
     for y in 0..h {
         let dst = dst + (y as isize * dst.pixel_stride::<BD>());
@@ -722,7 +722,7 @@ fn blend_h_rust<BD: BitDepth>(
     w: usize,
     h: usize,
 ) {
-    let mask = &dav1d_obmc_masks.0[h..];
+    let mask = &DAV1D_OBMC_MASKS.0[h..];
     let h = h * 3 >> 2;
     let tmp = &tmp[..w * h];
     for y in 0..h {
@@ -822,7 +822,7 @@ fn warp_affine_8x8_rust<BD: BitDepth>(
         let mx = mx + y as i32 * abcd[1] as i32;
         for x in 0..W {
             let tmx = mx + x as i32 * abcd[0] as i32;
-            let filter = &dav1d_mc_warp_filter[(64 + (tmx + 512 >> 10)) as usize];
+            let filter = &DAV1D_MC_WARP_FILTER[(64 + (tmx + 512 >> 10)) as usize];
             let n = filter.len();
             let src = &*(src + x - 3usize).slice::<BD>(n);
             mid[y][x] = ((0..n)
@@ -839,7 +839,7 @@ fn warp_affine_8x8_rust<BD: BitDepth>(
         let dst = &mut *dst.slice_mut::<BD>(W);
         for x in 0..W {
             let tmy = my + x as i32 * abcd[2] as i32;
-            let filter = &dav1d_mc_warp_filter[(64 + (tmy + 512 >> 10)) as usize];
+            let filter = &DAV1D_MC_WARP_FILTER[(64 + (tmy + 512 >> 10)) as usize];
             let n = filter.len();
             let mid = &mid[y..][..n];
             dst[x] = bd.iclip_pixel(
@@ -873,7 +873,7 @@ fn warp_affine_8x8t_rust<BD: BitDepth>(
         let mx = mx + y as i32 * abcd[1] as i32;
         for x in 0..W {
             let tmx = mx + x as i32 * abcd[0] as i32;
-            let filter = &dav1d_mc_warp_filter[(64 + (tmx + 512 >> 10)) as usize];
+            let filter = &DAV1D_MC_WARP_FILTER[(64 + (tmx + 512 >> 10)) as usize];
             let n = filter.len();
             let src = &*(src + x - 3usize).slice::<BD>(n);
             mid[y][x] = ((0..n)
@@ -889,7 +889,7 @@ fn warp_affine_8x8t_rust<BD: BitDepth>(
         let my = my + y as i32 * abcd[3] as i32;
         for x in 0..W {
             let tmy = my + x as i32 * abcd[2] as i32;
-            let filter = &dav1d_mc_warp_filter[(64 + (tmy + 512 >> 10)) as usize];
+            let filter = &DAV1D_MC_WARP_FILTER[(64 + (tmy + 512 >> 10)) as usize];
             let n = filter.len();
             let mid = &mid[y..][..n];
             tmp[x] = BD::sub_prep_bias(
@@ -996,7 +996,7 @@ fn resize_rust<BD: BitDepth>(
             PicOrBuf::Buf(buf) => &mut *buf.mut_slice_as((dst.offset.., ..dst_w)),
         };
         for dst_x in 0..dst_w {
-            let f = &dav1d_resize_filter[(mx >> 8) as usize];
+            let f = &DAV1D_RESIZE_FILTER[(mx >> 8) as usize];
             dst[dst_x] = bd.iclip_pixel(
                 -(0..f.len())
                     .map(|i| {

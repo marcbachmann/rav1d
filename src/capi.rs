@@ -1,5 +1,7 @@
 //! The dav1d-compatible C API, for the CLI and its tests (feature `capi`).
 
+#![expect(clippy::option_map_unit_fn)]
+
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::ptr::NonNull;
 use std::{mem, ptr, slice};

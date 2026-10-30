@@ -23,7 +23,7 @@ use crate::levels::{
 };
 use crate::strided::Strided as _;
 use crate::tables::{
-    dav1d_dr_intra_derivative, dav1d_filter_intra_taps, dav1d_sm_weights, filter_fn, FLT_INCR,
+    DAV1D_DR_INTRA_DERIVATIVE, DAV1D_FILTER_INTRA_TAPS, DAV1D_SM_WEIGHTS, filter_fn, FLT_INCR,
 };
 use crate::wrap_fn_ptr::wrap_fn_ptr;
 
@@ -743,8 +743,8 @@ mod rust_simd {
     ) {
         // The weights as `blend` takes them.
         let k = if size_of::<P>() > 1 && MODE != SMOOTH { 7 } else { 0 };
-        let w_hor = &dav1d_sm_weights.0[W..][..W];
-        let w_ver = &dav1d_sm_weights.0[h..][..h];
+        let w_hor = &DAV1D_SM_WEIGHTS.0[W..][..W];
+        let w_ver = &DAV1D_SM_WEIGHTS.0[h..][..h];
         let top = &topleft[off + 1..][..W];
         let left = |y: usize| topleft[off - 1 - y];
         let right: u32 = topleft[off + W].into();
@@ -1734,8 +1734,8 @@ fn ipred_smooth_rust<BD: BitDepth>(
 ) {
     let [width, height] = [width, height].map(|it| it as usize);
 
-    let weights_hor = &dav1d_sm_weights.0[width..][..width];
-    let weights_ver = &dav1d_sm_weights.0[height..][..height];
+    let weights_hor = &DAV1D_SM_WEIGHTS.0[width..][..width];
+    let weights_ver = &DAV1D_SM_WEIGHTS.0[height..][..height];
     let right = topleft[topleft_off + width].as_::<c_int>();
     let bottom = topleft[topleft_off - height].as_::<c_int>();
 
@@ -1785,7 +1785,7 @@ fn ipred_smooth_v_rust<BD: BitDepth>(
 ) {
     let [width, height] = [width, height].map(|it| it as usize);
 
-    let weights_ver = &dav1d_sm_weights.0[height..][..height];
+    let weights_ver = &DAV1D_SM_WEIGHTS.0[height..][..height];
     let bottom = topleft[topleft_off - height].as_::<c_int>();
 
     for y in 0..height {
@@ -1832,7 +1832,7 @@ fn ipred_smooth_h_rust<BD: BitDepth>(
 ) {
     let [width, height] = [width, height].map(|it| it as usize);
 
-    let weights_hor = &dav1d_sm_weights.0[width..][..width];
+    let weights_hor = &DAV1D_SM_WEIGHTS.0[width..][..width];
     let right = topleft[topleft_off + width].as_::<c_int>();
 
     for y in 0..height {
@@ -1986,7 +1986,7 @@ fn z1_edge<BD: BitDepth>(
     let enable_intra_edge_filter = (angle >> 10) != 0;
     angle &= 511;
     assert!(angle < 90);
-    let mut dx = dav1d_dr_intra_derivative[(angle >> 1) as usize] as c_int;
+    let mut dx = DAV1D_DR_INTRA_DERIVATIVE[(angle >> 1) as usize] as c_int;
     let upsample_above = if enable_intra_edge_filter {
         get_upsample(width + height, 90 - angle, is_sm)
     } else {
@@ -2087,8 +2087,8 @@ fn z2_edge<BD: BitDepth>(
     let enable_intra_edge_filter = angle >> 10;
     angle &= 511;
     assert!(angle > 90 && angle < 180);
-    let mut dy = dav1d_dr_intra_derivative[(angle - 90 >> 1) as usize] as c_int;
-    let mut dx = dav1d_dr_intra_derivative[(180 - angle >> 1) as usize] as c_int;
+    let mut dy = DAV1D_DR_INTRA_DERIVATIVE[(angle - 90 >> 1) as usize] as c_int;
+    let mut dx = DAV1D_DR_INTRA_DERIVATIVE[(180 - angle >> 1) as usize] as c_int;
     let upsample_left = if enable_intra_edge_filter != 0 {
         get_upsample(width + height, 180 - angle, is_sm)
     } else {
@@ -2252,7 +2252,7 @@ fn z3_edge<BD: BitDepth>(
     let enable_intra_edge_filter = angle >> 10;
     angle &= 511;
     assert!(angle > 180);
-    let mut dy = dav1d_dr_intra_derivative[(270 - angle >> 1) as usize] as usize;
+    let mut dy = DAV1D_DR_INTRA_DERIVATIVE[(270 - angle >> 1) as usize] as usize;
     let upsample_left = if enable_intra_edge_filter != 0 {
         get_upsample(width + height, angle - 180, is_sm)
     } else {
@@ -2390,7 +2390,7 @@ fn ipred_filter_rust<BD: BitDepth>(
     let stride = dst.pixel_stride::<BD>();
     let filt_idx = filt_idx & 511;
 
-    let filter = &dav1d_filter_intra_taps[filt_idx];
+    let filter = &DAV1D_FILTER_INTRA_TAPS[filt_idx];
     let mut top = &topleft_in[topleft_off + 1..][..width];
     let mut top_guard;
     for y in (0..height).step_by(2) {

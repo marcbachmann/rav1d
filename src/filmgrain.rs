@@ -21,7 +21,7 @@ use crate::include::dav1d::picture::{
 };
 use crate::internal::GrainLut;
 use crate::strided::Strided as _;
-use crate::tables::dav1d_gaussian_sequence;
+use crate::tables::DAV1D_GAUSSIAN_SEQUENCE;
 use crate::wrap_fn_ptr::wrap_fn_ptr;
 
 pub const GRAIN_WIDTH: usize = 82;
@@ -295,7 +295,7 @@ fn generate_grain_y_rust<BD: BitDepth>(
     for row in &mut buf[..GRAIN_HEIGHT] {
         row[..GRAIN_WIDTH].fill_with(|| {
             let value = get_random_number(11, &mut seed);
-            round2(dav1d_gaussian_sequence[value as usize], shift).as_::<BD::Entry>()
+            round2(DAV1D_GAUSSIAN_SEQUENCE[value as usize], shift).as_::<BD::Entry>()
         });
     }
 
@@ -409,7 +409,7 @@ fn generate_grain_uv_rust<BD: BitDepth>(
     for row in &mut buf[..is_sub.chroma().0] {
         row[..is_sub.chroma().1].fill_with(|| {
             let value = get_random_number(11, &mut seed);
-            round2(dav1d_gaussian_sequence[value as usize], shift).as_::<BD::Entry>()
+            round2(DAV1D_GAUSSIAN_SEQUENCE[value as usize], shift).as_::<BD::Entry>()
         });
     }
 
