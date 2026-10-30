@@ -1128,6 +1128,15 @@ fn add_block<
         coeff[0] = 0;
         return add_dc::<BD, W, H>(dst, dc, 255);
     }
+    #[cfg(target_arch = "x86_64")]
+    // Of a block with coefficients in its top-left quarter only, the halves are mostly zeros.
+    if WIDE && W == 8 && H == 8 && TYPE == DCT_DCT && !quarter(W, H, TYPE, eob) {
+        let mut v = [I16x8::splat(0); 8];
+        packed::rows(coeff, &mut v);
+        round(&mut v, round_mul(Dct, 8, 1), 0);
+        transpose8x8(&mut v);
+        return packed::cols::<BD, false>(dst, &v, 255);
+    }
     let shift = row_shift(W, H);
     let (cw, ch) = (W.min(32), H.min(32));
     let coeff = &mut coeff[..cw * ch];
@@ -1329,6 +1338,15 @@ fn add_block10<
         }
         y0 += 8;
     }
+    #[cfg(target_arch = "x86_64")]
+    if WIDE && W == 8 && H == 8 && TYPE == DCT_DCT {
+        let rows: &[I16x8; 8] = (&groups[0][..8]).try_into().unwrap();
+        return if half {
+            packed::cols::<BD, true>(dst, rows, px_max)
+        } else {
+            packed::cols::<BD, false>(dst, rows, px_max)
+        };
+    }
     #[allow(unused_mut)]
     let mut g = 0;
     #[cfg(target_arch = "x86_64")]
@@ -1422,6 +1440,122 @@ mod wide {
                 out.max(I16x16::splat(0))
                     .min(I16x16::splat(px_max))
                     .store_u16(px);
+            }
+        }
+    }
+}
+
+/// The 8x8 DCT as dav1d's AVX2 asm runs it: each pass one [`dct8`] on vectors of two rows
+/// (columns), the even half of the butterflies in the low halves and the odd half in the high
+/// ones.
+#[cfg(target_arch = "x86_64")]
+mod packed {
+    use super::*;
+    use crate::simd128::I16x16;
+
+    /// [`dct8`] of inputs `(0|1), (4|7), (2|5), (6|3)` into outputs `(0|1), (2|3), (5|4), (7|6)`;
+    /// the third rotation passes the even half through as `x * 4096 >> 12`. `HALF`: inputs 4 to
+    /// 7 are zero, the first rotations single products.
+    #[inline(always)]
+    fn dct8<const HALF: bool>(x: [I16x16; 4]) -> [I16x16; 4] {
+        #[inline(always)]
+        fn k(lo: i16, hi: i16) -> I16x16 {
+            I16x16::splat2(lo * 8, hi * 8)
+        }
+        let ((b, a), (c, d)) = if HALF {
+            let m = x[2].blend_hi(x[3]);
+            (
+                (x[0].mulhrs(k(2896, 799)), x[0].mulhrs(k(2896, 4017))),
+                (m.mulhrs(k(1567, -2276)), m.mulhrs(k(3784, 3406))),
+            )
+        } else {
+            (
+                x[0].madd2x(x[1], [[2896, -2896], [799, -4017]], [[2896, 2896], [4017, 799]]),
+                x[2].madd2x(
+                    x[3],
+                    [[1567, -3784], [3406, -2276]],
+                    [[3784, 1567], [2276, 3406]],
+                ),
+            )
+        };
+        let p = a.add_sat(d);
+        let q = b.add_sat(c);
+        let (r, s) = a.sub_sat(d).madd2x(
+            b.sub_sat(c),
+            [[4096, 0], [2896, -2896]],
+            [[0, 4096], [2896, 2896]],
+        );
+        let (u, w) = (p.join_lo(q), p.join_hi(s));
+        let (y, z) = (s.join_lo(r), r.join_hi(q));
+        [u.add_sat(w), y.add_sat(z), y.sub_sat(z), u.sub_sat(w)]
+    }
+
+    /// Rows `(0|1), (4|7), (2|5), (6|3)` of eight.
+    #[inline(always)]
+    fn pairs(r: &[I16x8; 8]) -> [I16x16; 4] {
+        [
+            I16x16::from_halves(r[0], r[1]),
+            I16x16::from_halves(r[4], r[7]),
+            I16x16::from_halves(r[2], r[5]),
+            I16x16::from_halves(r[6], r[3]),
+        ]
+    }
+
+    /// The row pass at 8 bpc: the coefficients' columns into `v`, before the rounding shift.
+    #[inline(always)]
+    pub fn rows(coeff: &mut [i16], v: &mut [I16x8; 8]) {
+        let c = &mut coeff[..64];
+        let mut r = [I16x8::splat(0); 8];
+        for (x, r) in r.iter_mut().enumerate() {
+            *r = I16x8::load(&c[8 * x..]);
+        }
+        c.fill(0);
+        let [o01, o23, o54, o76] = dct8::<false>(pairs(&r));
+        *v = [
+            o01.lo(),
+            o01.hi(),
+            o23.lo(),
+            o23.hi(),
+            o54.hi(),
+            o54.lo(),
+            o76.hi(),
+            o76.lo(),
+        ];
+    }
+
+    /// The column pass of the row pass's rounded outputs, turned into rows `r`, added to the
+    /// picture.
+    #[inline(always)]
+    pub fn cols<BD: BitDepth, const HALF: bool>(
+        dst: Rav1dPictureDataComponentOffset,
+        r: &[I16x8; 8],
+        px_max: i16,
+    ) {
+        let k = I16x16::splat(2048);
+        let o = dct8::<HALF>(pairs(r));
+        let stride = dst.pixel_stride::<BD>();
+        for (i, (y0, y1)) in [(0, 1), (2, 3), (5, 4), (7, 6)].into_iter().enumerate() {
+            let o = o[i].mulhrs(k);
+            let (mut ga, mut gb) = (
+                (dst + y0 * stride).slice_mut::<BD>(8),
+                (dst + y1 * stride).slice_mut::<BD>(8),
+            );
+            let (pa, pb) = (ga.as_bytes_mut(), gb.as_bytes_mut());
+            if BD::BITDEPTH == 8 {
+                let mut px = [0; 16];
+                px[..8].copy_from_slice(&pa[..8]);
+                px[8..].copy_from_slice(&pb[..8]);
+                let out = I16x16::from_u8x16(&px).add(o).pack_u8();
+                pa.copy_from_slice(&out[..8]);
+                pb.copy_from_slice(&out[8..]);
+            } else {
+                let (pa, pb) = (px16(pa), px16(pb));
+                let out = I16x16::from_halves(I16x8::load_u16(pa), I16x8::load_u16(pb))
+                    .add_sat(o)
+                    .max(I16x16::splat(0))
+                    .min(I16x16::splat(px_max));
+                out.lo().store_u16(pa);
+                out.hi().store_u16(pb);
             }
         }
     }

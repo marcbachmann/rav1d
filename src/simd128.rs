@@ -231,7 +231,6 @@ pub trait Bytes: Copy {
     /// Whether any lane is nonzero.
     fn any(self) -> bool;
     /// `t[lane]` for lanes below 64, 0 for the others.
-    fn lookup64(self, t: &[u8; 64]) -> Self;
     /// The loop filter's limits E and I of the levels in the lanes: from the tables `e` and
     /// `i`, or from the sharpness.
     fn limits(self, e: &[u8; 64], i: &[u8; 64], sharp: [u64; 2]) -> (Self, Self);
@@ -327,10 +326,6 @@ macro_rules! forward_bytes {
             #[inline(always)]
             fn any(self) -> bool {
                 <$t>::any(self)
-            }
-            #[inline(always)]
-            fn lookup64(self, t: &[u8; 64]) -> Self {
-                <$t>::lookup64(self, t)
             }
             #[inline(always)]
             fn limits(self, e: &[u8; 64], i: &[u8; 64], sharp: [u64; 2]) -> (Self, Self) {
@@ -1045,6 +1040,74 @@ mod wide {
             }
         }
 
+        /// [`Self::madd2`] with the constants `k1[h]` and `k2[h]` in half `h`.
+        #[inline(always)]
+        pub fn madd2x(self, o: Self, k1: [[i16; 2]; 2], k2: [[i16; 2]; 2]) -> (Self, Self) {
+            #[inline(always)]
+            fn pair(k: [i16; 2]) -> i32 {
+                k[0] as u16 as i32 | (k[1] as i32) << 16
+            }
+            unsafe {
+                let k1 = _mm256_setr_epi32(
+                    pair(k1[0]),
+                    pair(k1[0]),
+                    pair(k1[0]),
+                    pair(k1[0]),
+                    pair(k1[1]),
+                    pair(k1[1]),
+                    pair(k1[1]),
+                    pair(k1[1]),
+                );
+                let k2 = _mm256_setr_epi32(
+                    pair(k2[0]),
+                    pair(k2[0]),
+                    pair(k2[0]),
+                    pair(k2[0]),
+                    pair(k2[1]),
+                    pair(k2[1]),
+                    pair(k2[1]),
+                    pair(k2[1]),
+                );
+                let rnd = _mm256_set1_epi32(2048);
+                let lo = _mm256_unpacklo_epi16(self.0, o.0);
+                let hi = _mm256_unpackhi_epi16(self.0, o.0);
+                (
+                    Self(_mm256_packs_epi32(
+                        _mm256_srai_epi32::<12>(_mm256_add_epi32(_mm256_madd_epi16(lo, k1), rnd)),
+                        _mm256_srai_epi32::<12>(_mm256_add_epi32(_mm256_madd_epi16(hi, k1), rnd)),
+                    )),
+                    Self(_mm256_packs_epi32(
+                        _mm256_srai_epi32::<12>(_mm256_add_epi32(_mm256_madd_epi16(lo, k2), rnd)),
+                        _mm256_srai_epi32::<12>(_mm256_add_epi32(_mm256_madd_epi16(hi, k2), rnd)),
+                    )),
+                )
+            }
+        }
+
+        /// `lo` in the low half's lanes, `hi` in the high half's.
+        #[inline(always)]
+        pub fn splat2(lo: i16, hi: i16) -> Self {
+            Self(unsafe { _mm256_set_m128i(_mm_set1_epi16(hi), _mm_set1_epi16(lo)) })
+        }
+
+        /// The low half of `self` and the high half of `o`.
+        #[inline(always)]
+        pub fn blend_hi(self, o: Self) -> Self {
+            Self(unsafe { _mm256_blend_epi32::<0xf0>(self.0, o.0) })
+        }
+
+        /// The low halves of `self` and `o`.
+        #[inline(always)]
+        pub fn join_lo(self, o: Self) -> Self {
+            Self(unsafe { _mm256_permute2x128_si256::<0x20>(self.0, o.0) })
+        }
+
+        /// The high halves of `self` and `o`.
+        #[inline(always)]
+        pub fn join_hi(self, o: Self) -> Self {
+            Self(unsafe { _mm256_permute2x128_si256::<0x31>(self.0, o.0) })
+        }
+
         #[inline(always)]
         pub fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
             unsafe {
@@ -1288,25 +1351,6 @@ mod wide {
         #[inline(always)]
         pub fn any(self) -> bool {
             unsafe { _mm256_testz_si256(self.0, self.0) == 0 }
-        }
-
-        /// `t[lane]` for lanes below 64, 0 for the others.
-        #[inline(always)]
-        pub fn lookup64(self, t: &[u8; 64]) -> Self {
-            unsafe {
-                let mut r = _mm256_setzero_si256();
-                for k in 0..4 {
-                    let t =
-                        _mm256_broadcastsi128_si256(_mm_loadu_si128(t[16 * k..].as_ptr().cast()));
-                    // Indices outside this 16 saturate to the top bit, which zeroes them.
-                    let ik = _mm256_adds_epu8(
-                        _mm256_sub_epi8(self.0, _mm256_set1_epi8(16 * k as i8)),
-                        _mm256_set1_epi8(0x70),
-                    );
-                    r = _mm256_or_si256(r, _mm256_shuffle_epi8(t, ik));
-                }
-                Self(r)
-            }
         }
 
         /// The loop filter's limits E and I of the levels in the lanes, as the asm computes
@@ -2207,24 +2251,6 @@ mod imp {
         #[inline(always)]
         pub fn from_u32(x: u32) -> Self {
             Self(unsafe { _mm_cvtsi32_si128(x as i32) })
-        }
-
-        /// `t[lane]` for lanes below 64, 0 for the others.
-        #[inline(always)]
-        pub fn lookup64(self, t: &[u8; 64]) -> Self {
-            unsafe {
-                let mut r = _mm_setzero_si128();
-                for k in 0..4 {
-                    let t = _mm_loadu_si128(t[16 * k..].as_ptr().cast());
-                    // Indices outside this 16 saturate to the top bit, which zeroes them.
-                    let ik = _mm_adds_epu8(
-                        _mm_sub_epi8(self.0, _mm_set1_epi8(16 * k as i8)),
-                        _mm_set1_epi8(0x70),
-                    );
-                    r = _mm_or_si128(r, _mm_shuffle_epi8(t, ik));
-                }
-                Self(r)
-            }
         }
 
         /// The loop filter's limits E and I of the levels in the lanes, as the asm computes

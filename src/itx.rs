@@ -508,11 +508,13 @@ impl Rav1dInvTxfmDSPContext {
             return self;
         }
 
-        // Sixteen lanes on AVX2 where a side reaches 16; at 10 bits also eight-row row passes.
+        // Sixteen lanes on AVX2 where a side reaches 16; at 10 bits also eight-row row passes,
+        // and the 8x8 DCT on vectors of two rows.
         macro_rules! assign {
             ($w:literal, $h:literal, $($type:ident),*) => {{
                 let tx = TxfmSize::from_wh($w, $h) as usize;
-                let wide = avx2 && ($w >= 16 || $h >= if BD::BITDEPTH == 8 { 16 } else { 8 });
+                let wide = avx2
+                    && ($w >= 16 || $h >= if BD::BITDEPTH == 8 { 16 } else { 8 } || $w * $h == 64);
                 $(
                     self.itxfm_add[tx][$type as usize] = if wide {
                         itxfm::Fn::new(inv_txfm_add_simd_erased::<$w, $h, $type, BD, { ($w + 7) / 8 }, true>)
