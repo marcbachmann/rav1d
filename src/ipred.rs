@@ -815,6 +815,161 @@ mod rust_simd {
         })
     }
 
+    pub const PRED_V: u8 = 0;
+    pub const PRED_H: u8 = 1;
+    pub const PRED_PAETH: u8 = 2;
+
+    /// V_PRED, H_PRED or PAETH_PRED by `MODE`. `block` has a stride of at least `W`; its rows
+    /// are taken by offset, as chunks of the stride would divide by it.
+    #[inline(always)]
+    fn copy_rows<P: Pix, const W: usize, const MODE: u8>(
+        block: &mut [P],
+        stride: usize,
+        topleft: &[P],
+        off: usize,
+        h: usize,
+    ) {
+        let top: [P; W] = topleft[off + 1..][..W].try_into().unwrap();
+        if MODE == PRED_V {
+            for y in 0..h {
+                block[y * stride..][..W].copy_from_slice(&top);
+            }
+            return;
+        }
+        if MODE == PRED_H {
+            for y in 0..h {
+                block[y * stride..][..W].fill(topleft[off - 1 - y]);
+            }
+            return;
+        }
+        // PAETH: left where `|top - topleft|` is the least of the three differences, else top
+        // where `|left - topleft|` is no more than `|top + left - 2 * topleft|`, else topleft.
+        let tl = I16x8::splat(topleft[off].into() as i16);
+        let mut t = [I16x8::splat(0); 8];
+        let mut ldiff = [I16x8::splat(0); 8];
+        for i in 0..W.div_ceil(8) {
+            t[i] = if W == 4 { P::load4(&top) } else { P::load8(&top[8 * i..]) };
+            ldiff[i] = t[i].sub(tl).abs();
+        }
+        for y in 0..h {
+            let l = I16x8::splat(topleft[off - 1 - y].into() as i16);
+            let tdiff = l.sub(tl).abs();
+            let row = &mut block[y * stride..][..W];
+            for i in 0..W.div_ceil(8) {
+                let tldiff = t[i].add(l).sub(tl).sub(tl).abs();
+                let not_left = ldiff[i].gt(tdiff).or(ldiff[i].gt(tldiff));
+                let p = I16x8::select(not_left, I16x8::select(tdiff.gt(tldiff), tl, t[i]), l);
+                let k = W.min(8);
+                row[8 * i..][..k].copy_from_slice(&P::px8(p)[..k]);
+            }
+        }
+    }
+
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn copy_rows_128<BD: BitDepth, const MODE: u8>(
+        dst: Rav1dPictureDataComponentOffset,
+        topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
+        off: usize,
+        w: c_int,
+        h: usize,
+    ) {
+        let stride = dst.pixel_stride::<BD>() as usize;
+        let mut block = dst.slice_mut::<BD>((h - 1) * stride + w as usize);
+        with_px!(BD, |P| {
+            let (b, t) = (px_mut::<P>(block.as_bytes_mut()), px::<P>(topleft.as_bytes()));
+            match w {
+                4 => copy_rows::<P, 4, MODE>(b, stride, t, off, h),
+                8 => copy_rows::<P, 8, MODE>(b, stride, t, off, h),
+                16 => copy_rows::<P, 16, MODE>(b, stride, t, off, h),
+                32 => copy_rows::<P, 32, MODE>(b, stride, t, off, h),
+                64 => copy_rows::<P, 64, MODE>(b, stride, t, off, h),
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    /// FILTER_PRED: each 4x2 block is `(sum(taps[i] * p[i]) + 8) >> 4` over the 7 pixels above
+    /// and left of it, its 8 outputs in the lanes; the left two come from the block before.
+    /// The sums fit in 16 bits to 10 bpc. The row above a pair of rows is kept in `top`.
+    #[inline(always)]
+    fn filter_intra<P: Pix, const W: usize>(
+        block: &mut [P],
+        stride: usize,
+        topleft: &[P],
+        off: usize,
+        h: usize,
+        taps: &[i8; 64],
+        max: i16,
+    ) {
+        // Tap `i` of output `k` is at `FLT_INCR * k + [0, 1, 16, 17, 32, 33, 48][i]` on x86,
+        // `8 * i + k` elsewhere.
+        let b = taps.as_bytes();
+        let mut tv = [I16x8::splat(0); 8];
+        if FLT_INCR == 2 {
+            for j in 0..4 {
+                let v = I16x8::from_bytes(&b[16 * j..]);
+                tv[2 * j] = v.mul(I16x8::splat(256)).shr_s::<8>();
+                tv[2 * j + 1] = v.shr_s::<8>();
+            }
+        } else {
+            for i in 0..7 {
+                tv[i] = I16x8::from_u8x8(&b[8 * i..]).mul(I16x8::splat(256)).shr_s::<8>();
+            }
+        }
+        let mut top = [P::default(); W];
+        top.copy_from_slice(&topleft[off + 1..][..W]);
+        let (rnd, zero, max) = (I16x8::splat(8), I16x8::splat(0), I16x8::splat(max));
+        for y in (0..h).step_by(2) {
+            let mut p0: u32 = topleft[off - y].into();
+            let (mut p5, mut p6): (u32, u32) =
+                (topleft[off - 1 - y].into(), topleft[off - 2 - y].into());
+            for x in (0..W).step_by(4) {
+                let p = [p0, top[x].into(), top[x + 1].into(), top[x + 2].into(), top[x + 3].into(), p5, p6];
+                let mut acc = rnd;
+                for i in 0..7 {
+                    acc = acc.add(tv[i].mul(I16x8::splat(p[i] as i16)));
+                }
+                let o = P::px8(acc.shr_s::<4>().max(zero).min(max));
+                block[y * stride + x..][..4].copy_from_slice(&o[..4]);
+                block[(y + 1) * stride + x..][..4].copy_from_slice(&o[4..]);
+                top[x..x + 4].copy_from_slice(&o[4..]);
+                p0 = p[4];
+                (p5, p6) = (o[3].into(), o[7].into());
+            }
+        }
+    }
+
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
+    fn filter_128<BD: BitDepth>(
+        dst: Rav1dPictureDataComponentOffset,
+        topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
+        off: usize,
+        w: c_int,
+        h: usize,
+        filt_idx: c_int,
+        max: i16,
+    ) {
+        let taps = &dav1d_filter_intra_taps[(filt_idx & 511) as usize].0;
+        let stride = dst.pixel_stride::<BD>() as usize;
+        let mut block = dst.slice_mut::<BD>((h - 1) * stride + w as usize);
+        with_px!(BD, |P| {
+            let (b, t) = (px_mut::<P>(block.as_bytes_mut()), px::<P>(topleft.as_bytes()));
+            match w {
+                4 => filter_intra::<P, 4>(b, stride, t, off, h, taps, max),
+                8 => filter_intra::<P, 8>(b, stride, t, off, h, taps, max),
+                16 => filter_intra::<P, 16>(b, stride, t, off, h, taps, max),
+                32 => filter_intra::<P, 32>(b, stride, t, off, h, taps, max),
+                _ => unreachable!(),
+            }
+        })
+    }
+
     /// `dc + sign(alpha * ac) * ((|alpha * ac| + 32) >> 6)` clipped to the pixels, with
     /// `alpha` as `|alpha| << 9` and its sign in `neg`: the rounding multiply-high of
     /// `|ac| <= 8 << 12` divides by 64.
@@ -1539,6 +1694,75 @@ mod rust_simd {
         let half = (bitdepth_max + 1) as u32 >> 1;
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
         unsafe { dc_128::<BD, GEN>(dst, topleft, topleft_off, width, height, half) }
+    }
+
+    /// `MODE` is [`PRED_V`], [`PRED_H`] or [`PRED_PAETH`].
+    ///
+    /// # Safety
+    ///
+    /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn ipred_copy_erased<BD: BitDepth, const MODE: u8>(
+        _dst_ptr: *mut DynPixel,
+        _stride: ptrdiff_t,
+        topleft: *const DynPixel,
+        width: c_int,
+        height: c_int,
+        _a: c_int,
+        _max_width: c_int,
+        _max_height: c_int,
+        _bitdepth_max: c_int,
+        topleft_off: usize,
+        dst: FFISafeRav1dPictureDataComponentOffset,
+    ) {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `angular_ipred::Fn::call`.
+        let dst = unsafe { FFISafe::from_with_offset(dst) };
+        // SAFETY: `fn angular_ipred::Fn::call` makes `topleft` `topleft_off` from the beginning of the array.
+        let topleft = unsafe { reconstruct_topleft::<BD>(topleft, topleft_off) };
+        if dst.pixel_stride::<BD>() < width as isize {
+            return match MODE {
+                PRED_V => ipred_v_rust::<BD>(dst, topleft, topleft_off, width, height),
+                PRED_H => ipred_h_rust::<BD>(dst, topleft, topleft_off, width, height),
+                _ => ipred_paeth_rust::<BD>(dst, topleft, topleft_off, width, height),
+            };
+        }
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe { copy_rows_128::<BD, MODE>(dst, topleft, topleft_off, width, height as usize) }
+    }
+
+    /// # Safety
+    ///
+    /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[deny(unsafe_op_in_unsafe_fn)]
+    #[allow(unused_unsafe)]
+    pub unsafe extern "C" fn ipred_filter_erased<BD: BitDepth>(
+        _dst_ptr: *mut DynPixel,
+        _stride: ptrdiff_t,
+        topleft: *const DynPixel,
+        width: c_int,
+        height: c_int,
+        filt_idx: c_int,
+        max_width: c_int,
+        max_height: c_int,
+        bitdepth_max: c_int,
+        topleft_off: usize,
+        dst: FFISafeRav1dPictureDataComponentOffset,
+    ) {
+        // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `angular_ipred::Fn::call`.
+        let dst = unsafe { FFISafe::from_with_offset(dst) };
+        // SAFETY: `fn angular_ipred::Fn::call` makes `topleft` `topleft_off` from the beginning of the array.
+        let topleft = unsafe { reconstruct_topleft::<BD>(topleft, topleft_off) };
+        // Above 10 bpc the sums outgrow 16 bits.
+        if dst.pixel_stride::<BD>() < width as isize || bitdepth_max > 1023 {
+            let bd = BD::from_c(bitdepth_max);
+            return ipred_filter_rust::<BD>(
+                dst, topleft, topleft_off, width, height, filt_idx, max_width, max_height, bd,
+            );
+        }
+        let (h, max) = (height as usize, bitdepth_max as i16);
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        unsafe { filter_128::<BD>(dst, topleft, topleft_off, width, h, filt_idx, max) }
     }
 
     /// `MODE` is [`SMOOTH`], [`SMOOTH_V`] or [`SMOOTH_H`].
@@ -2756,6 +2980,10 @@ impl Rav1dIntraPredDSPContext {
         a[TOP_DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::Top as u8 }>);
         a[LEFT_DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::Left as u8 }>);
         a[DC_128_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, DC_128>);
+        a[VERT_PRED as usize] = angular_ipred::Fn::new(ipred_copy_erased::<BD, PRED_V>);
+        a[HOR_PRED as usize] = angular_ipred::Fn::new(ipred_copy_erased::<BD, PRED_H>);
+        a[PAETH_PRED as usize] = angular_ipred::Fn::new(ipred_copy_erased::<BD, PRED_PAETH>);
+        a[FILTER_PRED as usize] = angular_ipred::Fn::new(ipred_filter_erased::<BD>);
         a[SMOOTH_PRED as usize] = angular_ipred::Fn::new(ipred_smooth_erased::<BD, SMOOTH>);
         a[SMOOTH_V_PRED as usize] = angular_ipred::Fn::new(ipred_smooth_erased::<BD, SMOOTH_V>);
         a[SMOOTH_H_PRED as usize] = angular_ipred::Fn::new(ipred_smooth_erased::<BD, SMOOTH_H>);
@@ -2974,10 +3202,19 @@ mod tests {
                 _ => edge(&mut rng, max),
             };
             for (w, h) in SIZES {
-                for mode in DCS.into_iter().chain(SMOOTHS) {
+                for mode in DCS.into_iter().chain(SMOOTHS).chain([VERT_PRED, HOR_PRED, PAETH_PRED]) {
                     let want = run::<BD>(&scalar.intra_pred[mode as usize], &edge, w, h, max);
                     let got = run::<BD>(&rust.intra_pred[mode as usize], &edge, w, h, max);
                     assert_eq!(got, want, "{w}x{h} mode {mode} round {round}");
+                }
+                if w > 32 || h > 32 {
+                    continue;
+                }
+                for filt in 0..5 {
+                    let (s, r) = (&scalar.intra_pred[FILTER_PRED as usize], &rust.intra_pred[FILTER_PRED as usize]);
+                    let want = run_angle::<BD>(s, &edge, w, h, filt, max);
+                    let got = run_angle::<BD>(r, &edge, w, h, filt, max);
+                    assert_eq!(got, want, "{w}x{h} filter {filt} round {round}");
                 }
             }
         }
