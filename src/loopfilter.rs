@@ -1494,17 +1494,19 @@ mod rust_simd {
         }
         let (sa, sb) = (4 * at.b4_stridea, 4 * at.b4_strideb);
         let zero = B::splat(0);
+        let filtered = seg_masks::<B>(vm);
         let l = levels8::<B>(at.lvl.data, at.lvl.offset, sa, n);
-        let l = B::select(
-            l.le(zero),
-            levels8(at.lvl.data, at.lvl.offset - sb, sa, n),
-            l,
-        );
+        // A level of 0 takes the one across the edge, read only if some segment needs it.
+        let l = if l.le(zero).and(filtered).any() {
+            B::select(l.le(zero), levels8(at.lvl.data, at.lvl.offset - sb, sa, n), l)
+        } else {
+            l
+        };
         let p = Params8 {
             e: l.lookup64(&lut.0.e),
             i: l.lookup64(&lut.0.i),
             h: l.shr_u::<4>(),
-            active: seg_masks::<B>(vm).andnot(l.le(zero)),
+            active: filtered.andnot(l.le(zero)),
             gt4: seg_masks(gt4),
             wd16: seg_masks(wd16),
         };
