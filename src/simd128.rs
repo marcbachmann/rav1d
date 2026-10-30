@@ -1729,7 +1729,13 @@ mod imp {
         /// The first set lane of a mask, 8 if none is.
         #[inline(always)]
         pub fn first_set(self) -> u32 {
-            (unsafe { _mm_movemask_epi8(self.0) } as u32 | 1 << 16).trailing_zeros() / 2
+            self.first_set_byte() / 2
+        }
+
+        /// The byte offset of the first set lane of a mask, 16 if none is.
+        #[inline(always)]
+        pub fn first_set_byte(self) -> u32 {
+            (unsafe { _mm_movemask_epi8(self.0) } as u32 | 1 << 16).trailing_zeros()
         }
 
         #[inline(always)]

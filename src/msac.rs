@@ -146,7 +146,11 @@ const EC_WIN_SIZE: usize = mem::size_of::<EcWin>() << 3;
 
 /// [`ctx_refill_bytes`] in one load while a whole window of bytes is left: the bytes the loop
 /// would take land at the same bits, and the rest of the load is masked off.
-#[inline]
+///
+/// On x86 out of line, as it runs once in dozens of symbols: inlined, it doubles each of the many
+/// inlined decoders, which then miss the decoded-instruction cache.
+#[cfg_attr(not(target_arch = "x86_64"), inline)]
+#[cfg_attr(target_arch = "x86_64", cold, inline(never))]
 fn ctx_refill(s: &mut MsacContext) {
     const W: usize = mem::size_of::<EcWin>();
     let c = EC_WIN_SIZE as c_int - 24 - s.cnt;
@@ -208,6 +212,7 @@ fn ctx_norm_by(s: &mut MsacContext, dif: EcWin, rng: c_uint, d: c_int) {
     }
 }
 
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
     let r = s.rng;
     let dif = s.dif;
@@ -221,6 +226,7 @@ fn rav1d_msac_decode_bool_equi_rust(s: &mut MsacContext) -> bool {
     bit
 }
 
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn rav1d_msac_decode_bool_rust(s: &mut MsacContext, f: c_uint) -> bool {
     let r = s.rng;
     let dif = s.dif;
@@ -396,6 +402,18 @@ static COUNT_LANE: [i16; 31] = {
     t
 };
 
+/// `rng`, then the bounds in `vs`, for the symbol's pair to be read from by index; `M` is what is
+/// stored, as a zeroed tail would be a 16-bit immediate store, which stalls x86's legacy decoder.
+#[inline(always)]
+fn rng_then_bounds<const M: usize>(rng: c_uint, vs: &[I16x8; 2]) -> [i16; M] {
+    let mut bounds = [0; M];
+    bounds[0] = rng as u16 as i16;
+    for k in 0..(M - 1) / 8 {
+        vs[k].store(&mut bounds[1 + 8 * k..]);
+    }
+    bounds
+}
+
 /// [`rav1d_msac_decode_symbol_adapt_rust`] over all of the CDF's `LANES` at once: the symbol is the
 /// first lane whose bound is not above the window. The count at `cdf[n_symbols]` makes that lane's
 /// bound 0, so lanes past it are never read; like the asm, the adaptation leaves them alone only
@@ -438,25 +456,47 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
         vs[k] = scaled.add(I16x8::load(&EC_MIN_PROBS[15 - n + 8 * k..]));
         at_or_past[k] = vs[k].sub_sat_u(c).eq(zero);
     }
-    #[cfg(target_arch = "aarch64")]
-    let first_lo = |m: I16x8| m.first_set_lo();
-    #[cfg(not(target_arch = "aarch64"))]
-    let first_lo = |m: I16x8| m.first_set();
+    // As the asm, the pair below is read at the mask's byte offset, so no step turns the offset
+    // into a lane and back on the way from the mask to the next symbol.
+    #[cfg(target_arch = "x86_64")]
+    let byte = if LANES <= 8 {
+        at_or_past[0].first_set_byte() as usize
+    } else {
+        0
+    };
     let val = match LANES {
-        4 => first_lo(at_or_past[0]),
-        8 => at_or_past[0].first_set(),
+        #[cfg(target_arch = "x86_64")]
+        ..=8 => byte as u32 / 2,
+        #[cfg(target_arch = "aarch64")]
+        4 => at_or_past[0].first_set_lo(),
+        #[cfg(not(target_arch = "x86_64"))]
+        ..=8 => at_or_past[0].first_set(),
         _ => at_or_past[0].first_set2(at_or_past[1]),
     } as usize;
     // At most `n_symbols`, as its lane always is at or past; the mask only drops the check.
-    let val = val & 15;
+    let val = val & (LANES - 1);
     // The symbol's bounds are `[val]` and `[val + 1]` of `rng`, then the bounds.
-    let bound_pair = || {
-        let mut bounds = [0; 18];
-        bounds[0] = s.rng as u16 as i16;
-        for k in 0..LANES.div_ceil(8) {
-            vs[k].store(&mut bounds[1 + 8 * k..]);
+    let bound_pair = |rng: c_uint, vs: [I16x8; 2]| {
+        if LANES <= 8 {
+            let bounds = rng_then_bounds::<9>(rng, &vs);
+            #[cfg(target_arch = "x86_64")]
+            {
+                debug_assert!(byte == 2 * val);
+                let at = bounds.as_ptr().cast::<u8>();
+                // SAFETY: `byte` is twice `val`, which is below `LANES`, so both reads lie in `bounds`.
+                unsafe {
+                    (
+                        at.add(byte).cast::<u16>().read_unaligned(),
+                        at.add(byte + 2).cast::<u16>().read_unaligned(),
+                    )
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            (bounds[val] as u16, bounds[val + 1] as u16)
+        } else {
+            let bounds = rng_then_bounds::<17>(rng, &vs);
+            (bounds[val] as u16, bounds[val + 1] as u16)
         }
-        (bounds[val] as u16, bounds[val + 1] as u16)
     };
     // As the NEON asm: the pair shifted out of the packed lanes, without a trip through memory.
     // From the 64-bit half holding lane `val`, as a variable 128-bit shift compiles to ~20
@@ -474,10 +514,10 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
         let shift = 16 * (val & 3);
         ((us >> shift) as u16, (vs >> shift) as u16)
     } else {
-        bound_pair()
+        bound_pair(s.rng, vs)
     };
     #[cfg(not(target_arch = "aarch64"))]
-    let (u, v) = bound_pair();
+    let (u, v) = bound_pair(s.rng, vs);
     let (u, v) = (u as c_uint, v as c_uint);
     ctx_norm(
         s,
@@ -519,6 +559,7 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
     val as u8
 }
 
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn rav1d_msac_decode_bool_adapt_rust(s: &mut MsacContext, cdf: &mut [u16; 2]) -> bool {
     let bit = rav1d_msac_decode_bool_rust(s, cdf[0] as c_uint);
     if s.allow_update_cdf() {
@@ -671,17 +712,20 @@ pub fn rav1d_msac_decode_symbol_adapt16(s: &mut MsacContext, cdf: &mut [u16], n_
     ret as u8 % 16
 }
 
-#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), inline)]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 pub fn rav1d_msac_decode_bool_adapt(s: &mut MsacContext, cdf: &mut [u16; 2]) -> bool {
     rav1d_msac_decode_bool_adapt_rust(s, cdf)
 }
 
-#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), inline)]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 pub fn rav1d_msac_decode_bool_equi(s: &mut MsacContext) -> bool {
     rav1d_msac_decode_bool_equi_rust(s)
 }
 
-#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), inline)]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 pub fn rav1d_msac_decode_bool(s: &mut MsacContext, f: c_uint) -> bool {
     rav1d_msac_decode_bool_rust(s, f)
 }

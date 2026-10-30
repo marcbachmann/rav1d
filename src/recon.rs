@@ -1248,7 +1248,7 @@ fn decode_coefs<BD: BitDepth>(
                 dq_sat = cmp::min(dq as c_int, cf_max + sign as i32);
                 cf.set(rc, if sign { -dq_sat } else { dq_sat });
 
-                rc = rc_tok as u16 & 0x3ff;
+                rc = (rc_tok & 0x3ff) as u16;
                 if !(rc != 0) {
                     break;
                 }
@@ -1293,7 +1293,7 @@ fn decode_coefs<BD: BitDepth>(
                 cul_level = cul_level.wrapping_add(tok);
                 cf.set(rc, if sign != 0 { -dq } else { dq });
 
-                rc = rc_tok as u16 & 0x3ff; // next non-zero `rc`, zero if `eob`
+                rc = (rc_tok & 0x3ff) as u16; // next non-zero `rc`, zero if `eob`
                 if !(rc != 0) {
                     break;
                 }
