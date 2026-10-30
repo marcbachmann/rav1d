@@ -842,15 +842,26 @@ mod rust_simd {
             base: I32x4::splat((256 * (bottom + right) + 256) as i32),
         };
         if W == 4 {
-            // Two rows a vector.
-            let dt = P::load8(&std::array::from_fn::<_, 8, _>(|i| top[i % 4])).sub(c.bottom);
-            let wh = weights(&std::array::from_fn::<_, 8, _>(|i| w_hor[i % 4]), k);
-            for y in (0..h).step_by(2) {
-                let wv = weights(&std::array::from_fn::<_, 8, _>(|i| w_ver[y + i / 4]), k);
-                let l = P::load8(&std::array::from_fn::<_, 8, _>(|i| left(y + i / 4)));
-                let p = blend::<P, MODE>(c, dt, wv, wh, l.sub(c.right));
+            // Two rows a vector, four a step: the weights and the left pixels spread from one
+            // load each, the left ones read upwards and so swapped back by halves.
+            let t = P::load4(top);
+            let dt = t.zip_lo64(t).sub(c.bottom);
+            let w = weights(&DAV1D_SM_WEIGHTS.0[4..], k);
+            let wh = w.zip_lo64(w);
+            for y in (0..h).step_by(4) {
+                let w = weights(&DAV1D_SM_WEIGHTS.0[h + y..], k);
+                let w = w.zip_lo16(w);
+                let l = P::load4(&topleft[off - 4 - y..]);
+                let l = l.zip_lo16(l);
+                let (l01, l23) = (l.zip_hi32(l), l.zip_lo32(l));
+                let l01 = l01.zip_hi64(l01).zip_lo64(l01);
+                let l23 = l23.zip_hi64(l23).zip_lo64(l23);
+                let p = blend::<P, MODE>(c, dt, w.zip_lo32(w), wh, l01.sub(c.right));
                 block.put(y, 0, &p[..4]);
                 block.put(y + 1, 0, &p[4..]);
+                let p = blend::<P, MODE>(c, dt, w.zip_hi32(w), wh, l23.sub(c.right));
+                block.put(y + 2, 0, &p[..4]);
+                block.put(y + 3, 0, &p[4..]);
             }
             return;
         }
