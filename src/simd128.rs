@@ -232,6 +232,9 @@ pub trait Bytes: Copy {
     fn any(self) -> bool;
     /// `t[lane]` for lanes below 64, 0 for the others.
     fn lookup64(self, t: &[u8; 64]) -> Self;
+    /// The loop filter's limits E and I of the levels in the lanes: from the tables `e` and
+    /// `i`, or from the sharpness.
+    fn limits(self, e: &[u8; 64], i: &[u8; 64], sharp: [u64; 2]) -> (Self, Self);
     fn widen(self) -> [Self::Wide; 2];
     /// [`Bytes::widen`] back, each lane rounded `>> S` and saturated.
     fn narrow_rshr<const S: i32>(lo: Self::Wide, hi: Self::Wide) -> Self;
@@ -328,6 +331,10 @@ macro_rules! forward_bytes {
             #[inline(always)]
             fn lookup64(self, t: &[u8; 64]) -> Self {
                 <$t>::lookup64(self, t)
+            }
+            #[inline(always)]
+            fn limits(self, e: &[u8; 64], i: &[u8; 64], sharp: [u64; 2]) -> (Self, Self) {
+                <$t>::limits(self, e, i, sharp)
             }
             #[inline(always)]
             fn widen(self) -> [$wide; 2] {
@@ -781,7 +788,9 @@ pub use wide::{I16x16, I32x8, U8x32};
 mod wide {
     use std::arch::x86_64::*;
 
-    use super::{rows_fit, transpose16x4, transpose16x8, transpose4x16, transpose8x16, I16x8};
+    use super::{
+        rows_fit, transpose16x4, transpose16x8, transpose4x16, transpose8x16, I16x8, U8x16,
+    };
 
     #[derive(Clone, Copy)]
     pub struct I16x16(__m256i);
@@ -812,6 +821,18 @@ mod wide {
         #[inline(always)]
         pub fn hi(self) -> I16x8 {
             I16x8(unsafe { _mm256_extracti128_si256::<1>(self.0) })
+        }
+
+        /// The lanes of `b` zero-extended.
+        #[inline(always)]
+        pub fn widen_u8(b: U8x16) -> Self {
+            Self(unsafe { _mm256_cvtepu8_epi16(b.0) })
+        }
+
+        /// The lanes of `b` sign-extended.
+        #[inline(always)]
+        pub fn widen_i8(b: U8x16) -> Self {
+            Self(unsafe { _mm256_cvtepi8_epi16(b.0) })
         }
 
         /// Bytes `b[..16]` zero-extended.
@@ -1288,6 +1309,25 @@ mod wide {
             }
         }
 
+        /// The loop filter's limits E and I of the levels in the lanes, as the asm computes
+        /// them: `I = clamp(l >> sharp[0], 1, sharp[1])`, `E = 2 * (l + 2) + I`.
+        #[inline(always)]
+        pub fn limits(self, _e: &[u8; 64], _i: &[u8; 64], sharp: [u64; 2]) -> (Self, Self) {
+            unsafe {
+                let s = _mm_cvtsi32_si128(sharp[0] as i32);
+                let l = _mm256_and_si256(
+                    _mm256_srl_epi16(self.0, s),
+                    _mm256_set1_epi8((0xff >> sharp[0]) as u8 as i8),
+                );
+                let i = _mm256_max_epu8(
+                    _mm256_min_epu8(l, _mm256_set1_epi8(sharp[1] as u8 as i8)),
+                    _mm256_set1_epi8(1),
+                );
+                let e = _mm256_add_epi8(self.0, _mm256_set1_epi8(2));
+                (Self(_mm256_add_epi8(_mm256_add_epi8(e, e), i)), Self(i))
+            }
+        }
+
         /// The low and high eight bytes of each half, zero-extended: lane order within the
         /// halves, which [`Self::narrow_rshr`] restores.
         #[inline(always)]
@@ -1687,6 +1727,16 @@ mod imp {
         #[inline(always)]
         pub fn load(s: &[i16]) -> Self {
             Self(unsafe { _mm_loadu_si128(s[..8].as_ptr().cast()) })
+        }
+
+        /// [`Self::load_halves`] back.
+        #[inline(always)]
+        pub fn store_halves(self, lo: &mut [i16], hi: &mut [i16]) {
+            let (lo, hi) = (&mut lo[..4], &mut hi[..4]);
+            unsafe {
+                _mm_storel_epi64(lo.as_mut_ptr().cast(), self.0);
+                _mm_storeh_pd(hi.as_mut_ptr().cast(), _mm_castsi128_pd(self.0));
+            }
         }
 
         /// Lanes `lo[..4]` then `hi[..4]`: two rows of a 4-wide block.
@@ -2177,6 +2227,25 @@ mod imp {
             }
         }
 
+        /// The loop filter's limits E and I of the levels in the lanes, as the asm computes
+        /// them: `I = clamp(l >> sharp[0], 1, sharp[1])`, `E = 2 * (l + 2) + I`.
+        #[inline(always)]
+        pub fn limits(self, _e: &[u8; 64], _i: &[u8; 64], sharp: [u64; 2]) -> (Self, Self) {
+            unsafe {
+                let s = _mm_cvtsi32_si128(sharp[0] as i32);
+                let l = _mm_and_si128(
+                    _mm_srl_epi16(self.0, s),
+                    _mm_set1_epi8((0xff >> sharp[0]) as u8 as i8),
+                );
+                let i = _mm_max_epu8(
+                    _mm_min_epu8(l, _mm_set1_epi8(sharp[1] as u8 as i8)),
+                    _mm_set1_epi8(1),
+                );
+                let e = _mm_add_epi8(self.0, _mm_set1_epi8(2));
+                (Self(_mm_add_epi8(_mm_add_epi8(e, e), i)), Self(i))
+            }
+        }
+
         #[inline(always)]
         pub fn splat(v: u8) -> Self {
             Self(unsafe { _mm_set1_epi8(v as i8) })
@@ -2513,6 +2582,16 @@ mod imp {
         #[inline(always)]
         pub fn load(s: &[i16]) -> Self {
             Self(unsafe { vld1q_s16(s[..8].as_ptr()) })
+        }
+
+        /// [`Self::load_halves`] back.
+        #[inline(always)]
+        pub fn store_halves(self, lo: &mut [i16], hi: &mut [i16]) {
+            let (lo, hi) = (&mut lo[..4], &mut hi[..4]);
+            unsafe {
+                vst1_s16(lo.as_mut_ptr(), vget_low_s16(self.0));
+                vst1_s16(hi.as_mut_ptr(), vget_high_s16(self.0));
+            }
         }
 
         /// Lanes `lo[..4]` then `hi[..4]`: two rows of a 4-wide block.
@@ -3132,6 +3211,12 @@ mod imp {
             Self(unsafe { vqtbl4q_u8(vld1q_u8_x4(t.as_ptr()), self.0) })
         }
 
+        /// The loop filter's limits E and I of the levels in the lanes, from their tables.
+        #[inline(always)]
+        pub fn limits(self, e: &[u8; 64], i: &[u8; 64], _sharp: [u64; 2]) -> (Self, Self) {
+            (self.lookup64(e), self.lookup64(i))
+        }
+
         #[inline(always)]
         pub fn splat(v: u8) -> Self {
             Self(unsafe { vdupq_n_u8(v) })
@@ -3487,6 +3572,14 @@ mod imp {
         pub fn load(s: &[i16]) -> Self {
             let s = &s[..8];
             Self(i16x8(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+        }
+
+        /// [`Self::load_halves`] back.
+        #[inline(always)]
+        pub fn store_halves(self, lo: &mut [i16], hi: &mut [i16]) {
+            let a = self.to_array();
+            lo[..4].copy_from_slice(&a[..4]);
+            hi[..4].copy_from_slice(&a[4..]);
         }
 
         /// Lanes `lo[..4]` then `hi[..4]`: two rows of a 4-wide block.
@@ -3928,6 +4021,12 @@ mod imp {
             Self(r)
         }
 
+        /// The loop filter's limits E and I of the levels in the lanes, from their tables.
+        #[inline(always)]
+        pub fn limits(self, e: &[u8; 64], i: &[u8; 64], _sharp: [u64; 2]) -> (Self, Self) {
+            (self.lookup64(e), self.lookup64(i))
+        }
+
         #[inline(always)]
         pub fn splat(v: u8) -> Self {
             Self(u8x16_splat(v))
@@ -4275,6 +4374,13 @@ mod imp {
         #[inline(always)]
         pub fn load(s: &[i16]) -> Self {
             Self(s[..8].try_into().unwrap())
+        }
+
+        /// [`Self::load_halves`] back.
+        #[inline(always)]
+        pub fn store_halves(self, lo: &mut [i16], hi: &mut [i16]) {
+            lo[..4].copy_from_slice(&self.0[..4]);
+            hi[..4].copy_from_slice(&self.0[4..]);
         }
 
         /// Lanes `lo[..4]` then `hi[..4]`: two rows of a 4-wide block.
@@ -4674,6 +4780,12 @@ mod imp {
         #[inline(always)]
         pub fn lookup64(self, t: &[u8; 64]) -> Self {
             Self(self.0.map(|v| t.get(v as usize).copied().unwrap_or(0)))
+        }
+
+        /// The loop filter's limits E and I of the levels in the lanes, from their tables.
+        #[inline(always)]
+        pub fn limits(self, e: &[u8; 64], i: &[u8; 64], _sharp: [u64; 2]) -> (Self, Self) {
+            (self.lookup64(e), self.lookup64(i))
         }
 
         #[inline(always)]

@@ -294,6 +294,8 @@ mod rust_simd {
         fn load_px(b: &[u8]) -> Self;
         /// The low `N` lanes of `b` zero-extended.
         fn from_bytes(b: U8x16) -> Self;
+        /// [`Px::from_bytes`] of a mask: all ones where `b` is.
+        fn from_mask(b: U8x16) -> Self;
         /// The lanes saturated into `d[..N]`.
         fn store_px(self, d: &mut [u8]);
         /// Eight bytes of `a`, and on sixteen lanes eight of `b` in the high half: a row window
@@ -306,9 +308,13 @@ mod rust_simd {
         /// [`Px::load_rows`] for sixteen-bit pixels.
         fn load_rows16(a: &[i16], b: &[i16]) -> Self;
         fn store_rows16(self, a: &mut [i16], b: &mut [i16]);
+        /// The lanes shifted right by `n`, zeros in.
+        fn shr_var(self, n: u32) -> Self;
         /// `N` rows of eight pixels from `b[start + r * stride..]` as eight columns of `N`.
         fn load_cols8(b: &[i16], start: usize, stride: isize) -> [Self; 8];
         fn store_cols8(c: &[Self; 8], b: &mut [i16], start: usize, stride: isize);
+        /// [`Px::load_cols8`] of four pixels per row.
+        fn load_cols4(b: &[i16], start: usize, stride: isize) -> [Self; 4];
         /// [`Px::store_cols8`] of four columns.
         fn store_cols4(c: &[Self; 4], b: &mut [i16], start: usize, stride: isize);
     }
@@ -339,9 +345,26 @@ mod rust_simd {
     /// Rows `r` and `r + 1` from the halves of `v`.
     #[inline(always)]
     fn store_pair(v: I16x8, b: &mut [i16], start: usize, stride: isize, r: usize) {
-        let a = v.to_array();
-        row16_mut(b, start, stride, r, 4).copy_from_slice(&a[..4]);
-        row16_mut(b, start, stride, r + 1, 4).copy_from_slice(&a[4..]);
+        let (lo, hi) = (r as isize * stride, (r + 1) as isize * stride);
+        // SAFETY: The caller checked the rows with `rows_fit`.
+        let (lo, hi) = unsafe {
+            let p = b.as_mut_ptr().add(start);
+            (
+                std::slice::from_raw_parts_mut(p.offset(lo), 4),
+                std::slice::from_raw_parts_mut(p.offset(hi), 4),
+            )
+        };
+        v.store_halves(lo, hi);
+    }
+
+    /// The four columns of rows `k`, `k + 4`, .. in the 64-bit halves of `c[k]`.
+    #[inline(always)]
+    fn cols4<V: Lanes>(c: [V; 4]) -> [V; 4] {
+        let (a0, a1) = (c[0].zip_lo16(c[1]), c[0].zip_hi16(c[1]));
+        let (b0, b1) = (c[2].zip_lo16(c[3]), c[2].zip_hi16(c[3]));
+        let (o0, o1) = (a0.zip_lo32(b0), a0.zip_hi32(b0));
+        let (o2, o3) = (a1.zip_lo32(b1), a1.zip_hi32(b1));
+        [o0.zip_lo64(o2), o0.zip_hi64(o2), o1.zip_lo64(o3), o1.zip_hi64(o3)]
     }
 
     impl Px for I16x8 {
@@ -353,6 +376,10 @@ mod rust_simd {
         #[inline(always)]
         fn from_bytes(b: U8x16) -> Self {
             b.widen()[0]
+        }
+        #[inline(always)]
+        fn from_mask(b: U8x16) -> Self {
+            b.widen()[0].eq(Self::splat(0xff))
         }
         #[inline(always)]
         fn store_px(self, d: &mut [u8]) {
@@ -383,6 +410,10 @@ mod rust_simd {
             self.store(a)
         }
         #[inline(always)]
+        fn shr_var(self, n: u32) -> Self {
+            self.shr_u(n)
+        }
+        #[inline(always)]
         fn load_cols8(b: &[i16], start: usize, stride: isize) -> [Self; 8] {
             rows_fit(b.len(), start, stride, 8, 8);
             let mut v = [I16x8::splat(0); 8];
@@ -402,6 +433,16 @@ mod rust_simd {
             }
         }
         #[inline(always)]
+        fn load_cols4(b: &[i16], start: usize, stride: isize) -> [Self; 4] {
+            rows_fit(b.len(), start, stride, 8, 4);
+            let row = |r| row16(b, start, stride, r, 4);
+            let mut c = [I16x8::splat(0); 4];
+            for (k, c) in c.iter_mut().enumerate() {
+                *c = I16x8::load_halves(row(k), row(k + 4));
+            }
+            cols4(c)
+        }
+        #[inline(always)]
         fn store_cols4(c: &[Self; 4], b: &mut [i16], start: usize, stride: isize) {
             rows_fit(b.len(), start, stride, 8, 4);
             for (i, v) in transpose4(c).into_iter().enumerate() {
@@ -419,8 +460,11 @@ mod rust_simd {
         }
         #[inline(always)]
         fn from_bytes(b: U8x16) -> Self {
-            let [lo, hi] = b.widen();
-            I16x16::from_halves(lo, hi)
+            I16x16::widen_u8(b)
+        }
+        #[inline(always)]
+        fn from_mask(b: U8x16) -> Self {
+            I16x16::widen_i8(b)
         }
         #[inline(always)]
         fn store_px(self, d: &mut [u8]) {
@@ -453,6 +497,10 @@ mod rust_simd {
             self.lo().store(a);
             self.hi().store(b);
         }
+        #[inline(always)]
+        fn shr_var(self, n: u32) -> Self {
+            self.shr_u(n)
+        }
         /// Rows `r` and `r + 8` in the halves of a vector, then [`transpose8x8`] on both.
         #[inline(always)]
         fn load_cols8(b: &[i16], start: usize, stride: isize) -> [Self; 8] {
@@ -476,6 +524,19 @@ mod rust_simd {
                 v.lo().store(row16_mut(b, start, stride, r, 8));
                 v.hi().store(row16_mut(b, start, stride, r + 8, 8));
             }
+        }
+        #[inline(always)]
+        fn load_cols4(b: &[i16], start: usize, stride: isize) -> [Self; 4] {
+            rows_fit(b.len(), start, stride, 16, 4);
+            let row = |r| row16(b, start, stride, r, 4);
+            let mut c = [I16x16::splat(0); 4];
+            for (k, c) in c.iter_mut().enumerate() {
+                *c = I16x16::from_halves(
+                    I16x8::load_halves(row(k), row(k + 4)),
+                    I16x8::load_halves(row(k + 8), row(k + 12)),
+                );
+            }
+            cols4(c)
         }
         #[inline(always)]
         fn store_cols4(c: &[Self; 4], b: &mut [i16], start: usize, stride: isize) {
@@ -964,12 +1025,21 @@ mod rust_simd {
         stride: isize,
         p: Params<V>,
     ) {
+        let mut px = [V::splat(0); 14];
+        if MAX == 4 {
+            // As the asm, only the four columns the filter reads, from `start`.
+            px[5..9].copy_from_slice(&V::load_cols4(b, start, stride));
+            if filter::<V, MAX>(&mut px, p) != 0 {
+                clip_narrow(&mut px, p.max);
+                V::store_cols4(&[px[5], px[6], px[7], px[8]], b, start, stride);
+            }
+            return;
+        }
         let (n, x0) = if MAX == 16 { (2, -8) } else { (1, -4) };
         let mut win = [[V::splat(0); 8]; 2];
         for (w, win) in win.iter_mut().enumerate().take(n) {
             *win = V::load_cols8(b, start + 8 * w, stride);
         }
-        let mut px = [V::splat(0); 14];
         for k in -7..7isize {
             let c = (k - x0) as usize;
             if c < 8 * n {
@@ -1255,7 +1325,8 @@ mod rust_simd {
     }
 
     /// [`Bytes::spread4`] of the first `n` levels from `lvl[start]`, `stride` apart, the others 0.
-    /// One byte at a time: the bytes between belong to blocks other threads may be writing.
+    /// Across rows one byte at a time: the bytes between belong to blocks other threads may be
+    /// writing.
     #[inline(always)]
     fn levels8<B: Bytes>(
         lvl: &DisjointMut<AlignedVec2<u8>>,
@@ -1264,8 +1335,17 @@ mod rust_simd {
         n: usize,
     ) -> B {
         let mut l = [0; 8];
-        for (j, l) in l.iter_mut().enumerate().take(n) {
-            *l = *lvl.index(start + j * stride);
+        if stride == 4 {
+            // Along a horizontal edge the levels are one row's entries, whose other bytes are
+            // written together with them: one borrow.
+            let row = &*lvl.index(start..start + 4 * n - 3);
+            for (j, l) in l.iter_mut().enumerate().take(n) {
+                *l = row[4 * j];
+            }
+        } else {
+            for (j, l) in l.iter_mut().enumerate().take(n) {
+                *l = *lvl.index(start + j * stride);
+            }
         }
         B::spread4(u64::from_le_bytes(l))
     }
@@ -1361,31 +1441,37 @@ mod rust_simd {
         }
     }
 
-    /// The thresholds of [`thresholds8`] widened to sixteen-bit lanes and scaled to the bit
-    /// depth (10 bits at most).
+    /// The thresholds as the asm computes them at 16 bpc, in sixteen-bit lanes from the levels
+    /// and the sharpness, scaled to the bit depth (10 bits at most).
     #[inline(always)]
     fn group16<BD: BitDepth, V: Px>(at: At, lut: &Align16<Av1FilterLUT>, bd: BD) {
-        let Some((t, max)) = thresholds8::<U8x16>(&at, V::N / 4, lut) else {
+        let Some(([l, active, gt4, wd16], max)) = levels_masks::<U8x16>(&at, V::N / 4) else {
             return;
         };
         let s = bd.bitdepth() - 8;
         debug_assert!(s == 0 || s == 2);
-        let scaled = |b: U8x16| {
-            let v = V::from_bytes(b);
+        let scaled = |v: V| {
             if s == 0 {
                 return v;
             }
             let v = v.add(v);
             v.add(v)
         };
-        let mask = |b: U8x16| V::from_bytes(b).eq(V::splat(0xff));
+        let l = V::from_bytes(l);
+        let [sharp0, sharp1] = lut.0.sharp;
+        let i = l
+            .shr_var(sharp0 as u32)
+            .min(V::splat(sharp1 as i16))
+            .max(V::splat(1));
+        let e = l.add(V::splat(2));
+        let e = e.add(e).add(i);
         let p = Params {
-            e: scaled(t.e),
-            i: scaled(t.i),
-            h: scaled(t.h),
-            active: mask(t.active),
-            gt4: mask(t.gt4),
-            wd16: mask(t.wd16),
+            e: scaled(e),
+            i: scaled(i),
+            h: scaled(l.shr_s::<4>()),
+            active: V::from_mask(active),
+            gt4: V::from_mask(gt4),
+            wd16: V::from_mask(wd16),
             flat: V::splat(1 << s),
             lo: V::splat(-128 << s),
             hi: V::splat((128 << s) - 1),
@@ -1395,9 +1481,11 @@ mod rust_simd {
         if BD::BITDEPTH != 8 {
             let h = matches!(at.hv, super::HV::H);
             let stride = dst.pixel_stride::<BD>();
-            // As `block`, but along a vertical edge 8 (16) pixels from 4 (8) left of it.
+            // As `block`, but along a vertical edge 8 (16) pixels from 4 (8) left of it, or the
+            // four the narrow filter reads.
             let (before, rows, w) = match (h, max) {
                 (false, _) => (reach(max), 2 * reach(max), V::N),
+                (true, 4) => (2, V::N, 4),
                 (true, 16) => (8, V::N, 16),
                 _ => (4, V::N, 8),
             };
@@ -1480,14 +1568,11 @@ mod rust_simd {
     #[cfg(target_arch = "x86_64")]
     groups_bytes!(U8x32);
 
-    /// The thresholds of the first `n` segments as the asm takes them, in byte lanes, and the
-    /// group's longest filter; none if no segment is filtered.
+    /// The levels of the first `n` segments in byte lanes, a level of 0 replaced by the one
+    /// across the edge, with [`Params8`]'s masks and the group's longest filter; none if no
+    /// segment is filtered.
     #[inline(always)]
-    fn thresholds8<B: Bytes>(
-        at: &At,
-        n: usize,
-        lut: &Align16<Av1FilterLUT>,
-    ) -> Option<(Params8<B>, usize)> {
+    fn levels_masks<B: Bytes>(at: &At, n: usize) -> Option<([B; 4], usize)> {
         let [vm, gt4, wd16] = at.masks().map(|m| m & ((1 << n) - 1));
         if vm == 0 {
             return None;
@@ -1502,19 +1587,33 @@ mod rust_simd {
         } else {
             l
         };
-        let p = Params8 {
-            e: l.lookup64(&lut.0.e),
-            i: l.lookup64(&lut.0.i),
-            h: l.shr_u::<4>(),
-            active: filtered.andnot(l.le(zero)),
-            gt4: seg_masks(gt4),
-            wd16: seg_masks(wd16),
-        };
         let max = match (wd16 != 0, gt4 != 0, at.yuv) {
             (true, _, _) => 16,
             (_, true, super::YUV::Y) => 8,
             (_, true, super::YUV::UV) => 6,
             _ => 4,
+        };
+        let active = filtered.andnot(l.le(zero));
+        Some(([l, active, seg_masks(gt4), seg_masks(wd16)], max))
+    }
+
+    /// The thresholds of the first `n` segments as the asm takes them, in byte lanes, and the
+    /// group's longest filter; none if no segment is filtered.
+    #[inline(always)]
+    fn thresholds8<B: Bytes>(
+        at: &At,
+        n: usize,
+        lut: &Align16<Av1FilterLUT>,
+    ) -> Option<(Params8<B>, usize)> {
+        let ([l, active, gt4, wd16], max) = levels_masks::<B>(at, n)?;
+        let (e, i) = l.limits(&lut.0.e, &lut.0.i, lut.0.sharp);
+        let p = Params8 {
+            e,
+            i,
+            h: l.shr_u::<4>(),
+            active,
+            gt4,
+            wd16,
         };
         Some((p, max))
     }
@@ -1953,6 +2052,102 @@ mod tests {
     fn simd_matches_scalar_16bpc() {
         matches_scalar::<BitDepth16>(1023, 3000);
         matches_scalar::<BitDepth16>(4095, 300);
+    }
+
+    /// ns per call of a whole edge (32 segments) of each direction, plane and longest filter,
+    /// on fresh planes, at 8 and 10 bits.
+    #[test]
+    #[ignore]
+    fn time_lf() {
+        time_lf_at::<BitDepth8>(255);
+        time_lf_at::<BitDepth16>(1023);
+    }
+
+    fn time_lf_at<BD: BitDepth>(bitdepth_max: c_int) {
+        use std::time::Instant;
+
+        const N: usize = 32;
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut lut = Align16(Av1FilterLUT::default());
+        rav1d_calc_eih(&mut lut.0, 0);
+        let mut lvl = AlignedVec2::<u8>::new();
+        lvl.resize(4 * B4_STRIDE * 48, 0);
+        for l in lvl.as_mut_slice() {
+            *l = 8 + (rng.next() % 40) as u8;
+        }
+        let lvl = DisjointMut::new(lvl);
+        let origs: Vec<_> = (0..N).map(|_| plane::<BD>(&mut rng, bitdepth_max)).collect();
+        let mut bufs: Vec<_> = (0..N)
+            .map(|_| {
+                let mut b = AlignedVec64::<BD::Pixel>::new();
+                b.resize(STRIDE * ROWS, 0.into());
+                b
+            })
+            .collect();
+        let dsps = contexts::<BD>();
+        for (hv, name) in [(HV::H, "h"), (HV::V, "v")] {
+            for (yuv, wds) in [(YUV::Y, &[4, 8, 16][..]), (YUV::UV, &[4, 6][..])] {
+                for &wd in wds {
+                    let on = |b: bool| if b { u32::MAX } else { 0 };
+                    let mask = [u32::MAX, on(wd > 4), on(wd == 16)];
+                    let mut line = format!("{bitdepth_max} {name} {} wd {wd:2}:", yuv as usize);
+                    // `TIME_LF` picks the lines holding it, timed `TIME_LF_N` (20) times.
+                    if !std::env::var("TIME_LF").map_or(true, |f| line.contains(&f)) {
+                        continue;
+                    }
+                    for (dsp_name, dsp) in &dsps {
+                        let c = match yuv {
+                            YUV::Y => &dsp.loop_filter_sb.y,
+                            YUV::UV => &dsp.loop_filter_sb.uv,
+                        };
+                        let f = match hv {
+                            HV::H => c.h,
+                            HV::V => c.v,
+                        };
+                        let mut best = f64::MAX;
+                        let n: usize = std::env::var("TIME_LF_N").map_or(20, |n| n.parse().unwrap());
+                        for _ in 0..n {
+                            for (b, o) in bufs.iter_mut().zip(&origs) {
+                                b.as_mut_slice().copy_from_slice(o);
+                            }
+                            let start = Instant::now();
+                            for b in &mut bufs {
+                                let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(
+                                    b.as_mut_slice(),
+                                    STRIDE,
+                                );
+                                let offset = match hv {
+                                    HV::H => 8 * STRIDE + 32,
+                                    HV::V => 32 * STRIDE,
+                                };
+                                let dst = WithOffset { data: &comp, offset };
+                                let l = WithOffset { data: &lvl, offset: 8 * B4_STRIDE };
+                                let dst_ptr = dst.as_mut_ptr::<BD>().cast();
+                                let lvl_ptr = l.data.as_mut_ptr().wrapping_add(l.offset).cast();
+                                // SAFETY: The arguments are what `loopfilter_sb::Fn::call` passes.
+                                unsafe {
+                                    f.get()(
+                                        dst_ptr,
+                                        dst.stride(),
+                                        &mask,
+                                        lvl_ptr,
+                                        B4_STRIDE as isize,
+                                        &lut,
+                                        32,
+                                        bitdepth_max,
+                                        dst.into_ffi_safe(),
+                                        l.into_ffi_safe(),
+                                    )
+                                };
+                            }
+                            best = best.min(start.elapsed().as_nanos() as f64 / N as f64);
+                        }
+                        line += &format!("  {dsp_name} {best:7.1} ns");
+                    }
+                    println!("{line}");
+                }
+            }
+        }
     }
 
     fn matches_scalar<BD: BitDepth>(bitdepth_max: c_int, rounds: usize) {
