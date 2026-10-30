@@ -388,6 +388,14 @@ static EC_MIN_PROBS: [i16; 31] = {
     t
 };
 
+/// -1 at lane `n_symbols` from `[15 - n_symbols..]`, 0 elsewhere.
+#[cfg(target_arch = "x86_64")]
+static COUNT_LANE: [i16; 31] = {
+    let mut t = [0; 31];
+    t[15] = -1;
+    t
+};
+
 /// [`rav1d_msac_decode_symbol_adapt_rust`] over all of the CDF's `LANES` at once: the symbol is the
 /// first lane whose bound is not above the window. The count at `cdf[n_symbols]` makes that lane's
 /// bound 0, so lanes past it are never read; like the asm, the adaptation leaves them alone only
@@ -486,14 +494,27 @@ fn rav1d_msac_decode_symbol_adapt_simd<const LANES: usize>(
             // would wrap, and no CDF holds one.
             let step = ones.avg_u(at_or_past[k]).sub(cdfs[k]).shr_s_by(rate);
             let updated = cdfs[k].sub(at_or_past[k]).add(step);
+            // The count's lane takes a step of `-(count >> rate)`, 0 for every count up to 32, and
+            // counts up below 32 here, so the CDF is written by one store, which the next load of
+            // it forwards from; a load spanning the vector store and a count store after it waits
+            // for both to retire.
+            #[cfg(target_arch = "x86_64")]
+            let updated = updated.sub(
+                I16x8::splat(32)
+                    .gt(cdfs[k])
+                    .and(I16x8::load(&COUNT_LANE[15 - n + 8 * k..])),
+            );
             if LANES == 4 {
                 updated.store_u16_lo(cdf);
             } else {
                 updated.store_u16(&mut cdf[8 * k..]);
             }
         }
-        // The count's lane took a step with the others; as in the asm, it is written over.
-        cdf[n] = count + (count < 32) as u16;
+        // As in the asm, the count is written over its lane.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            cdf[n] = count + (count < 32) as u16;
+        }
     }
     val as u8
 }
