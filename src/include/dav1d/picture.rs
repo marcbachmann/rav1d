@@ -281,7 +281,7 @@ impl Rav1dPictureDataComponent {
         self.as_strided_mut_ptr::<BD>().cast_const()
     }
 
-    fn as_dav1d(&self) -> Option<NonNull<c_void>> {
+    pub(crate) fn as_dav1d(&self) -> Option<NonNull<c_void>> {
         if self.byte_len() == 0 {
             None
         } else {
