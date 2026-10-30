@@ -211,7 +211,7 @@ fn round<V: Lanes, const N: usize>(v: &mut [V; N], k: i32, negated: u32) {
     if k == 32768 {
         let zero = V::splat(0);
         for i in 0..N {
-            if negated >> i & 1 != 0 {
+            if (negated as u64) >> i & 1 != 0 {
                 v[i] = zero.sub_sat(v[i]);
             }
         }
@@ -219,7 +219,7 @@ fn round<V: Lanes, const N: usize>(v: &mut [V; N], k: i32, negated: u32) {
     }
     let (pos, neg) = (V::splat(k as i16), V::splat(-k as i16));
     for i in 0..N {
-        v[i] = v[i].mulhrs(if negated >> i & 1 != 0 { neg } else { pos });
+        v[i] = v[i].mulhrs(if (negated as u64) >> i & 1 != 0 { neg } else { pos });
     }
 }
 

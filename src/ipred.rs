@@ -3719,7 +3719,7 @@ mod tests {
                 *a = match round {
                     0 => lim,
                     1 => -lim,
-                    _ => (rng.next() % (2 * lim as u32 + 1)) as i16 - lim,
+                    _ => ((rng.next() % (2 * lim as u32 + 1)) as i32 - lim as i32) as i16,
                 };
             }
             for (w, h) in SIZES.into_iter().filter(|&(w, h)| w <= 32 && h <= 32) {

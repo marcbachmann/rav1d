@@ -82,7 +82,7 @@ pub trait Lanes: Copy {
     fn select(m: Self, a: Self, b: Self) -> Self;
     fn and(self, o: Self) -> Self;
     fn eq(self, o: Self) -> Self;
-    /// Whether any lane is set.
+    /// Whether any lane is nonzero.
     fn any(self) -> bool;
     /// `(a * k1[0] + b * k1[1] + 2048) >> 12` and the same with `k2`, in 32 bits, each
     /// saturated to `i16`.
@@ -670,7 +670,7 @@ mod wide {
 
         #[inline(always)]
         pub fn any(self) -> bool {
-            unsafe { _mm256_movemask_epi8(self.0) != 0 }
+            unsafe { _mm256_testz_si256(self.0, self.0) == 0 }
         }
 
         #[inline(always)]
@@ -1115,10 +1115,10 @@ mod imp {
             Self(unsafe { _mm_or_si128(self.0, o.0) })
         }
 
-        /// Whether any lane is set.
+        /// Whether any lane is nonzero.
         #[inline(always)]
         pub fn any(self) -> bool {
-            unsafe { _mm_movemask_epi8(self.0) != 0 }
+            unsafe { _mm_testz_si128(self.0, self.0) == 0 }
         }
 
         /// The sum of the lanes as `u16`.
@@ -1406,7 +1406,7 @@ mod imp {
 
         #[inline(always)]
         pub fn any(self) -> bool {
-            unsafe { _mm_movemask_epi8(self.0) != 0 }
+            unsafe { _mm_testz_si128(self.0, self.0) == 0 }
         }
 
         #[inline(always)]
@@ -1870,7 +1870,7 @@ mod imp {
             Self(unsafe { vorrq_s16(self.0, o.0) })
         }
 
-        /// Whether any lane is set.
+        /// Whether any lane is nonzero.
         #[inline(always)]
         pub fn any(self) -> bool {
             unsafe { vmaxvq_u16(u(self.0)) != 0 }
@@ -2717,7 +2717,7 @@ mod imp {
             Self(v128_or(self.0, o.0))
         }
 
-        /// Whether any lane is set.
+        /// Whether any lane is nonzero.
         #[inline(always)]
         pub fn any(self) -> bool {
             v128_any_true(self.0)
@@ -3439,7 +3439,7 @@ mod imp {
             Self(std::array::from_fn(|i| self.0[i] | o.0[i]))
         }
 
-        /// Whether any lane is set.
+        /// Whether any lane is nonzero.
         #[inline(always)]
         pub fn any(self) -> bool {
             self.0.iter().any(|&m| m != 0)
