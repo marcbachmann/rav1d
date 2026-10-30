@@ -434,95 +434,154 @@ mod rust_simd {
         v.add(V::splat(1 << (N - 1))).shr_s::<N>()
     }
 
-    /// Generated from `loop_filter`'s flat16 branch: one running sum, a term in and out per output;
-    /// `out` holds the sums before [`rshr`]`::<4>`.
+    /// The sums the flat filters keep: lanes, or a pair of 16-bit halves of byte lanes.
+    trait Sum: Copy {
+        fn plus(self, o: Self) -> Self;
+        fn minus(self, o: Self) -> Self;
+    }
+
+    impl<V: Lanes> Sum for V {
+        #[inline(always)]
+        fn plus(self, o: Self) -> Self {
+            self.add(o)
+        }
+        #[inline(always)]
+        fn minus(self, o: Self) -> Self {
+            self.sub(o)
+        }
+    }
+
+    /// [`U8x16::widen`]ed lanes.
+    #[derive(Clone, Copy)]
+    struct Wide([I16x8; 2]);
+
+    impl Sum for Wide {
+        #[inline(always)]
+        fn plus(self, o: Self) -> Self {
+            Self([self.0[0].add(o.0[0]), self.0[1].add(o.0[1])])
+        }
+        #[inline(always)]
+        fn minus(self, o: Self) -> Self {
+            Self([self.0[0].sub(o.0[0]), self.0[1].sub(o.0[1])])
+        }
+    }
+
+    /// Where a flat filter's output `k` goes, as soon as it is summed: one at a time keeps few
+    /// sums live.
+    trait Sink<S> {
+        fn put(&mut self, k: usize, s: S);
+    }
+
+    /// `px[k]` rounded from the sum where `m` is set, `>> N`.
+    struct Select<'a, V, const N: i32> {
+        px: &'a mut [V; 14],
+        m: V,
+    }
+
+    impl<V: Lanes, const N: i32> Sink<V> for Select<'_, V, N> {
+        #[inline(always)]
+        fn put(&mut self, k: usize, s: V) {
+            self.px[k] = V::select(self.m, rshr::<V, N>(s), self.px[k]);
+        }
+    }
+
+    impl<const N: i32> Sink<Wide> for Select<'_, U8x16, N> {
+        #[inline(always)]
+        fn put(&mut self, k: usize, s: Wide) {
+            let v = U8x16::narrow_rshr::<N>(s.0[0], s.0[1]);
+            self.px[k] = U8x16::select(self.m, v, self.px[k]);
+        }
+    }
+
+    /// Generated from `loop_filter`'s flat16 branch: one running sum, a term in and out per output,
+    /// each sum handed to `out` before [`rshr`]`::<4>` as soon as it is complete.
     #[inline(always)]
-    fn flat16<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
+    fn flat16<S: Sum>(px: &[S; 14], out: &mut impl Sink<S>) {
         let mut s = px[0]
-            .add(px[0])
-            .add(px[0])
-            .add(px[0])
-            .add(px[0])
-            .add(px[0])
-            .add(px[0])
-            .add(px[1])
-            .add(px[1])
-            .add(px[2])
-            .add(px[2])
-            .add(px[3])
-            .add(px[4])
-            .add(px[5])
-            .add(px[6])
-            .add(px[7]);
-        out[1] = s;
-        s = s.sub(px[0]).sub(px[0]).add(px[3]).add(px[8]);
-        out[2] = s;
-        s = s.sub(px[0]).sub(px[1]).add(px[4]).add(px[9]);
-        out[3] = s;
-        s = s.sub(px[0]).sub(px[2]).add(px[5]).add(px[10]);
-        out[4] = s;
-        s = s.sub(px[0]).sub(px[3]).add(px[6]).add(px[11]);
-        out[5] = s;
-        s = s.sub(px[0]).sub(px[4]).add(px[7]).add(px[12]);
-        out[6] = s;
-        s = s.sub(px[0]).sub(px[5]).add(px[8]).add(px[13]);
-        out[7] = s;
-        s = s.sub(px[1]).sub(px[6]).add(px[9]).add(px[13]);
-        out[8] = s;
-        s = s.sub(px[2]).sub(px[7]).add(px[10]).add(px[13]);
-        out[9] = s;
-        s = s.sub(px[3]).sub(px[8]).add(px[11]).add(px[13]);
-        out[10] = s;
-        s = s.sub(px[4]).sub(px[9]).add(px[12]).add(px[13]);
-        out[11] = s;
-        s = s.sub(px[5]).sub(px[10]).add(px[13]).add(px[13]);
-        out[12] = s;
+            .plus(px[0])
+            .plus(px[0])
+            .plus(px[0])
+            .plus(px[0])
+            .plus(px[0])
+            .plus(px[0])
+            .plus(px[1])
+            .plus(px[1])
+            .plus(px[2])
+            .plus(px[2])
+            .plus(px[3])
+            .plus(px[4])
+            .plus(px[5])
+            .plus(px[6])
+            .plus(px[7]);
+        out.put(1, s);
+        s = s.minus(px[0]).minus(px[0]).plus(px[3]).plus(px[8]);
+        out.put(2, s);
+        s = s.minus(px[0]).minus(px[1]).plus(px[4]).plus(px[9]);
+        out.put(3, s);
+        s = s.minus(px[0]).minus(px[2]).plus(px[5]).plus(px[10]);
+        out.put(4, s);
+        s = s.minus(px[0]).minus(px[3]).plus(px[6]).plus(px[11]);
+        out.put(5, s);
+        s = s.minus(px[0]).minus(px[4]).plus(px[7]).plus(px[12]);
+        out.put(6, s);
+        s = s.minus(px[0]).minus(px[5]).plus(px[8]).plus(px[13]);
+        out.put(7, s);
+        s = s.minus(px[1]).minus(px[6]).plus(px[9]).plus(px[13]);
+        out.put(8, s);
+        s = s.minus(px[2]).minus(px[7]).plus(px[10]).plus(px[13]);
+        out.put(9, s);
+        s = s.minus(px[3]).minus(px[8]).plus(px[11]).plus(px[13]);
+        out.put(10, s);
+        s = s.minus(px[4]).minus(px[9]).plus(px[12]).plus(px[13]);
+        out.put(11, s);
+        s = s.minus(px[5]).minus(px[10]).plus(px[13]).plus(px[13]);
+        out.put(12, s);
     }
 
-    /// Generated from `loop_filter`'s flat8 branch: one running sum, a term in and out per output;
-    /// `out` holds the sums before [`rshr`]`::<3>`.
+    /// Generated from `loop_filter`'s flat8 branch: one running sum, a term in and out per output,
+    /// each sum handed to `out` before [`rshr`]`::<3>` as soon as it is complete.
     #[inline(always)]
-    fn flat8<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
+    fn flat8<S: Sum>(px: &[S; 14], out: &mut impl Sink<S>) {
         let mut s = px[3]
-            .add(px[3])
-            .add(px[3])
-            .add(px[4])
-            .add(px[4])
-            .add(px[5])
-            .add(px[6])
-            .add(px[7]);
-        out[4] = s;
-        s = s.sub(px[3]).sub(px[4]).add(px[5]).add(px[8]);
-        out[5] = s;
-        s = s.sub(px[3]).sub(px[5]).add(px[6]).add(px[9]);
-        out[6] = s;
-        s = s.sub(px[3]).sub(px[6]).add(px[7]).add(px[10]);
-        out[7] = s;
-        s = s.sub(px[4]).sub(px[7]).add(px[8]).add(px[10]);
-        out[8] = s;
-        s = s.sub(px[5]).sub(px[8]).add(px[9]).add(px[10]);
-        out[9] = s;
+            .plus(px[3])
+            .plus(px[3])
+            .plus(px[4])
+            .plus(px[4])
+            .plus(px[5])
+            .plus(px[6])
+            .plus(px[7]);
+        out.put(4, s);
+        s = s.minus(px[3]).minus(px[4]).plus(px[5]).plus(px[8]);
+        out.put(5, s);
+        s = s.minus(px[3]).minus(px[5]).plus(px[6]).plus(px[9]);
+        out.put(6, s);
+        s = s.minus(px[3]).minus(px[6]).plus(px[7]).plus(px[10]);
+        out.put(7, s);
+        s = s.minus(px[4]).minus(px[7]).plus(px[8]).plus(px[10]);
+        out.put(8, s);
+        s = s.minus(px[5]).minus(px[8]).plus(px[9]).plus(px[10]);
+        out.put(9, s);
     }
 
-    /// Generated from `loop_filter`'s flat6 branch: one running sum, a term in and out per output;
-    /// `out` holds the sums before [`rshr`]`::<3>`.
+    /// Generated from `loop_filter`'s flat6 branch: one running sum, a term in and out per output,
+    /// each sum handed to `out` before [`rshr`]`::<3>` as soon as it is complete.
     #[inline(always)]
-    fn flat6<V: Lanes>(px: &[V; 14], out: &mut [V; 14]) {
+    fn flat6<S: Sum>(px: &[S; 14], out: &mut impl Sink<S>) {
         let mut s = px[4]
-            .add(px[4])
-            .add(px[4])
-            .add(px[5])
-            .add(px[5])
-            .add(px[6])
-            .add(px[6])
-            .add(px[7]);
-        out[5] = s;
-        s = s.sub(px[4]).sub(px[4]).add(px[7]).add(px[8]);
-        out[6] = s;
-        s = s.sub(px[4]).sub(px[5]).add(px[8]).add(px[9]);
-        out[7] = s;
-        s = s.sub(px[5]).sub(px[6]).add(px[9]).add(px[9]);
-        out[8] = s;
+            .plus(px[4])
+            .plus(px[4])
+            .plus(px[5])
+            .plus(px[5])
+            .plus(px[6])
+            .plus(px[6])
+            .plus(px[7]);
+        out.put(5, s);
+        s = s.minus(px[4]).minus(px[4]).plus(px[7]).plus(px[8]);
+        out.put(6, s);
+        s = s.minus(px[4]).minus(px[5]).plus(px[8]).plus(px[9]);
+        out.put(7, s);
+        s = s.minus(px[5]).minus(px[6]).plus(px[9]).plus(px[9]);
+        out.put(8, s);
     }
 
     /// `px[7 + k]` is the pixel at offset `k` across the edge, `-7..=6`; `MAX` is the group's
@@ -581,26 +640,18 @@ mod rust_simd {
             flat_in = flat_in.and(V::select(p.gt6, c, ones));
         }
         let flat_in = flat_in.and(fm);
-        let mut out = orig;
         if MAX == 6 {
             let m = flat_in.and(p.gt4);
             if !m.any() {
                 return;
             }
-            flat6(&orig, &mut out);
-            for k in 5..=8 {
-                px[k] = V::select(m, rshr::<V, 3>(out[k]), px[k]);
-            }
-            return;
+            return flat6(&orig, &mut Select::<V, 3> { px, m });
         }
         let m = flat_in.and(p.gt6);
         if !m.any() {
             return;
         }
-        flat8(&orig, &mut out);
-        for k in 4..=9 {
-            px[k] = V::select(m, rshr::<V, 3>(out[k]), px[k]);
-        }
+        flat8(&orig, &mut Select::<V, 3> { px, m });
         if MAX == 16 && flat_in.and(p.wd16).any() {
             let flat_out = le(absdiff(p6, p0), p.flat)
                 .and(le(absdiff(p5, p0), p.flat))
@@ -609,10 +660,7 @@ mod rust_simd {
                 .and(le(absdiff(q5, q0), p.flat))
                 .and(le(absdiff(q6, q0), p.flat));
             let m = flat_in.and(flat_out).and(p.wd16);
-            flat16(&orig, &mut out);
-            for k in 1..=12 {
-                px[k] = V::select(m, rshr::<V, 4>(out[k]), px[k]);
-            }
+            flat16(&orig, &mut Select::<V, 4> { px, m });
         }
     }
 
@@ -685,18 +733,12 @@ mod rust_simd {
         if !m8.any() {
             return 2;
         }
-        let (mut lo, mut hi) = ([I16x8::splat(0); 14], [I16x8::splat(0); 14]);
-        for k in 0..14 {
-            [lo[k], hi[k]] = orig[k].widen();
+        let mut wide = [Wide([I16x8::splat(0); 2]); 14];
+        for (w, v) in wide.iter_mut().zip(orig) {
+            *w = Wide(v.widen());
         }
-        let (mut out_lo, mut out_hi) = (lo, hi);
         if MAX == 6 {
-            flat6(&lo, &mut out_lo);
-            flat6(&hi, &mut out_hi);
-            for k in 5..=8 {
-                let v = U8x16::narrow_rshr::<3>(out_lo[k], out_hi[k]);
-                px[k] = U8x16::select(m8, v, px[k]);
-            }
+            flat6(&wide, &mut Select::<_, 3> { px, m: m8 });
             return 2;
         }
         let mut changed = 3;
@@ -711,24 +753,14 @@ mod rust_simd {
             let m16 = flat_out.le(one).and(m8).and(p.wd16);
             m8 = m8.andnot(m16);
             if m16.any() {
-                flat16(&lo, &mut out_lo);
-                flat16(&hi, &mut out_hi);
-                for k in 1..=12 {
-                    let v = U8x16::narrow_rshr::<4>(out_lo[k], out_hi[k]);
-                    px[k] = U8x16::select(m16, v, px[k]);
-                }
+                flat16(&wide, &mut Select::<_, 4> { px, m: m16 });
                 changed = 6;
             }
             if !m8.any() {
                 return changed;
             }
         }
-        flat8(&lo, &mut out_lo);
-        flat8(&hi, &mut out_hi);
-        for k in 4..=9 {
-            let v = U8x16::narrow_rshr::<3>(out_lo[k], out_hi[k]);
-            px[k] = U8x16::select(m8, v, px[k]);
-        }
+        flat8(&wide, &mut Select::<_, 3> { px, m: m8 });
         changed
     }
 
@@ -1100,8 +1132,8 @@ mod rust_simd {
     /// The low four bits of `m` as masks, each over four lanes.
     #[inline(always)]
     fn seg_masks(m: u32) -> U8x16 {
-        // Bit `j` to bit 0 of byte `j`, which `0xff` then fills.
-        U8x16::spread4(((m & 15) * 0x0020_4081 & 0x0101_0101) * 0xff)
+        let bits = U8x16::spread4(0x0804_0201);
+        U8x16::splat(m as u8).and(bits).eq(bits)
     }
 
     /// 8 bpc only. The thresholds as the asm takes them: all four segments' levels at once, a

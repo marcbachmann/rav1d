@@ -1278,6 +1278,11 @@ mod imp {
         }
 
         #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            Self(unsafe { _mm_cmpeq_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
         pub fn and(self, o: Self) -> Self {
             Self(unsafe { _mm_and_si128(self.0, o.0) })
         }
@@ -2029,6 +2034,11 @@ mod imp {
         }
 
         #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            Self(unsafe { vceqq_u8(self.0, o.0) })
+        }
+
+        #[inline(always)]
         pub fn and(self, o: Self) -> Self {
             Self(unsafe { vandq_u8(self.0, o.0) })
         }
@@ -2773,6 +2783,11 @@ mod imp {
         }
 
         #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            Self(i8x16_eq(self.0, o.0))
+        }
+
+        #[inline(always)]
         pub fn and(self, o: Self) -> Self {
             Self(v128_and(self.0, o.0))
         }
@@ -3457,6 +3472,11 @@ mod imp {
         #[inline(always)]
         pub fn le(self, o: Self) -> Self {
             self.zip(o, |a, b| if a <= b { 0xff } else { 0 })
+        }
+
+        #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            self.zip(o, |a, b| if a == b { 0xff } else { 0 })
         }
 
         #[inline(always)]
