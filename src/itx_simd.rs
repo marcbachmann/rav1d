@@ -987,8 +987,9 @@ fn add_rows<BD: BitDepth, const W: usize, const H: usize>(
 ) {
     let n = if W == 4 { 4 } else { 8 };
     let (zero, max) = (I16x8::splat(0), I16x8::splat(px_max));
+    let stride = dst.pixel_stride::<BD>();
     for y in 0..H {
-        let row = dst + (y as isize * dst.pixel_stride::<BD>());
+        let row = dst + (y as isize * stride);
         let px = &mut *row.slice_mut::<BD>(x0 + n);
         if BD::BITDEPTH == 8 {
             let px = &mut px.as_bytes_mut()[x0..];
@@ -1027,10 +1028,11 @@ fn add_dc<BD: BitDepth, const W: usize, const H: usize>(
     dc = dc * 181 + 128 >> 8;
     dc = dc + (1 << shift >> 1) >> shift;
     dc = dc * 181 + 128 + 2048 >> 12;
+    let stride = dst.pixel_stride::<BD>();
     if BD::BITDEPTH == 8 {
         let dc = I16x8::splat(dc as i16);
         for y in 0..H {
-            let row = dst + (y as isize * dst.pixel_stride::<BD>());
+            let row = dst + (y as isize * stride);
             let px = &mut *row.slice_mut::<BD>(W);
             let px = px.as_bytes_mut();
             if W == 4 {
@@ -1048,7 +1050,7 @@ fn add_dc<BD: BitDepth, const W: usize, const H: usize>(
     let dc = I16x8::splat(dc.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
     let (zero, max) = (I16x8::splat(0), I16x8::splat(px_max));
     for y in 0..H {
-        let row = dst + (y as isize * dst.pixel_stride::<BD>());
+        let row = dst + (y as isize * stride);
         let px = &mut *row.slice_mut::<BD>(W);
         let px = px16(px.as_bytes_mut());
         if W == 4 {
@@ -1406,8 +1408,9 @@ mod wide {
         }
         tx::<_, H, true>(&mut v, cols, 4, half);
         round(&mut v, round_mul(cols, H, 4), negated(cols, H));
+        let stride = dst.pixel_stride::<BD>();
         for y in 0..H {
-            let row = dst + (y as isize * dst.pixel_stride::<BD>());
+            let row = dst + (y as isize * stride);
             let px = &mut *row.slice_mut::<BD>(x0 + 16);
             if BD::BITDEPTH == 8 {
                 let px = &mut px.as_bytes_mut()[x0..];
