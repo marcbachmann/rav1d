@@ -39,12 +39,10 @@ fn put_rust<BD: BitDepth>(
     w: usize,
     h: usize,
 ) {
-    for y in 0..h {
-        let src = src + y as isize * src.pixel_stride::<BD>();
-        let dst = dst + y as isize * dst.pixel_stride::<BD>();
-        let src = &*src.slice::<BD>(w);
-        let dst = &mut *dst.slice_mut::<BD>(w);
-        BD::pixel_copy(dst, src, w);
+    let src = src.block::<BD>(0..h as isize, 0..w as isize);
+    let dst = dst.block::<BD>(0..h as isize, 0..w as isize);
+    for y in 0..h as isize {
+        BD::pixel_copy(&mut dst.row_mut(y, 0, w), &src.row(y, 0, w), w);
     }
 }
 

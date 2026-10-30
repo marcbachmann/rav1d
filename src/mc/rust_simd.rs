@@ -5,11 +5,11 @@
 //! dav1d's asm keeps them there (the taps sum to 64), everything else is summed in 32 bits.
 //! Widths below a vector (2 and 4, and 8 on AVX2) go through a short copy or the narrower tier.
 
-use std::marker::PhantomData;
 use std::mem::size_of;
 use std::slice;
 
 use super::*;
+use crate::include::dav1d::picture::PicBlock;
 
 /// The lane operations the kernels take; one implementation per tier.
 pub trait Vx: Copy {
@@ -435,27 +435,19 @@ fn store_px_row<BD: BitDepth, V: Vx, const PW: usize, const I: usize>(
 }
 
 /// Where a kernel's rows go: the picture (`put`), or the compound buffer (`prep`).
-pub enum Out<'a, 'b> {
-    Put(Rav1dPictureDataComponentOffset<'a>),
+pub enum Out<'a, 'b, BD: BitDepth> {
+    Put(PicBlock<'a, BD>),
     Prep(&'b mut [i16]),
 }
 
-impl Out<'_, '_> {
+impl<BD: BitDepth> Out<'_, '_, BD> {
     /// Stores `v`'s strip at `(x, y)`: clipped to pixels for `put`, as is for `prep`.
     #[inline(always)]
-    fn emit<BD: BitDepth, V: Vx, const PW: usize>(
-        &mut self,
-        v: V,
-        x: usize,
-        y: usize,
-        w: usize,
-        max: i16,
-    ) {
+    fn emit<V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, w: usize, max: i16) {
         let n = if PW == 0 { V::N } else { PW };
         match self {
             Out::Put(d) => {
-                let d = *d + (y as isize * d.pixel_stride::<BD>() + x as isize);
-                store_px::<BD, V, PW>(v, &mut d.slice_mut::<BD>(n), max);
+                store_px::<BD, V, PW>(v, &mut d.row_mut(y as isize, x as isize, n), max);
             }
             Out::Prep(t) => st_i16::<V, PW>(v, &mut t[y * w + x..]),
         }
@@ -467,14 +459,13 @@ impl Out<'_, '_> {
 }
 
 /// Where `mc_8tap` stores its rows: the picture (`put`) or the compound buffer (`prep`).
-trait Sink {
+trait Sink<BD: BitDepth> {
     const PREP: bool;
-    fn emit<BD: BitDepth, V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, max: i16);
+    fn emit<V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, max: i16);
 }
 
-struct PutRows<'a> {
-    d: Rav1dPictureDataComponentOffset<'a>,
-    stride: isize,
+struct PutRows<'a, BD: BitDepth> {
+    d: PicBlock<'a, BD>,
 }
 
 struct PrepRows<'b> {
@@ -482,26 +473,25 @@ struct PrepRows<'b> {
     w: usize,
 }
 
-impl Sink for PutRows<'_> {
+impl<BD: BitDepth> Sink<BD> for PutRows<'_, BD> {
     const PREP: bool = false;
 
     #[inline(always)]
-    fn emit<BD: BitDepth, V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, max: i16) {
+    fn emit<V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, max: i16) {
         let n = px::<V, PW>();
-        let d = self.d + (y as isize * self.stride + x as isize);
-        store_px_row::<BD, V, PW, 0>(v, &mut d.slice_mut::<BD>(n), max);
+        let (x, y) = (x as isize, y as isize);
+        store_px_row::<BD, V, PW, 0>(v, &mut self.d.row_mut(y, x, n), max);
         if V::ROWS == 2 {
-            let d = d + self.stride;
-            store_px_row::<BD, V, PW, 1>(v, &mut d.slice_mut::<BD>(n), max);
+            store_px_row::<BD, V, PW, 1>(v, &mut self.d.row_mut(y + 1, x, n), max);
         }
     }
 }
 
-impl Sink for PrepRows<'_> {
+impl<BD: BitDepth> Sink<BD> for PrepRows<'_> {
     const PREP: bool = true;
 
     #[inline(always)]
-    fn emit<BD: BitDepth, V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, _: i16) {
+    fn emit<V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, _: i16) {
         let v = v.sub(V::splat(BD::PREP_BIAS));
         let i = y * self.w + x;
         if V::ROWS == 2 {
@@ -515,13 +505,12 @@ impl Sink for PrepRows<'_> {
 /// Source row `y` (from the block's top) of the strip at `x`.
 #[inline(always)]
 fn vrow<BD: BitDepth, V: Vx, const PW: usize>(
-    src: Rav1dPictureDataComponentOffset,
-    stride: isize,
+    src: &PicBlock<BD>,
     y: isize,
     x: usize,
     n: usize,
 ) -> V {
-    let s = (src + (y * stride + x as isize)).slice::<BD>(n);
+    let s = src.row(y, x as isize, n);
     if BD::BITDEPTH == 8 {
         ld_u8::<V, PW>(cast(&s))
     } else {
@@ -532,8 +521,7 @@ fn vrow<BD: BitDepth, V: Vx, const PW: usize>(
 /// The first pass of source row `y` (from the block's top) of the strip at `x`, rounded.
 #[inline(always)]
 fn hrow<BD: BitDepth, V: Vx, const PW: usize, const T6: bool>(
-    src: Rav1dPictureDataComponentOffset,
-    stride: isize,
+    src: &PicBlock<BD>,
     y: isize,
     x: usize,
     n: usize,
@@ -542,7 +530,7 @@ fn hrow<BD: BitDepth, V: Vx, const PW: usize, const T6: bool>(
     hrnd: i32,
     hsh: u32,
 ) -> V {
-    let s = (src + (y * stride + x as isize - 3)).slice::<BD>(n + 7);
+    let s = src.row(y, x as isize - 3, n + 7);
     if BD::BITDEPTH == 8 {
         rshr8(h8_u8::<V, PW, T6>(cast(&s), fh), hrnd as i16, hsh)
     } else {
@@ -552,16 +540,9 @@ fn hrow<BD: BitDepth, V: Vx, const PW: usize, const T6: bool>(
 
 /// Source rows `a` and `b` of the strip at `x`, in a two-row tier.
 #[inline(always)]
-fn vrow2<BD: BitDepth, V: Vx>(
-    src: Rav1dPictureDataComponentOffset,
-    stride: isize,
-    a: isize,
-    b: isize,
-    x: usize,
-    n: usize,
-) -> V {
-    let sa = (src + (a * stride + x as isize)).slice::<BD>(n);
-    let sb = (src + (b * stride + x as isize)).slice::<BD>(n);
+fn vrow2<BD: BitDepth, V: Vx>(src: &PicBlock<BD>, a: isize, b: isize, x: usize, n: usize) -> V {
+    let sa = src.row(a, x as isize, n);
+    let sb = src.row(b, x as isize, n);
     if BD::BITDEPTH == 8 {
         V::load2_u8(cast(&sa), cast(&sb))
     } else {
@@ -572,8 +553,7 @@ fn vrow2<BD: BitDepth, V: Vx>(
 /// The first pass of source rows `a` and `b` of the strip at `x`, in a two-row tier.
 #[inline(always)]
 fn hrow2<BD: BitDepth, V: Vx, const T6: bool>(
-    src: Rav1dPictureDataComponentOffset,
-    stride: isize,
+    src: &PicBlock<BD>,
     a: isize,
     b: isize,
     x: usize,
@@ -583,8 +563,8 @@ fn hrow2<BD: BitDepth, V: Vx, const T6: bool>(
     hrnd: i32,
     hsh: u32,
 ) -> V {
-    let sa = (src + (a * stride + x as isize - 3)).slice::<BD>(n + 7);
-    let sb = (src + (b * stride + x as isize - 3)).slice::<BD>(n + 7);
+    let sa = src.row(a, x as isize - 3, n + 7);
+    let sb = src.row(b, x as isize - 3, n + 7);
     if BD::BITDEPTH == 8 {
         rshr8(V::h8x2::<T6>(cast(&sa), cast(&sb), fh), hrnd as i16, hsh)
     } else {
@@ -594,9 +574,8 @@ fn hrow2<BD: BitDepth, V: Vx, const T6: bool>(
 
 /// The source rows of a strip's vertical pass: as they are, or through the first pass (`H`).
 /// A closure would not inherit the tier's target features where it is not inlined.
-struct Rows<'a, BD, const PW: usize, const H: bool, const T6: bool> {
-    src: Rav1dPictureDataComponentOffset<'a>,
-    stride: isize,
+struct Rows<'a, BD: BitDepth, const PW: usize, const H: bool, const T6: bool> {
+    src: PicBlock<'a, BD>,
     y0: isize,
     x: usize,
     n: usize,
@@ -604,7 +583,6 @@ struct Rows<'a, BD, const PW: usize, const H: bool, const T6: bool> {
     kh: [i16; 8],
     hrnd: i32,
     hsh: u32,
-    bd: PhantomData<BD>,
 }
 
 impl<BD: BitDepth, const PW: usize, const H: bool, const T6: bool> Rows<'_, BD, PW, H, T6> {
@@ -614,18 +592,10 @@ impl<BD: BitDepth, const PW: usize, const H: bool, const T6: bool> Rows<'_, BD, 
         let y = i as isize + self.y0;
         if H {
             hrow::<BD, V, PW, T6>(
-                self.src,
-                self.stride,
-                y,
-                self.x,
-                self.n,
-                &self.fh,
-                &self.kh,
-                self.hrnd,
-                self.hsh,
+                &self.src, y, self.x, self.n, &self.fh, &self.kh, self.hrnd, self.hsh,
             )
         } else {
-            vrow::<BD, V, PW>(self.src, self.stride, y, self.x, self.n)
+            vrow::<BD, V, PW>(&self.src, y, self.x, self.n)
         }
     }
 
@@ -635,19 +605,10 @@ impl<BD: BitDepth, const PW: usize, const H: bool, const T6: bool> Rows<'_, BD, 
         let (a, b) = (i as isize + self.y0, j as isize + self.y0);
         if H {
             hrow2::<BD, V, T6>(
-                self.src,
-                self.stride,
-                a,
-                b,
-                self.x,
-                self.n,
-                &self.fh,
-                &self.kh,
-                self.hrnd,
-                self.hsh,
+                &self.src, a, b, self.x, self.n, &self.fh, &self.kh, self.hrnd, self.hsh,
             )
         } else {
-            vrow2::<BD, V>(self.src, self.stride, a, b, self.x, self.n)
+            vrow2::<BD, V>(&self.src, a, b, self.x, self.n)
         }
     }
 }
@@ -655,7 +616,7 @@ impl<BD: BitDepth, const PW: usize, const H: bool, const T6: bool> Rows<'_, BD, 
 /// `put_8tap` / `prep_8tap` with at least one subpel filter.
 #[inline(always)]
 pub fn mc_8tap<BD: BitDepth, V: Vx, const PW: usize>(
-    out: Out,
+    out: Out<BD>,
     src: Rav1dPictureDataComponentOffset,
     w: usize,
     h: usize,
@@ -664,16 +625,13 @@ pub fn mc_8tap<BD: BitDepth, V: Vx, const PW: usize>(
     bd: BD,
 ) {
     match out {
-        Out::Put(d) => {
-            let stride = d.pixel_stride::<BD>();
-            mc_8tap_to::<BD, V, PW, _>(&mut PutRows { d, stride }, src, w, h, fh, fv, bd)
-        }
+        Out::Put(d) => mc_8tap_to::<BD, V, PW, _>(&mut PutRows { d }, src, w, h, fh, fv, bd),
         Out::Prep(t) => mc_8tap_to::<BD, V, PW, _>(&mut PrepRows { t, w }, src, w, h, fh, fv, bd),
     }
 }
 
 #[inline(always)]
-fn mc_8tap_to<BD: BitDepth, V: Vx, const PW: usize, S: Sink>(
+fn mc_8tap_to<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>>(
     s: &mut S,
     src: Rav1dPictureDataComponentOffset,
     w: usize,
@@ -682,6 +640,8 @@ fn mc_8tap_to<BD: BitDepth, V: Vx, const PW: usize, S: Sink>(
     fv: Option<&[i8; 8]>,
     bd: BD,
 ) {
+    let (mx, my) = (fh.is_some() as isize, fv.is_some() as isize);
+    let src = src.block::<BD>(-3 * my..h as isize + 4 * my, -3 * mx..w as isize + 4 * mx);
     match (fh, fv) {
         (Some(fh), None) if six(fh) => h_pass::<BD, V, PW, S, true>(s, src, w, h, fh, bd),
         (Some(fh), None) => h_pass::<BD, V, PW, S, false>(s, src, w, h, fh, bd),
@@ -698,9 +658,9 @@ fn mc_8tap_to<BD: BitDepth, V: Vx, const PW: usize, S: Sink>(
 }
 
 #[inline(always)]
-fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
+fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const T6: bool>(
     s: &mut S,
-    src: Rav1dPictureDataComponentOffset,
+    src: PicBlock<BD>,
     w: usize,
     h: usize,
     fh: &[i8; 8],
@@ -709,7 +669,6 @@ fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
     let ib = bd.get_intermediate_bits() as u32;
     let max = bd.bitdepth_max().as_::<i32>() as i16;
     let n = px::<V, PW>();
-    let stride = src.pixel_stride::<BD>();
     let hsh = 6 - ib;
     let hrnd = 1 << (hsh - 1);
     // By value, not behind the reference: stores could alias that, and keep the taps in the loop.
@@ -721,7 +680,6 @@ fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
         for x in (0..w).step_by(n) {
             let row = Rows::<BD, PW, true, T6> {
                 src,
-                stride,
                 y0: 0,
                 x,
                 n,
@@ -729,16 +687,15 @@ fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
                 kh: k,
                 hrnd: rnd,
                 hsh: sh,
-                bd: PhantomData,
             };
             for y in (0..h).step_by(2) {
-                s.emit::<BD, V, PW>(row.get2(y, y + 1), x, y, max);
+                s.emit::<V, PW>(row.get2(y, y + 1), x, y, max);
             }
         }
         return;
     }
     for y in 0..h {
-        let r = (src + (y as isize * stride - 3)).slice::<BD>(w + 7);
+        let r = src.row(y as isize, -3, w + 7);
         for x in (0..w).step_by(n) {
             let v = if BD::BITDEPTH == 8 {
                 rshr8(
@@ -749,15 +706,15 @@ fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
             } else {
                 h_u16::<V, PW, T6>(&cast::<_, u16>(&r)[x..][..n + 7], &k, rnd, sh)
             };
-            s.emit::<BD, V, PW>(v, x, y, max);
+            s.emit::<V, PW>(v, x, y, max);
         }
     }
 }
 
 #[inline(always)]
-fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
+fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const T6: bool>(
     s: &mut S,
-    src: Rav1dPictureDataComponentOffset,
+    src: PicBlock<BD>,
     w: usize,
     h: usize,
     fv: &[i8; 8],
@@ -766,7 +723,6 @@ fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
     let ib = bd.get_intermediate_bits() as u32;
     let max = bd.bitdepth_max().as_::<i32>() as i16;
     let n = px::<V, PW>();
-    let stride = src.pixel_stride::<BD>();
     let hsh = 6 - ib;
     let hrnd = 1 << (hsh - 1);
     let k = taps::<T6>(fv);
@@ -775,7 +731,6 @@ fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
     for x in (0..w).step_by(n) {
         let row = Rows::<BD, PW, false, false> {
             src,
-            stride,
             y0,
             x,
             n,
@@ -783,7 +738,6 @@ fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
             kh: k,
             hrnd: 0,
             hsh: 0,
-            bd: PhantomData,
         };
         if BD::BITDEPTH == 8 && V::BYTE_PAIRS {
             vpairs::<BD, V, PW, S, Bytes, T6, false, false>(s, x, h, &row, &k, rnd, sh, max);
@@ -796,9 +750,9 @@ fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
 }
 
 #[inline(always)]
-fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const H6: bool, const V6: bool>(
+fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const H6: bool, const V6: bool>(
     s: &mut S,
-    src: Rav1dPictureDataComponentOffset,
+    src: PicBlock<BD>,
     w: usize,
     h: usize,
     fh: &[i8; 8],
@@ -808,7 +762,6 @@ fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const H6: bool, const 
     let ib = bd.get_intermediate_bits() as u32;
     let max = bd.bitdepth_max().as_::<i32>() as i16;
     let n = px::<V, PW>();
-    let stride = src.pixel_stride::<BD>();
     let hsh = 6 - ib;
     let hrnd = 1 << (hsh - 1);
     let kh = taps::<H6>(fh);
@@ -822,7 +775,6 @@ fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const H6: bool, const 
     for x in (0..w).step_by(n) {
         let row = Rows::<BD, PW, true, H6> {
             src,
-            stride,
             y0,
             x,
             n,
@@ -830,7 +782,6 @@ fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const H6: bool, const 
             kh,
             hrnd,
             hsh,
-            bd: PhantomData,
         };
         v32::<BD, V, PW, S, V6, H6, true>(s, x, h, &row, &kv, rnd, sh, max);
     }
@@ -842,7 +793,7 @@ fn v32<
     BD: BitDepth,
     V: Vx,
     const PW: usize,
-    S: Sink,
+    S: Sink<BD>,
     const T6: bool,
     const RT6: bool,
     const H: bool,
@@ -869,7 +820,7 @@ fn vrows<
     BD: BitDepth,
     V: Vx,
     const PW: usize,
-    S: Sink,
+    S: Sink<BD>,
     const T6: bool,
     const RT6: bool,
     const H: bool,
@@ -895,7 +846,7 @@ fn vrows<
         for y in (0..h).step_by(2) {
             let a = row.get2(y + t - 1, y + t);
             (r[t - 2], r[t - 1]) = (V::mid(last, a), a);
-            s.emit::<BD, V, PW>(V::maddr(&r[..t], k, rnd, sh), x, y, max);
+            s.emit::<V, PW>(V::maddr(&r[..t], k, rnd, sh), x, y, max);
             r = [r[2], r[3], r[4], r[5], r[6], r[7], r[7], r[7], r[7]];
             last = a;
         }
@@ -908,15 +859,15 @@ fn vrows<
     while y + 2 <= h {
         r[t - 1] = row.get(y + t - 1);
         r[t] = row.get(y + t);
-        s.emit::<BD, V, PW>(V::maddr(&r[..t], k, rnd, sh), x, y, max);
-        s.emit::<BD, V, PW>(V::maddr(&r[1..t + 1], k, rnd, sh), x, y + 1, max);
+        s.emit::<V, PW>(V::maddr(&r[..t], k, rnd, sh), x, y, max);
+        s.emit::<V, PW>(V::maddr(&r[1..t + 1], k, rnd, sh), x, y + 1, max);
         // Rebuilt, not shifted in a loop: a loop becomes a memmove through the stack.
         r = [r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[8], r[8]];
         y += 2;
     }
     if y < h {
         r[t - 1] = row.get(y + t - 1);
-        s.emit::<BD, V, PW>(V::maddr(&r[..t], k, rnd, sh), x, y, max);
+        s.emit::<V, PW>(V::maddr(&r[..t], k, rnd, sh), x, y, max);
     }
 }
 
@@ -927,7 +878,7 @@ fn vmac<
     BD: BitDepth,
     V: Vx,
     const PW: usize,
-    S: Sink,
+    S: Sink<BD>,
     const T6: bool,
     const RT6: bool,
     const H: bool,
@@ -953,7 +904,7 @@ fn vmac<
         for y in (0..h).step_by(2) {
             let a = row.get2(y + t - 1, y + t);
             (r[t - 2], r[t - 1]) = (V::mid(last, a), a);
-            s.emit::<BD, V, PW>(rshr8(mac(&r[..t], k), rnd, sh), x, y, max);
+            s.emit::<V, PW>(rshr8(mac(&r[..t], k), rnd, sh), x, y, max);
             r = [r[2], r[3], r[4], r[5], r[6], r[7], r[7], r[7], r[7]];
             last = a;
         }
@@ -968,15 +919,15 @@ fn vmac<
         r[t] = row.get(y + t);
         let a = rshr8(mac(&r[..t], k), rnd, sh);
         let b = rshr8(mac(&r[1..t + 1], k), rnd, sh);
-        s.emit::<BD, V, PW>(a, x, y, max);
-        s.emit::<BD, V, PW>(b, x, y + 1, max);
+        s.emit::<V, PW>(a, x, y, max);
+        s.emit::<V, PW>(b, x, y + 1, max);
         // Rebuilt, not shifted in a loop: a loop becomes a memmove through the stack.
         r = [r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[8], r[8]];
         y += 2;
     }
     if y < h {
         r[t - 1] = row.get(y + t - 1);
-        s.emit::<BD, V, PW>(rshr8(mac(&r[..t], k), rnd, sh), x, y, max);
+        s.emit::<V, PW>(rshr8(mac(&r[..t], k), rnd, sh), x, y, max);
     }
 }
 
@@ -1029,7 +980,7 @@ fn vpairs<
     BD: BitDepth,
     V: Vx,
     const PW: usize,
-    S: Sink,
+    S: Sink<BD>,
     K: Acc<V>,
     const T6: bool,
     const RT6: bool,
@@ -1058,7 +1009,7 @@ fn vpairs<
         for y in (0..h).step_by(2) {
             let a = row.get2(y + t - 1, y + t);
             e[m] = K::pair(V::mid(last, a), a);
-            s.emit::<BD, V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
+            s.emit::<V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
             e = [e[1], e[2], e[3], e[3]];
             last = a;
         }
@@ -1078,8 +1029,8 @@ fn vpairs<
         let b = row.get(y + t);
         e[m] = K::pair(last, a);
         o[m] = K::pair(a, b);
-        s.emit::<BD, V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
-        s.emit::<BD, V, PW>(K::madd(&o[..m + 1], k, rnd, sh), x, y + 1, max);
+        s.emit::<V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
+        s.emit::<V, PW>(K::madd(&o[..m + 1], k, rnd, sh), x, y + 1, max);
         e = [e[1], e[2], e[3], e[3]];
         o = [o[1], o[2], o[3], o[3]];
         last = b;
@@ -1087,7 +1038,7 @@ fn vpairs<
     }
     if y < h {
         e[m] = K::pair(last, row.get(y + t - 1));
-        s.emit::<BD, V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
+        s.emit::<V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
     }
 }
 
@@ -1132,7 +1083,7 @@ fn comp_k<BD: BitDepth, V: Vx, const PW: usize, const K: u8>(
     let max = bd.bitdepth_max().as_::<i32>() as i16;
     let bias = BD::PREP_BIAS as i32;
     let n = if PW == 0 { V::N } else { PW };
-    let stride = dst.pixel_stride::<BD>();
+    let dst = dst.block::<BD>(0..h as isize, 0..w as isize);
     let (rnd, sh) = match K {
         0 => ((1 << ib) + 2 * bias, ib + 1),
         1 => ((8 << ib) + 16 * bias, ib + 4),
@@ -1157,14 +1108,14 @@ fn comp_k<BD: BitDepth, V: Vx, const PW: usize, const K: u8>(
                     V::madd2(a, b, m, V::splat(64).sub(m), rnd, sh)
                 }
             };
-            let d = dst + 2 * y as isize * stride;
-            store_px_row::<BD, V, 0, 0>(v, &mut d.slice_mut::<BD>(w), max);
-            store_px_row::<BD, V, 0, 1>(v, &mut (d + stride).slice_mut::<BD>(w), max);
+            let y = 2 * y as isize;
+            store_px_row::<BD, V, 0, 0>(v, &mut dst.row_mut(y, 0, w), max);
+            store_px_row::<BD, V, 0, 1>(v, &mut dst.row_mut(y + 1, 0, w), max);
         }
         return;
     }
     for (y, (r1, r2)) in t1.chunks_exact(w).zip(t2.chunks_exact(w)).enumerate() {
-        let mut row = (dst + y as isize * stride).slice_mut::<BD>(w);
+        let row = &mut *dst.row_mut(y as isize, 0, w);
         let rm = if K == 2 { &m[y * w..][..w] } else { &[] };
         for (x, (d, (a, b))) in row
             .chunks_exact_mut(n)
@@ -1255,7 +1206,7 @@ fn warp_filters<V: Vw>(m: i32, step: i32) -> [V; 8] {
 /// in registers, then eight rows with a filter per column. `w` is `prep`'s row stride.
 #[inline(always)]
 pub fn warp<BD: BitDepth, V: Vw>(
-    out: Out,
+    out: Out<BD>,
     w: usize,
     src: Rav1dPictureDataComponentOffset,
     abcd: &[i16; 4],
@@ -1287,10 +1238,10 @@ fn warp_h<BD: BitDepth, V: Vw>(
     bd: BD,
 ) -> [V; 15] {
     let ib = bd.get_intermediate_bits() as u32;
-    let stride = src.pixel_stride::<BD>();
+    let src = src.block::<BD>(-3..12, -3..12);
     let mut mid = [V::splat(0); 15];
     for y in 0..15 {
-        let s = (src + ((y as isize - 3) * stride - 3)).slice::<BD>(15);
+        let s = src.row(y as isize - 3, -3, 15);
         let (m, step) = (mx + y as i32 * abcd[1] as i32, abcd[0] as i32);
         mid[y] = if BD::BITDEPTH == 8 {
             let f = warp_filter_refs::<V>(m, step);
@@ -1322,7 +1273,7 @@ fn warp_h<BD: BitDepth, V: Vw>(
 /// The warp's vertical pass over `mid`.
 #[inline(always)]
 fn warp_v<BD: BitDepth, V: Vw>(
-    mut out: Out,
+    mut out: Out<BD>,
     w: usize,
     mid: &[V; 15],
     abcd: &[i16; 4],
@@ -1341,7 +1292,7 @@ fn warp_v<BD: BitDepth, V: Vw>(
         } else {
             v
         };
-        out.emit::<BD, V, 0>(v, 0, y, w, max);
+        out.emit::<V, 0>(v, 0, y, w, max);
     }
 }
 
@@ -2566,7 +2517,7 @@ fn bl2<BD: BitDepth, V: Vx>(a: V, b: V, f: i16, rnd: i32, sh: u32) -> V {
 
 #[inline(always)]
 fn bl_row<BD: BitDepth, V: Vx, const PW: usize>(
-    src: Rav1dPictureDataComponentOffset,
+    src: &PicBlock<BD>,
     y: usize,
     x: usize,
     n: usize,
@@ -2574,7 +2525,7 @@ fn bl_row<BD: BitDepth, V: Vx, const PW: usize>(
     hrnd: i32,
     hsh: u32,
 ) -> V {
-    let s = (src + (y as isize * src.pixel_stride::<BD>() + x as isize)).slice::<BD>(n + 1);
+    let s = src.row(y as isize, x as isize, n + 1);
     bl2::<BD, V>(
         ld_px::<BD, V, PW>(&s),
         ld_px::<BD, V, PW>(&s[1..]),
@@ -2587,7 +2538,7 @@ fn bl_row<BD: BitDepth, V: Vx, const PW: usize>(
 /// `put_bilin` / `prep_bilin` with a subpel position.
 #[inline(always)]
 pub fn bilin<BD: BitDepth, V: Vx, const PW: usize>(
-    mut out: Out,
+    mut out: Out<BD>,
     src: Rav1dPictureDataComponentOffset,
     w: usize,
     h: usize,
@@ -2603,27 +2554,27 @@ pub fn bilin<BD: BitDepth, V: Vx, const PW: usize>(
     let (mx, my) = (mx as i16, my as i16);
     let hsh = 4 - ib;
     let hrnd = (1 << hsh) >> 1;
+    let (dx, dy) = ((mx != 0) as isize, (my != 0) as isize);
+    let src = src.block::<BD>(0..h as isize + dy, 0..w as isize + dx);
     for x in (0..w).step_by(n) {
         if my == 0 {
             for y in 0..h {
-                let v = bl_row::<BD, V, PW>(src, y, x, n, mx, hrnd, hsh);
+                let v = bl_row::<BD, V, PW>(&src, y, x, n, mx, hrnd, hsh);
                 let v = if prep {
                     v.sub(V::splat(bias))
                 } else {
                     rshr8(v, (1 << ib) >> 1, ib)
                 };
-                out.emit::<BD, V, PW>(v, x, y, w, max);
+                out.emit::<V, PW>(v, x, y, w, max);
             }
         } else if mx == 0 {
             let (rnd, sh) = if prep { (hrnd, hsh) } else { (8, 4) };
-            let stride = src.pixel_stride::<BD>();
-            let mut a = ld_px::<BD, V, PW>(&(src + x).slice::<BD>(n));
+            let mut a = ld_px::<BD, V, PW>(&src.row(0, x as isize, n));
             for y in 0..h {
-                let b = (src + ((y + 1) as isize * stride + x as isize)).slice::<BD>(n);
-                let b = ld_px::<BD, V, PW>(&b);
+                let b = ld_px::<BD, V, PW>(&src.row(y as isize + 1, x as isize, n));
                 let v = bl2::<BD, V>(a, b, my, rnd, sh);
                 let v = if prep { v.sub(V::splat(bias)) } else { v };
-                out.emit::<BD, V, PW>(v, x, y, w, max);
+                out.emit::<V, PW>(v, x, y, w, max);
                 a = b;
             }
         } else {
@@ -2632,12 +2583,12 @@ pub fn bilin<BD: BitDepth, V: Vx, const PW: usize>(
             } else {
                 (1 << (3 + ib), 4 + ib)
             };
-            let mut a = bl_row::<BD, V, PW>(src, 0, x, n, mx, hrnd, hsh);
+            let mut a = bl_row::<BD, V, PW>(&src, 0, x, n, mx, hrnd, hsh);
             for y in 0..h {
-                let b = bl_row::<BD, V, PW>(src, y + 1, x, n, mx, hrnd, hsh);
+                let b = bl_row::<BD, V, PW>(&src, y + 1, x, n, mx, hrnd, hsh);
                 let v = V::madd2(a, b, V::splat(16 - my), V::splat(my), rnd, sh);
                 let v = if prep { v.sub(V::splat(bias)) } else { v };
-                out.emit::<BD, V, PW>(v, x, y, w, max);
+                out.emit::<V, PW>(v, x, y, w, max);
                 a = b;
             }
         }
@@ -2656,8 +2607,9 @@ pub fn prep_copy<BD: BitDepth, V: Vx, const PW: usize>(
     let ib = bd.get_intermediate_bits() as u32;
     let n = if PW == 0 { V::N } else { PW };
     let (k, bias) = (V::splat(1 << ib), V::splat(BD::PREP_BIAS));
+    let src = src.block::<BD>(0..h as isize, 0..w as isize);
     for y in 0..h {
-        let s = (src + y as isize * src.pixel_stride::<BD>()).slice::<BD>(w);
+        let s = src.row(y as isize, 0, w);
         for x in (0..w).step_by(n) {
             let v = ld_px::<BD, V, PW>(&s[x..]).mul(k).sub(bias);
             st_i16::<V, PW>(v, &mut tmp[y * w + x..]);
@@ -2691,9 +2643,9 @@ pub fn blend<BD: BitDepth, V: Vx, const PW: usize>(
         vm[..w * 3 >> 2].copy_from_slice(&obmc[w..][..w * 3 >> 2]);
     }
     let oh = if let Blend::H = kind { h * 3 >> 2 } else { h };
-    let stride = dst.pixel_stride::<BD>();
+    let dst = dst.block::<BD>(0..oh as isize, 0..w as isize);
     for y in 0..oh {
-        let mut row = (dst + y as isize * stride).slice_mut::<BD>(w);
+        let row = &mut *dst.row_mut(y as isize, 0, w);
         for x in (0..w).step_by(n) {
             let d = ld_px::<BD, V, PW>(&row[x..]);
             let t = ld_px::<BD, V, PW>(&tmp[y * w + x..]);
@@ -2744,7 +2696,7 @@ pub fn w_mask<BD: BitDepth, V: Vx, const PW: usize>(
     let mask_rnd = 1 << (mask_sh - 5);
     let n = if PW == 0 { V::N } else { PW };
     let mw = w >> ss_hor as usize;
-    let stride = dst.pixel_stride::<BD>();
+    let dst = dst.block::<BD>(0..h as isize, 0..w as isize);
     let sign = sign as i16;
     for y in (0..h).step_by(2) {
         for x in (0..w).step_by(n) {
@@ -2755,8 +2707,8 @@ pub fn w_mask<BD: BitDepth, V: Vx, const PW: usize>(
                 let b = ld_i16::<V, PW>(&t2[i..]);
                 m[r] = a.wmask(b, mask_rnd, mask_sh);
                 let v = V::madd2(a, b, m[r], V::splat(64).sub(m[r]), rnd, ib + 6);
-                let d = dst + ((y + r) as isize * stride + x as isize);
-                store_px::<BD, V, PW>(v, &mut d.slice_mut::<BD>(n), max);
+                let d = &mut dst.row_mut((y + r) as isize, x as isize, n);
+                store_px::<BD, V, PW>(v, d, max);
             }
             if !ss_hor {
                 store_u8_lanes(m[0], 0, &mut mask[y * mw + x..][..n]);
@@ -2808,7 +2760,7 @@ macro_rules! tiers {
     };
 }
 
-tiers!(mc8, mc_8tap, (out: Out, src: Rav1dPictureDataComponentOffset, w: usize, h: usize,
+tiers!(mc8, mc_8tap, (out: Out<BD>, src: Rav1dPictureDataComponentOffset, w: usize, h: usize,
     fh: Option<&[i8; 8]>, fv: Option<&[i8; 8]>, bd: BD));
 /// `mod $m` with the kernel `$k` two rows a vector: 4-pixel strips on SSE4.1 (`n`) and in
 /// AVX2's VEX encoding (`nw`), 8-pixel ones on AVX2 (`w`); 4-pixel strips on NEON (`n`, and
@@ -2850,7 +2802,7 @@ macro_rules! tiers2 {
     };
 }
 
-tiers2!(mc8x2, mc_8tap, (out: Out, src: Rav1dPictureDataComponentOffset, w: usize, h: usize,
+tiers2!(mc8x2, mc_8tap, (out: Out<BD>, src: Rav1dPictureDataComponentOffset, w: usize, h: usize,
     fh: Option<&[i8; 8]>, fv: Option<&[i8; 8]>, bd: BD));
 tiers2!(cmpx2, comp, (dst: Rav1dPictureDataComponentOffset, t1: &[i16], t2: &[i16], w: usize,
     h: usize, kind: Comp, bd: BD));
@@ -2862,7 +2814,7 @@ tiers!(cmp, comp, (dst: Rav1dPictureDataComponentOffset, t1: &[i16], t2: &[i16],
     target_feature(enable = "sse4.1")
 )]
 fn warp_128<BD: BitDepth>(
-    out: Out,
+    out: Out<BD>,
     w: usize,
     src: Rav1dPictureDataComponentOffset,
     abcd: &[i16; 4],
@@ -2877,7 +2829,7 @@ fn warp_128<BD: BitDepth>(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 fn warp_vex<BD: BitDepth>(
-    mut out: Out,
+    mut out: Out<BD>,
     w: usize,
     src: Rav1dPictureDataComponentOffset,
     abcd: &[i16; 4],
@@ -2895,7 +2847,7 @@ fn warp_vex<BD: BitDepth>(
     for y in 0..8 {
         let f = warp_filter_refs::<S>(my + y as i32 * abcd[3] as i32, abcd[2] as i32);
         let v = x86::warp_v8(&r[y..], f, rnd, sh);
-        out.emit::<BD, S, 0>(v, 0, y, w, 0);
+        out.emit::<S, 0>(v, 0, y, w, 0);
     }
 }
 
@@ -2904,7 +2856,7 @@ fn warp_vex<BD: BitDepth>(
 /// On x86 SSE4.1 must hold, and AVX2 with `WIDE`.
 #[inline(always)]
 unsafe fn warp_any<BD: BitDepth, const WIDE: bool>(
-    out: Out,
+    out: Out<BD>,
     w: usize,
     src: Rav1dPictureDataComponentOffset,
     abcd: &[i16; 4],
@@ -2924,7 +2876,7 @@ unsafe fn warp_any<BD: BitDepth, const WIDE: bool>(
     }
 }
 
-tiers!(bl, bilin, (out: Out, src: Rav1dPictureDataComponentOffset, w: usize, h: usize,
+tiers!(bl, bilin, (out: Out<BD>, src: Rav1dPictureDataComponentOffset, w: usize, h: usize,
     mx: usize, my: usize, bd: BD));
 tiers!(pc, prep_copy, (tmp: &mut [i16], src: Rav1dPictureDataComponentOffset, w: usize,
     h: usize, bd: BD));
@@ -2995,11 +2947,12 @@ fn put_8tap<BD: BitDepth, const FILTER: usize, const WIDE: bool>(
     bd: BD,
 ) {
     let filter = Filter2d::from_repr(FILTER).unwrap();
+    let put = || Out::Put(dst.block::<BD>(0..h as isize, 0..w as isize));
     if filter == Filter2d::Bilinear {
         if mx == 0 && my == 0 {
             return put_rust::<BD>(dst, src, w, h);
         }
-        return call_tier!(bl, WIDE, w, (Out::Put(dst), src, w, h, mx, my, bd));
+        return call_tier!(bl, WIDE, w, (put(), src, w, h, mx, my, bd));
     }
     let (ht, vt) = filter.hv();
     let fh = get_filter(mx, w, ht);
@@ -3007,7 +2960,7 @@ fn put_8tap<BD: BitDepth, const FILTER: usize, const WIDE: bool>(
     if fh.is_none() && fv.is_none() {
         return put_rust::<BD>(dst, src, w, h);
     }
-    call_tier2!(mc8x2, mc8, WIDE, w, (Out::Put(dst), src, w, h, fh, fv, bd))
+    call_tier2!(mc8x2, mc8, WIDE, w, (put(), src, w, h, fh, fv, bd))
 }
 
 #[inline(always)]
@@ -3194,7 +3147,17 @@ pub unsafe extern "C" fn warp8x8_erased<BD: BitDepth, const WIDE: bool>(
     let src = unsafe { FFISafe::from_with_offset(src) };
     let bd = BD::from_c(bitdepth_max);
     // SAFETY: The CPU flags are checked before this `fn` is chosen.
-    unsafe { warp_any::<BD, WIDE>(Out::Put(dst), 8, src, abcd, mx, my, bd) }
+    unsafe {
+        warp_any::<BD, WIDE>(
+            Out::Put(dst.block::<BD>(0..8, 0..8)),
+            8,
+            src,
+            abcd,
+            mx,
+            my,
+            bd,
+        )
+    }
 }
 
 /// # Safety

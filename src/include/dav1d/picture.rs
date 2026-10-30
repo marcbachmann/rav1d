@@ -2,6 +2,8 @@
 
 use std::ffi::{c_int, c_void};
 use std::hint::assert_unchecked;
+use std::marker::PhantomData;
+use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::{array, mem};
@@ -397,6 +399,137 @@ impl<'a> Rav1dPictureDataComponentOffset<'a> {
         len: usize,
     ) -> DisjointMutGuard<'a, Rav1dPictureDataComponentInner, [BD::Pixel]> {
         self.data.slice_mut::<BD, _>((self.offset.., ..len))
+    }
+
+    /// The block of `rows` and `cols` around this offset, in pixels, for [`PicBlock`]'s rows.
+    /// Panics unless the footprint lies in the component or is empty.
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn block<BD: BitDepth>(self, rows: Range<isize>, cols: Range<isize>) -> PicBlock<'a, BD> {
+        #[inline(never)]
+        #[cfg_attr(debug_assertions, track_caller)]
+        fn out_of_bounds(rows: Range<isize>, cols: Range<isize>, at: usize, len: usize) -> ! {
+            panic!("block rows {rows:?} columns {cols:?} at pixel offset {at} out of range for pixel length {len}");
+        }
+
+        /// Where row `y`'s columns start; `offset` wraps below 0 as `WithOffset`'s arithmetic does.
+        fn row_start(offset: usize, stride: isize, y: isize, x: isize) -> Option<isize> {
+            (offset as isize)
+                .checked_add(y.checked_mul(stride)?)?
+                .checked_add(x)
+        }
+
+        let stride = self.pixel_stride::<BD>();
+        let len = self.data.pixel_len::<BD>();
+        // Row starts are linear in `y`, so the first and the last row bound all the others.
+        let fits = rows.is_empty()
+            || cols.is_empty()
+            || match (
+                row_start(self.offset, stride, rows.start, cols.start),
+                row_start(self.offset, stride, rows.end - 1, cols.start),
+                cols.end.checked_sub(cols.start),
+            ) {
+                (Some(a), Some(b), Some(w)) => {
+                    a.min(b) >= 0
+                        && a.max(b)
+                            .checked_add(w)
+                            .is_some_and(|end| end as usize <= len)
+                }
+                _ => false,
+            };
+        if !fits {
+            out_of_bounds(rows, cols, self.offset, len);
+        }
+        PicBlock {
+            #[cfg(debug_assertions)]
+            at: self,
+            #[cfg(not(debug_assertions))]
+            origin: self.data.as_mut_ptr::<BD>().wrapping_add(self.offset),
+            stride,
+            rows: (rows.start, rows.end),
+            cols: (cols.start, cols.end),
+            phantom: PhantomData,
+        }
+    }
+}
+
+/// The rows of a block in a picture component, its whole footprint checked once by
+/// [`Rav1dPictureDataComponentOffset::block`] to lie in the component's allocation.
+///
+/// Release builds then borrow its rows without bounds checks. Like [`DisjointMut::index_mut`],
+/// that is not `unsafe` to call but relies on correct use, which only debug builds check:
+/// - the `n` pixels at `(x, y)` lie in the footprint: `y` in its rows, `x..x + n` in its
+///   columns. Kernels declare the footprint from the block size they loop over.
+/// - a borrowed row overlaps no mutable borrow of the same pixels while held.
+///
+/// With `debug_assertions` each row is checked against the footprint and borrowed on its own
+/// through the [`DisjointMut`], so its tracker sees one row at a time, never the whole block.
+#[derive(Clone, Copy)]
+pub struct PicBlock<'a, BD: BitDepth> {
+    #[cfg(debug_assertions)]
+    at: Rav1dPictureDataComponentOffset<'a>,
+    #[cfg(not(debug_assertions))]
+    /// Pixel `(0, 0)` of the block; only the footprint is known to be in bounds.
+    origin: *mut BD::Pixel,
+    stride: isize,
+    rows: (isize, isize),
+    cols: (isize, isize),
+    phantom: PhantomData<(&'a Rav1dPictureDataComponent, BD)>,
+}
+
+#[cfg(debug_assertions)]
+pub type PicRow<'a, BD> =
+    DisjointImmutGuard<'a, Rav1dPictureDataComponentInner, [<BD as BitDepth>::Pixel]>;
+#[cfg(not(debug_assertions))]
+pub type PicRow<'a, BD> = &'a [<BD as BitDepth>::Pixel];
+
+#[cfg(debug_assertions)]
+pub type PicRowMut<'a, BD> =
+    DisjointMutGuard<'a, Rav1dPictureDataComponentInner, [<BD as BitDepth>::Pixel]>;
+#[cfg(not(debug_assertions))]
+pub type PicRowMut<'a, BD> = &'a mut [<BD as BitDepth>::Pixel];
+
+impl<'a, BD: BitDepth> PicBlock<'a, BD> {
+    /// The offset of `n` pixels at `(x, y)` from pixel `(0, 0)`.
+    #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
+    fn at(&self, y: isize, x: isize, n: usize) -> isize {
+        let ((top, bottom), (left, right)) = (self.rows, self.cols);
+        let inside = y >= top && y < bottom && x >= left && x <= right && n <= (right - x) as usize;
+        debug_assert!(
+            inside,
+            "{n} pixels at ({x}, {y}) outside block rows {top}..{bottom} columns {left}..{right}"
+        );
+        y.wrapping_mul(self.stride).wrapping_add(x)
+    }
+
+    /// `n` pixels of row `y` from column `x`.
+    #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn row(&self, y: isize, x: isize, n: usize) -> PicRow<'a, BD> {
+        let i = self.at(y, x, n);
+        #[cfg(debug_assertions)]
+        return (self.at + i).slice::<BD>(n);
+        // SAFETY: `block` checked that the footprint lies in the allocation, and `i`'s `n`
+        // pixels lie in the footprint (the caller's part, checked in debug builds).
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            std::slice::from_raw_parts(self.origin.wrapping_offset(i), n)
+        }
+    }
+
+    /// `n` pixels of row `y` from column `x`, to write.
+    #[inline(always)]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub fn row_mut(&self, y: isize, x: isize, n: usize) -> PicRowMut<'a, BD> {
+        let i = self.at(y, x, n);
+        #[cfg(debug_assertions)]
+        return (self.at + i).slice_mut::<BD>(n);
+        // SAFETY: As in `row`; no other borrow of these pixels is held (`DisjointMut`'s rule).
+        #[cfg(not(debug_assertions))]
+        unsafe {
+            std::slice::from_raw_parts_mut(self.origin.wrapping_offset(i), n)
+        }
     }
 }
 
@@ -825,5 +958,177 @@ impl Rav1dPicAllocator {
         unsafe {
             (self.release_picture_callback)(&mut pic_c, self.cookie);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::AlignedVec64;
+    use crate::include::common::bitdepth::{BitDepth16, BitDepth8};
+
+    const S: usize = 64;
+    const H: usize = 6;
+
+    /// `H` rows of `S` pixels, each pixel its index.
+    fn plane<BD: BitDepth>() -> AlignedVec64<BD::Pixel> {
+        let mut buf = AlignedVec64::<BD::Pixel>::new();
+        buf.resize(S * H, 0.into());
+        for (i, p) in buf.as_mut_slice().iter_mut().enumerate() {
+            *p = (i as u8).into();
+        }
+        buf
+    }
+
+    fn rows_match<BD: BitDepth>(
+        b: &PicBlock<BD>,
+        buf: &[BD::Pixel],
+        at: usize,
+        rows: Range<isize>,
+        cols: Range<isize>,
+    ) {
+        for y in rows {
+            let n = (cols.end - cols.start) as usize;
+            let i = at as isize + y * S as isize + cols.start;
+            assert!(*b.row(y, cols.start, n) == buf[i as usize..][..n]);
+        }
+    }
+
+    fn edges<BD: BitDepth>() {
+        let mut buf = plane::<BD>();
+        let want = buf.as_slice().to_vec();
+        let pic = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), S);
+        let at = 3 * S + 3;
+        let all = (-3..H as isize - 3, -3..S as isize - 3);
+        let b = (pic.with_offset::<BD>() + at).block::<BD>(all.0.clone(), all.1.clone());
+        rows_match(&b, &want, at, all.0, all.1);
+        let last = (pic.with_offset::<BD>() + (S * H - 1)).block::<BD>(-1..1, -1..1);
+        assert!(last.row(0, 0, 1)[0] == want[S * H - 1]);
+        let first = pic.with_offset::<BD>().block::<BD>(0..1, 0..1);
+        assert!(first.row(0, 0, 1)[0] == want[0]);
+    }
+
+    #[test]
+    fn block_at_the_edges() {
+        edges::<BitDepth8>();
+        edges::<BitDepth16>();
+    }
+
+    #[test]
+    fn block_empty() {
+        let mut buf = plane::<BitDepth8>();
+        let pic = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), S);
+        pic.with_offset::<BitDepth8>()
+            .block::<BitDepth8>(-9..-9, 0..4);
+    }
+
+    fn refused(rows: Range<isize>, cols: Range<isize>) {
+        let mut buf = plane::<BitDepth16>();
+        let pic = Rav1dPictureDataComponent::wrap_buf::<BitDepth16>(buf.as_mut_slice(), S);
+        (pic.with_offset::<BitDepth16>() + (3 * S + 3)).block::<BitDepth16>(rows, cols);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn block_one_past_the_end() {
+        refused(-3..H as isize - 3, -3..S as isize - 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn block_one_row_below() {
+        refused(-3..H as isize - 2, 0..1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn block_one_before_the_start() {
+        refused(-3..0, -4..0);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn block_one_row_above() {
+        refused(-4..0, 0..1);
+    }
+
+    /// The component with its rows bottom up, as an allocator with a negative stride hands out.
+    fn bottom_up(buf: &mut [u8]) -> Rav1dPictureDataComponent {
+        Rav1dPictureDataComponent(DisjointMut::new(Rav1dPictureDataComponentInner {
+            ptr: NonNull::new(buf.as_mut_ptr()).unwrap(),
+            len: buf.len(),
+            stride: -(S as isize),
+        }))
+    }
+
+    #[test]
+    fn block_negative_stride() {
+        let mut buf = plane::<BitDepth8>();
+        let want = buf.as_slice().to_vec();
+        let pic = bottom_up(buf.as_mut_slice());
+        let b = pic
+            .with_offset::<BitDepth8>()
+            .block::<BitDepth8>(0..H as isize, 0..S as isize);
+        for y in 0..H {
+            assert_eq!(&*b.row(y as isize, 0, S), &want[(H - 1 - y) * S..][..S]);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn block_negative_stride_one_row_below() {
+        let mut buf = plane::<BitDepth8>();
+        let pic = bottom_up(buf.as_mut_slice());
+        pic.with_offset::<BitDepth8>()
+            .block::<BitDepth8>(0..H as isize + 1, 0..1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn block_negative_stride_one_row_above() {
+        let mut buf = plane::<BitDepth8>();
+        let pic = bottom_up(buf.as_mut_slice());
+        pic.with_offset::<BitDepth8>()
+            .block::<BitDepth8>(-1..1, 0..1);
+    }
+
+    /// Rows are borrowed one at a time: another borrow may hold the row between them.
+    #[test]
+    fn block_rows_borrowed_alone() {
+        let mut buf = plane::<BitDepth8>();
+        let pic = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), S);
+        let b = pic
+            .with_offset::<BitDepth8>()
+            .block::<BitDepth8>(0..3, 0..8);
+        let _middle = pic
+            .with_offset::<BitDepth8>()
+            .block::<BitDepth8>(1..2, 0..8)
+            .row_mut(1, 0, 8);
+        let (_a, _c) = (b.row(0, 0, 8), b.row_mut(2, 0, 8));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "overlapping DisjointMut")]
+    fn block_rows_overlap_tracked() {
+        let mut buf = plane::<BitDepth8>();
+        let pic = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), S);
+        let b = pic
+            .with_offset::<BitDepth8>()
+            .block::<BitDepth8>(0..2, 0..8);
+        let _w = b.row_mut(1, 0, 8);
+        let _r = b.row(1, 4, 4);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "outside block")]
+    fn block_row_outside_the_footprint() {
+        let mut buf = plane::<BitDepth8>();
+        let pic = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), S);
+        let b = pic
+            .with_offset::<BitDepth8>()
+            .block::<BitDepth8>(0..2, 0..8);
+        let _ = b.row(0, 1, 8);
     }
 }
