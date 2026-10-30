@@ -37,7 +37,7 @@ use crate::loopfilter::Rav1dLoopFilterDSPContext;
 use crate::looprestoration::Rav1dLoopRestorationDSPContext;
 use crate::lr_apply::LrRestorePlanes;
 use crate::mc::Rav1dMCDSPContext;
-use crate::msac::{MsacContext, Rav1dMsacDSPContext};
+use crate::msac::MsacContext;
 use crate::pal::Rav1dPalDSPContext;
 use crate::picture::{PictureFlags, Rav1dThreadPicture};
 use crate::pool::MemPool;
@@ -59,7 +59,6 @@ use crate::thread_task::{Rav1dTaskIndex, Rav1dTasks};
 pub struct Rav1dDSPContext {
     pub pal: Rav1dPalDSPContext,
     pub refmvs: Rav1dRefmvsDSPContext,
-    pub msac: Rav1dMsacDSPContext,
 }
 
 impl Rav1dDSPContext {
@@ -67,24 +66,12 @@ impl Rav1dDSPContext {
         Self {
             pal: Rav1dPalDSPContext::default(),
             refmvs: Rav1dRefmvsDSPContext::default(),
-            msac: Rav1dMsacDSPContext::default(),
-        }
-    }
-
-    pub const fn new(flags: CpuFlags) -> Self {
-        Self {
-            pal: Rav1dPalDSPContext::new(flags),
-            refmvs: Rav1dRefmvsDSPContext::new(flags),
-            msac: Rav1dMsacDSPContext::new(flags),
         }
     }
 
     pub fn get() -> &'static Self {
-        static DSP: OnceLock<Rav1dDSPContext> = OnceLock::new();
-        DSP.get_or_init(|| {
-            let flags = rav1d_get_cpu_flags();
-            Self::new(flags)
-        })
+        static DSP: Rav1dDSPContext = Rav1dDSPContext::default();
+        &DSP
     }
 }
 
@@ -119,13 +106,13 @@ impl Rav1dBitDepthDSPContext {
 
     pub const fn new<BD: BitDepth>(flags: CpuFlags, bpc: u8) -> Self {
         Self {
-            fg: Rav1dFilmGrainDSPContext::new::<BD>(flags),
+            fg: Rav1dFilmGrainDSPContext::default::<BD>(),
             ipred: Rav1dIntraPredDSPContext::new::<BD>(flags),
-            mc: Rav1dMCDSPContext::new::<BD>(flags),
+            mc: Rav1dMCDSPContext::default::<BD>(),
             itx: Rav1dInvTxfmDSPContext::new::<BD>(flags, bpc),
             lf: Rav1dLoopFilterDSPContext::new::<BD>(flags),
             cdef: Rav1dCdefDSPContext::new::<BD>(flags),
-            lr: Rav1dLoopRestorationDSPContext::new::<BD>(flags, bpc),
+            lr: Rav1dLoopRestorationDSPContext::new::<BD>(flags),
         }
     }
 

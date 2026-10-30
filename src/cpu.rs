@@ -108,7 +108,7 @@ impl CpuFlags {
         combined_flags
     }
 
-    /// Detected with or without the `asm` feature: the encoder's intrinsics read these too.
+    /// Detected at run time: the Rust SIMD kernels and the encoder's intrinsics read these.
     pub fn run_time_detect() -> Self {
         let mut flags = Self::empty();
 

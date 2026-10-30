@@ -3,7 +3,6 @@
 use std::ffi::c_int;
 use std::slice;
 
-use crate::cpu::CpuFlags;
 use crate::wrap_fn_ptr::wrap_fn_ptr;
 
 wrap_fn_ptr!(pub unsafe extern "C" fn pal_idx_finish(
@@ -137,64 +136,6 @@ impl Rav1dPalDSPContext {
         Self {
             pal_idx_finish: pal_idx_finish::Fn::new(pal_idx_finish_c),
         }
-    }
-
-    #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
-    #[inline(always)]
-    const fn init_x86(mut self, flags: CpuFlags) -> Self {
-        if !flags.contains(CpuFlags::SSSE3) {
-            return self;
-        }
-
-        self.pal_idx_finish = pal_idx_finish::decl_fn!(fn dav1d_pal_idx_finish_ssse3);
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if !flags.contains(CpuFlags::AVX2) {
-                return self;
-            }
-
-            self.pal_idx_finish = pal_idx_finish::decl_fn!(fn dav1d_pal_idx_finish_avx2);
-
-            if !flags.contains(CpuFlags::AVX512ICL) {
-                return self;
-            }
-
-            self.pal_idx_finish = pal_idx_finish::decl_fn!(fn dav1d_pal_idx_finish_avx512icl);
-        }
-
-        self
-    }
-
-    #[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-    #[inline(always)]
-    const fn init_arm(self, _flags: CpuFlags) -> Self {
-        self
-    }
-
-    #[inline(always)]
-    const fn init(self, flags: CpuFlags) -> Self {
-        #[cfg(all(feature = "asm", not(rav1d_rust_simd = "pal")))]
-        {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                return self.init_x86(flags);
-            }
-            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            {
-                return self.init_arm(flags);
-            }
-        }
-
-        #[allow(unreachable_code)] // Reachable on some #[cfg]s.
-        {
-            let _ = flags;
-            self
-        }
-    }
-
-    pub const fn new(flags: CpuFlags) -> Self {
-        Self::default().init(flags)
     }
 }
 

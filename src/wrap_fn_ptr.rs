@@ -26,18 +26,12 @@
 ///     and removes any need for an [`Option::unwrap`] check,
 ///     as the check is moved to inside the `fn` call.
 ///
-/// * `decl_fn!`:
-///     A macro that, given a `fn $fn_name:ident`,
-///     declares an `extern "C" fn` with the `fn` signature provided.
-///     This macro can and is meant to be used with [`bd_fn!`].
-///
 /// This ensures that the `fn` signature is consistent between all of these
 /// and reduces the need to repeat the `fn` signature many times.
 ///
 /// [`BitDepth`]: crate::include::common::bitdepth::BitDepth
 /// [`DefaultValue`]: crate::enum_map::DefaultValue
 /// [`enum_map!`]: crate::enum_map::enum_map
-/// [`bd_fn!`]: crate::include::common::bitdepth::bd_fn
 macro_rules! wrap_fn_ptr {
     ($vis:vis unsafe extern "C" fn $name:ident(
             $($arg_name:ident: $arg_ty:ty),*$(,)?
@@ -78,22 +72,6 @@ macro_rules! wrap_fn_ptr {
                     Self::new(default_unimplemented)
                 };
             }
-
-            #[cfg(feature = "asm")]
-            #[allow(unused_macros)]
-            macro_rules! decl_fn {
-                (fn $fn_name:ident) => {{
-                    extern "C" {
-                        fn $fn_name($($arg_name: $arg_ty,)*) -> $return_ty;
-                    }
-
-                    self::$name::Fn::new($fn_name)
-                }};
-            }
-
-            #[cfg(feature = "asm")]
-            #[allow(unused_imports)]
-            pub(crate) use decl_fn;
         }
     };
 }

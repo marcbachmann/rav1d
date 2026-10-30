@@ -3817,7 +3817,7 @@ fn setup_tile(
     ts.last_qidx = frame_hdr.quant.yac.into();
     ts.last_delta_lf = Default::default();
 
-    ts_c.msac = MsacContext::new(data, frame_hdr.disable_cdf_update != 0, &c.dsp.msac);
+    ts_c.msac = MsacContext::new(data, frame_hdr.disable_cdf_update != 0);
 
     ts.tiling.row = tile_row as i32;
     ts.tiling.col = tile_col as i32;

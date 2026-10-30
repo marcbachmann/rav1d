@@ -7,7 +7,6 @@ use std::{cmp, mem, ptr, slice};
 use zerocopy::{AsBytes, FromZeroes};
 
 use crate::align::{Align16, AlignedVec64};
-use crate::cpu::CpuFlags;
 use crate::disjoint_mut::{DisjointMut, DisjointMutArcSlice, DisjointMutGuard, DisjointMutSlice};
 use crate::env::{fix_mv_precision, get_gmv_2d, get_poc_diff};
 use crate::error::Rav1dResult;
@@ -1748,90 +1747,6 @@ impl Rav1dRefmvsDSPContext {
             save_tmvs: save_tmvs::Fn::new(save_tmvs_c),
             splat_mv: splat_mv::Fn::new(splat_mv_c),
         }
-    }
-
-    #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
-    #[inline(always)]
-    const fn init_x86(mut self, flags: CpuFlags) -> Self {
-        if !flags.contains(CpuFlags::SSE2) {
-            return self;
-        }
-
-        self.splat_mv = splat_mv::decl_fn!(fn dav1d_splat_mv_sse2);
-
-        if !flags.contains(CpuFlags::SSSE3) {
-            return self;
-        }
-
-        self.save_tmvs = save_tmvs::decl_fn!(fn dav1d_save_tmvs_ssse3);
-
-        if !flags.contains(CpuFlags::SSE41) {
-            return self;
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            self.load_tmvs = load_tmvs::decl_fn!(fn dav1d_load_tmvs_sse4);
-
-            if !flags.contains(CpuFlags::AVX2) {
-                return self;
-            }
-
-            self.save_tmvs = save_tmvs::decl_fn!(fn dav1d_save_tmvs_avx2);
-            self.splat_mv = splat_mv::decl_fn!(fn dav1d_splat_mv_avx2);
-
-            if !flags.contains(CpuFlags::AVX512ICL) {
-                return self;
-            }
-
-            self.save_tmvs = save_tmvs::decl_fn!(fn dav1d_save_tmvs_avx512icl);
-            self.splat_mv = splat_mv::decl_fn!(fn dav1d_splat_mv_avx512icl);
-        }
-
-        self
-    }
-
-    #[cfg(all(feature = "asm", any(target_arch = "arm", target_arch = "aarch64")))]
-    #[inline(always)]
-    const fn init_arm(mut self, flags: CpuFlags) -> Self {
-        if !flags.contains(CpuFlags::NEON) {
-            return self;
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            self.load_tmvs = load_tmvs::decl_fn!(fn dav1d_load_tmvs_neon);
-        }
-
-        self.save_tmvs = save_tmvs::decl_fn!(fn dav1d_save_tmvs_neon);
-        self.splat_mv = splat_mv::decl_fn!(fn dav1d_splat_mv_neon);
-
-        self
-    }
-
-    #[inline(always)]
-    const fn init(self, flags: CpuFlags) -> Self {
-        #[cfg(all(feature = "asm", not(rav1d_rust_simd = "refmvs")))]
-        {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                return self.init_x86(flags);
-            }
-            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            {
-                return self.init_arm(flags);
-            }
-        }
-
-        #[allow(unreachable_code)] // Reachable on some #[cfg]s.
-        {
-            let _ = flags;
-            self
-        }
-    }
-
-    pub const fn new(flags: CpuFlags) -> Self {
-        Self::default().init(flags)
     }
 }
 

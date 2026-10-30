@@ -230,7 +230,6 @@ mod tests {
     use super::*;
     use crate::c_arc::CArc;
     use crate::c_box::CRef;
-    use crate::cpu::rav1d_get_cpu_flags;
     use crate::msac::*;
 
     struct Rng(u64);
@@ -338,9 +337,8 @@ mod tests {
     }
 
     fn decoder(data: Vec<u8>) -> MsacContext {
-        let dsp = Rav1dMsacDSPContext::new(rav1d_get_cpu_flags());
         let data = CArc::wrap(CRef::Box(data.into_boxed_slice())).unwrap();
-        MsacContext::new(data, false, &dsp)
+        MsacContext::new(data, false)
     }
 
     /// The decoder's assembly loads CDFs with aligned vector loads.

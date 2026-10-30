@@ -13,9 +13,6 @@ requires a nightly compiler for `arm` and `riscv64`. The project is configured
 to use a nightly compiler by default via `rust-toolchain.toml`, but a stable
 library build can be made with the `+stable` cargo flag.
 
-For x86 targets, you'll also need to install [`nasm`](https://nasm.us/) in order
-to build with assembly support.
-
 A release build can then be made using cargo:
 
 ```sh
@@ -39,20 +36,19 @@ cargo +stable build --lib --release
 
 The following feature flags are supported:
 
-* `asm` - Enables optimized assembly routines, if available for the target
-  platform.
 * `bitdepth_8` - Enables support for 8 bitdepth decoding.
 * `bitdepth_16` - Enables support for 10 and 12 bitdepth decoding.
 
-All of these features are enabled by default. In order to build a version of
-`librav1d` that disables one or more of these features use the
-`--no-default-features` flag in combination with the `--features` flag to enable
-any desired features. For example, to build without assembly routines, which is
-useful when testing the Rust fallback functions, do the following:
+Both features are enabled by default. To build a version of `librav1d` with
+only one of them, use the `--no-default-features` flag in combination with the
+`--features` flag:
 
 ```sh
-cargo build --no-default-features --features="bitdepth_8,bitdepth_16"
+cargo build --no-default-features --features="bitdepth_8"
 ```
+
+The SIMD kernels are written in Rust and selected at run time from the CPU's
+features; there is no assembly and no C to build.
 
 ## Cross-Compiling
 
