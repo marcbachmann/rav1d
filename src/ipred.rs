@@ -520,6 +520,8 @@ mod rust_simd {
         fn pairs<const HALF: bool>(s: &[Self]) -> (I16x8, I16x8);
         /// Lanes in the pixel range, saturated to it at 8 bpc.
         fn px8(v: I16x8) -> [Self; 8];
+        /// The lanes shifted right by 8, as `u16`.
+        fn hi8(v: I16x8) -> [Self; 8];
         fn from_u32(v: u32) -> Self;
     }
 
@@ -543,6 +545,11 @@ mod rust_simd {
         #[inline(always)]
         fn px8(v: I16x8) -> [Self; 8] {
             v.pack_u8()
+        }
+
+        #[inline(always)]
+        fn hi8(v: I16x8) -> [Self; 8] {
+            v.hi_u8()
         }
 
         #[inline(always)]
@@ -573,6 +580,11 @@ mod rust_simd {
             let mut p = [0; 8];
             v.store_u16(&mut p);
             p
+        }
+
+        #[inline(always)]
+        fn hi8(v: I16x8) -> [Self; 8] {
+            Self::px8(v.shr_u(8))
         }
 
         #[inline(always)]
@@ -746,10 +758,7 @@ mod rust_simd {
         }
     }
 
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn dc_128<BD: BitDepth, const GEN: u8>(
         dst: Rav1dPictureDataComponentOffset,
         topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
@@ -790,14 +799,11 @@ mod rust_simd {
         if size_of::<P>() == 1 {
             let v = c.v_base.add(dt.mul(wv));
             let h = c.h_base.add(wh.mul(dl));
-            return P::px8(
-                match MODE {
-                    SMOOTH => v.avg_u(h),
-                    SMOOTH_V => v,
-                    _ => h,
-                }
-                .shr_u(8),
-            );
+            return P::hi8(match MODE {
+                SMOOTH => v.avg_u(h),
+                SMOOTH_V => v,
+                _ => h,
+            });
         }
         P::px8(match MODE {
             SMOOTH => {
@@ -870,10 +876,7 @@ mod rust_simd {
         }
     }
 
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn smooth_128<BD: BitDepth, const MODE: u8>(
         dst: Rav1dPictureDataComponentOffset,
         topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
@@ -942,10 +945,7 @@ mod rust_simd {
         }
     }
 
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn copy_rows_128<BD: BitDepth, const MODE: u8>(
         dst: Rav1dPictureDataComponentOffset,
         topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
@@ -1017,10 +1017,7 @@ mod rust_simd {
         }
     }
 
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn filter_128<BD: BitDepth>(
         dst: Rav1dPictureDataComponentOffset,
         topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
@@ -1086,10 +1083,7 @@ mod rust_simd {
         }
     }
 
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn cfl_128<BD: BitDepth, const GEN: u8>(
         dst: Rav1dPictureDataComponentOffset,
         topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
@@ -1200,10 +1194,7 @@ mod rust_simd {
         }
     }
 
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn cfl_ac_128<BD: BitDepth, const SS_HOR: bool, const SS_VER: bool>(
         ac: &mut [i16; SCRATCH_AC_TXTP_LEN],
         y_src: Rav1dPictureDataComponentOffset,
@@ -1394,10 +1385,7 @@ mod rust_simd {
     }
 
     /// `dst` has a stride of at least `width`.
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn z1_128<BD: BitDepth>(
         dst: Rav1dPictureDataComponentOffset,
         topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
@@ -1560,10 +1548,7 @@ mod rust_simd {
     }
 
     /// `dst` has a stride of at least `width`.
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn z2_128<BD: BitDepth>(
         dst: Rav1dPictureDataComponentOffset,
         topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
@@ -1598,10 +1583,7 @@ mod rust_simd {
     }
 
     /// `dst` has a stride of at least `width`.
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
+    #[inline(always)]
     fn z3_128<BD: BitDepth>(
         dst: Rav1dPictureDataComponentOffset,
         topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
@@ -1633,6 +1615,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_z1_erased<BD: BitDepth>(
@@ -1665,6 +1651,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_z2_erased<BD: BitDepth>(
@@ -1701,6 +1691,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_z3_erased<BD: BitDepth>(
@@ -1735,6 +1729,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_dc_erased<BD: BitDepth, const GEN: u8>(
@@ -1764,6 +1762,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_copy_erased<BD: BitDepth, const MODE: u8>(
@@ -1797,6 +1799,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_filter_erased<BD: BitDepth>(
@@ -1833,6 +1839,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_smooth_erased<BD: BitDepth, const MODE: u8>(
@@ -1868,6 +1878,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`cfl_pred::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_cfl_erased<BD: BitDepth, const GEN: u8>(
@@ -1902,6 +1916,10 @@ mod rust_simd {
     /// # Safety
     ///
     /// Must be called by [`cfl_ac::Fn::call`], on x86 once the CPU flags hold SSE41.
+    #[cfg_attr(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature(enable = "sse4.1")
+    )]
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn cfl_ac_erased<

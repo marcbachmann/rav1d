@@ -1621,6 +1621,17 @@ mod imp {
             Self(unsafe { _mm_avg_epu16(self.0, o.0) })
         }
 
+        /// The high byte of each lane.
+        #[inline(always)]
+        pub fn hi_u8(self) -> [u8; 8] {
+            let mut out = [0; 8];
+            unsafe {
+                let hi = _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -1, -1, -1, -1, -1, -1, -1);
+                _mm_storel_epi64(out.as_mut_ptr().cast(), _mm_shuffle_epi8(self.0, hi));
+            }
+            out
+        }
+
         #[inline(always)]
         pub fn shr_s_by(self, n: u32) -> Self {
             Self(unsafe { _mm_sra_epi16(self.0, _mm_cvtsi32_si128(n as i32)) })
@@ -2352,6 +2363,14 @@ mod imp {
         #[inline(always)]
         pub fn avg_u(self, o: Self) -> Self {
             Self(s(unsafe { vrhaddq_u16(u(self.0), u(o.0)) }))
+        }
+
+        /// The high byte of each lane.
+        #[inline(always)]
+        pub fn hi_u8(self) -> [u8; 8] {
+            let mut out = [0; 8];
+            unsafe { vst1_u8(out.as_mut_ptr(), vshrn_n_u16::<8>(u(self.0))) };
+            out
         }
 
         #[inline(always)]
@@ -3223,6 +3242,12 @@ mod imp {
             Self(u16x8_avgr(self.0, o.0))
         }
 
+        /// The high byte of each lane.
+        #[inline(always)]
+        pub fn hi_u8(self) -> [u8; 8] {
+            Self(u16x8_shr(self.0, 8)).pack_u8()
+        }
+
         #[inline(always)]
         pub fn shr_s_by(self, n: u32) -> Self {
             Self(i16x8_shr(self.0, n))
@@ -3943,6 +3968,12 @@ mod imp {
             self.zip(o, |a, b| {
                 ((a as u16 as u32 + b as u16 as u32 + 1) >> 1) as i16
             })
+        }
+
+        /// The high byte of each lane.
+        #[inline(always)]
+        pub fn hi_u8(self) -> [u8; 8] {
+            self.0.map(|v| (v as u16 >> 8) as u8)
         }
 
         #[inline(always)]
