@@ -911,6 +911,17 @@ mod imp {
             Self(unsafe { _mm_unpacklo_epi16(self.0, o.0) })
         }
 
+        /// The even lanes of `self` then `o`, and the odd ones.
+        #[inline(always)]
+        pub fn unzip(self, o: Self) -> (Self, Self) {
+            unsafe {
+                let m = _mm_set1_epi32(0xffff);
+                let even = _mm_packus_epi32(_mm_and_si128(self.0, m), _mm_and_si128(o.0, m));
+                let odd = _mm_packus_epi32(_mm_srli_epi32::<16>(self.0), _mm_srli_epi32::<16>(o.0));
+                (Self(even), Self(odd))
+            }
+        }
+
         #[inline(always)]
         pub fn zip_hi16(self, o: Self) -> Self {
             Self(unsafe { _mm_unpackhi_epi16(self.0, o.0) })
@@ -1437,6 +1448,12 @@ mod imp {
         #[inline(always)]
         pub fn zip_lo16(self, o: Self) -> Self {
             Self(unsafe { vzip1q_s16(self.0, o.0) })
+        }
+
+        /// The even lanes of `self` then `o`, and the odd ones.
+        #[inline(always)]
+        pub fn unzip(self, o: Self) -> (Self, Self) {
+            unsafe { (Self(vuzp1q_s16(self.0, o.0)), Self(vuzp2q_s16(self.0, o.0))) }
         }
 
         #[inline(always)]
@@ -1966,6 +1983,15 @@ mod imp {
             Self(i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(self.0, o.0))
         }
 
+        /// The even lanes of `self` then `o`, and the odd ones.
+        #[inline(always)]
+        pub fn unzip(self, o: Self) -> (Self, Self) {
+            (
+                Self(i16x8_shuffle::<0, 2, 4, 6, 8, 10, 12, 14>(self.0, o.0)),
+                Self(i16x8_shuffle::<1, 3, 5, 7, 9, 11, 13, 15>(self.0, o.0)),
+            )
+        }
+
         #[inline(always)]
         pub fn zip_hi16(self, o: Self) -> Self {
             Self(i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(self.0, o.0))
@@ -2419,6 +2445,13 @@ mod imp {
         #[inline(always)]
         pub fn zip_lo16(self, o: Self) -> Self {
             Self(std::array::from_fn(|i| [self.0, o.0][i & 1][i >> 1]))
+        }
+
+        /// The even lanes of `self` then `o`, and the odd ones.
+        #[inline(always)]
+        pub fn unzip(self, o: Self) -> (Self, Self) {
+            let at = |k: usize| [self.0, o.0][k >> 3][k & 7];
+            (Self(std::array::from_fn(|i| at(2 * i))), Self(std::array::from_fn(|i| at(2 * i + 1))))
         }
 
         #[inline(always)]

@@ -467,12 +467,16 @@ unsafe extern "C" fn ipred_cfl_128_c_erased<BD: BitDepth>(
     cfl_pred(dst, width, height, dc, ac, alpha, bd)
 }
 
-/// The intra predictions at 8 bpc with the block width in the type. DC is a fixed-length sum of
-/// the edge and rows stored from a constant array, both of which the compiler vectorizes on every
-/// target; smooth and CfL run on [`I16x8`].
+/// The intra predictions with the block width in the type, on `u8` or `u16` pixels. DC is a
+/// fixed-length sum of the edge and rows stored from a constant array, both of which the compiler
+/// vectorizes on every target; smooth and CfL run on [`I16x8`].
 mod rust_simd {
+    use std::mem::size_of;
+
+    use zerocopy::{AsBytes, FromBytes};
+
     use super::*;
-    use crate::simd128::{transpose8x8, I16x8};
+    use crate::simd128::{transpose8x8, I16x8, I32x4};
 
     pub const SMOOTH: u8 = 0;
     pub const SMOOTH_V: u8 = 1;
@@ -499,111 +503,247 @@ mod rust_simd {
         };
     }
 
-    #[inline(always)]
-    fn sum<const N: usize>(px: &[u8]) -> u32 {
-        px[..N].iter().map(|&p| p as u32).sum()
+    /// `$e` with `$P` the [`Pix`] of `$BD`.
+    macro_rules! with_px {
+        ($BD:ty, |$P:ident| $e:expr) => {
+            if <$BD>::BITDEPTH == 8 {
+                type $P = u8;
+                $e
+            } else {
+                type $P = u16;
+                $e
+            }
+        };
+    }
+
+    /// A pixel as the kernels take it: `u8`, or `u16` above 8 bpc. Every value they compute
+    /// in 16-bit lanes fits up to 12 bpc.
+    pub trait Pix: AsBytes + FromBytes + Copy + Default + Into<u32> {
+        fn load8(s: &[Self]) -> I16x8;
+        /// `s[..4]` into the low four lanes.
+        fn load4(s: &[Self]) -> I16x8;
+        /// The even and the odd pixels of `s[..16]`, or with `HALF` of `s[..8]` in the low
+        /// four lanes.
+        fn pairs<const HALF: bool>(s: &[Self]) -> (I16x8, I16x8);
+        /// Lanes in the pixel range, saturated to it at 8 bpc.
+        fn px8(v: I16x8) -> [Self; 8];
+        fn from_u32(v: u32) -> Self;
+    }
+
+    impl Pix for u8 {
+        #[inline(always)]
+        fn load8(s: &[Self]) -> I16x8 {
+            I16x8::from_u8x8(s)
+        }
+
+        #[inline(always)]
+        fn load4(s: &[Self]) -> I16x8 {
+            I16x8::from_u8x4(s)
+        }
+
+        #[inline(always)]
+        fn pairs<const HALF: bool>(s: &[Self]) -> (I16x8, I16x8) {
+            let v = if HALF { I16x8::from_bytes_half(s) } else { I16x8::from_bytes(s) };
+            (v.and(I16x8::splat(0xff)), v.shr_u(8))
+        }
+
+        #[inline(always)]
+        fn px8(v: I16x8) -> [Self; 8] {
+            v.pack_u8()
+        }
+
+        #[inline(always)]
+        fn from_u32(v: u32) -> Self {
+            v as u8
+        }
+    }
+
+    impl Pix for u16 {
+        #[inline(always)]
+        fn load8(s: &[Self]) -> I16x8 {
+            I16x8::load_u16(s)
+        }
+
+        #[inline(always)]
+        fn load4(s: &[Self]) -> I16x8 {
+            I16x8::load_u16_lo(s)
+        }
+
+        #[inline(always)]
+        fn pairs<const HALF: bool>(s: &[Self]) -> (I16x8, I16x8) {
+            let hi = if HALF { I16x8::splat(0) } else { I16x8::load_u16(&s[8..]) };
+            I16x8::load_u16(s).unzip(hi)
+        }
+
+        #[inline(always)]
+        fn px8(v: I16x8) -> [Self; 8] {
+            let mut p = [0; 8];
+            v.store_u16(&mut p);
+            p
+        }
+
+        #[inline(always)]
+        fn from_u32(v: u32) -> Self {
+            v as u16
+        }
     }
 
     #[inline(always)]
-    fn dc_value<const W: usize, const H: usize, const GEN: u8>(
-        topleft: &[u8; SCRATCH_EDGE_LEN],
+    fn px<P: Pix>(b: &[u8]) -> &[P] {
+        FromBytes::slice_from(b).unwrap()
+    }
+
+    #[inline(always)]
+    fn px_mut<P: Pix>(b: &mut [u8]) -> &mut [P] {
+        FromBytes::mut_slice_from(b).unwrap()
+    }
+
+    #[inline(always)]
+    fn sum<P: Pix, const N: usize>(px: &[P]) -> u32 {
+        px[..N].iter().map(|&p| p.into()).sum()
+    }
+
+    /// `half` is the DC_128 value, half the pixel range.
+    #[inline(always)]
+    fn dc_value<P: Pix, const W: usize, const H: usize, const GEN: u8>(
+        topleft: &[P],
         off: usize,
-    ) -> u8 {
-        let top = || sum::<W>(&topleft[off + 1..]);
-        let left = || sum::<H>(&topleft[off - H..]);
+        half: u32,
+    ) -> P {
+        let top = || sum::<P, W>(&topleft[off + 1..]);
+        let left = || sum::<P, H>(&topleft[off - H..]);
         let dc = match DcGen::from_repr(GEN) {
             Some(DcGen::Top) => top() + (W >> 1) as u32 >> W.trailing_zeros(),
             Some(DcGen::Left) => left() + (H >> 1) as u32 >> H.trailing_zeros(),
             Some(DcGen::TopLeft) => {
                 let dc = top() + left() + ((W + H) >> 1) as u32 >> (W + H).trailing_zeros();
+                // 1/3 and 1/5 in fixed point, finer for the larger sums of `u16` pixels.
+                let (third, fifth, shift) =
+                    if size_of::<P>() == 1 { (0x5556, 0x3334, 16) } else { (0xaaab, 0x6667, 17) };
                 match () {
                     _ if W == H => dc,
-                    _ if W > 2 * H || H > 2 * W => dc * 0x3334 >> 16,
-                    _ => dc * 0x5556 >> 16,
+                    _ if W > 2 * H || H > 2 * W => dc * fifth >> shift,
+                    _ => dc * third >> shift,
                 }
             }
-            None => 128,
+            None => half,
         };
-        dc as u8
+        P::from_u32(dc)
     }
 
     #[inline(always)]
-    fn dc<BD: BitDepth, const W: usize, const H: usize, const GEN: u8>(
+    fn dc<BD: BitDepth, P: Pix, const W: usize, const H: usize, const GEN: u8>(
         dst: Rav1dPictureDataComponentOffset,
-        topleft: &[u8; SCRATCH_EDGE_LEN],
+        topleft: &[P],
         off: usize,
+        half: u32,
     ) {
-        let row = [dc_value::<W, H, GEN>(topleft, off); W];
+        let row = [dc_value::<P, W, H, GEN>(topleft, off, half); W];
         let stride = dst.pixel_stride::<BD>();
         if stride < W as isize {
             for y in 0..H {
                 let dst = dst + y as isize * stride;
-                dst.slice_mut::<BD>(W).as_bytes_mut().copy_from_slice(&row);
+                px_mut::<P>(dst.slice_mut::<BD>(W).as_bytes_mut()).copy_from_slice(&row);
             }
             return;
         }
         // One borrow for the block: its rows are the chunks of a slice ending at the last row.
         let stride = stride as usize;
         let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
-        for r in block.as_bytes_mut().chunks_mut(stride) {
+        for r in px_mut::<P>(block.as_bytes_mut()).chunks_mut(stride) {
             r[..W].copy_from_slice(&row);
         }
     }
 
-    /// `v = 256 * bottom + w_ver * (top - bottom)` and `h` the same across, each in 16 bits that
-    /// wrap: exact, as the true values fit in `u16`. The rounding is in the bases; for SMOOTH,
-    /// `h` carries 255 so that the unsigned average floors to `(v + h + 256) >> 1`.
-    #[inline(always)]
-    fn blend<const MODE: u8>(
+    /// A block's SMOOTH constants: its bottom-left and top-right pixels and the bases below.
+    #[derive(Clone, Copy)]
+    struct Corners {
+        bottom: I16x8,
+        right: I16x8,
         v_base: I16x8,
-        dt: I16x8,
-        wv: I16x8,
         h_base: I16x8,
-        wh: I16x8,
-        dl: I16x8,
-    ) -> [u8; 8] {
-        let v = v_base.add(dt.mul(wv));
-        let h = h_base.add(wh.mul(dl));
-        match MODE {
-            SMOOTH => v.avg_u(h),
-            SMOOTH_V => v,
-            _ => h,
-        }
-        .shr_u(8)
-        .pack_u8()
+        base: I32x4,
     }
 
-    /// `dst` has a stride of at least `W`.
+    /// At 8 bpc, `v = 256 * bottom + w_ver * (top - bottom)` and `h` the same across, each in
+    /// 16 bits that wrap: exact, as the true values fit in `u16`. The rounding is in the bases;
+    /// for SMOOTH, `h` carries 255 so that the unsigned average floors to `(v + h + 256) >> 1`.
+    /// Above, SMOOTH sums the products in 32 bits, and SMOOTH_V and SMOOTH_H take
+    /// `bottom + ((top - bottom) * w + 128 >> 8)` as a rounding multiply-high by `w << 7`.
     #[inline(always)]
-    fn smooth<BD: BitDepth, const W: usize, const MODE: u8>(
-        dst: Rav1dPictureDataComponentOffset,
-        topleft: &[u8; SCRATCH_EDGE_LEN],
+    fn blend<P: Pix, const MODE: u8>(
+        c: Corners,
+        dt: I16x8,
+        wv: I16x8,
+        wh: I16x8,
+        dl: I16x8,
+    ) -> [P; 8] {
+        if size_of::<P>() == 1 {
+            let v = c.v_base.add(dt.mul(wv));
+            let h = c.h_base.add(wh.mul(dl));
+            return P::px8(
+                match MODE {
+                    SMOOTH => v.avg_u(h),
+                    SMOOTH_V => v,
+                    _ => h,
+                }
+                .shr_u(8),
+            );
+        }
+        P::px8(match MODE {
+            SMOOTH => {
+                let [v0, v1] = dt.mul_wide(wv);
+                let [h0, h1] = dl.mul_wide(wh);
+                I32x4::pack(
+                    v0.add(h0).add(c.base).shr_s::<9>(),
+                    v1.add(h1).add(c.base).shr_s::<9>(),
+                )
+            }
+            SMOOTH_V => c.bottom.add(dt.mulhrs(wv)),
+            _ => c.right.add(dl.mulhrs(wh)),
+        })
+    }
+
+    /// `w[..8]` shifted by `k`.
+    #[inline(always)]
+    fn weights(w: &[u8], k: u32) -> I16x8 {
+        I16x8::from_u8x8(w).mul(I16x8::splat(1 << k))
+    }
+
+    /// `block` has a stride of at least `W`.
+    #[inline(always)]
+    fn smooth<P: Pix, const W: usize, const MODE: u8>(
+        block: &mut [P],
+        stride: usize,
+        topleft: &[P],
         off: usize,
         h: usize,
     ) {
+        // The weights as `blend` takes them.
+        let k = if size_of::<P>() > 1 && MODE != SMOOTH { 7 } else { 0 };
         let w_hor = &dav1d_sm_weights.0[W..][..W];
         let w_ver = &dav1d_sm_weights.0[h..][..h];
         let top = &topleft[off + 1..][..W];
         let left = |y: usize| topleft[off - 1 - y];
-        let right = topleft[off + W] as u16;
-        let bottom = topleft[off - h] as u16;
+        let right: u32 = topleft[off + W].into();
+        let bottom: u32 = topleft[off - h].into();
         let (v_round, h_round) = if MODE == SMOOTH { (0, 255) } else { (128, 128) };
-        let v_base = I16x8::splat((bottom * 256 + v_round) as i16);
-        let h_base = I16x8::splat((right * 256 + h_round) as i16);
-        let bottom = I16x8::splat(bottom as i16);
-        let right = I16x8::splat(right as i16);
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((h - 1) * stride + W);
-        let block = block.as_bytes_mut();
+        let c = Corners {
+            bottom: I16x8::splat(bottom as i16),
+            right: I16x8::splat(right as i16),
+            v_base: I16x8::splat((bottom * 256 + v_round) as i16),
+            h_base: I16x8::splat((right * 256 + h_round) as i16),
+            base: I32x4::splat((256 * (bottom + right) + 256) as i32),
+        };
         if W == 4 {
             // Two rows a vector.
-            let dt = I16x8::from_u8x8(&std::array::from_fn::<_, 8, _>(|i| top[i % 4])).sub(bottom);
-            let wh = I16x8::from_u8x8(&std::array::from_fn::<_, 8, _>(|i| w_hor[i % 4]));
+            let dt = P::load8(&std::array::from_fn::<_, 8, _>(|i| top[i % 4])).sub(c.bottom);
+            let wh = weights(&std::array::from_fn::<_, 8, _>(|i| w_hor[i % 4]), k);
             for (y, rows) in block.chunks_mut(2 * stride).enumerate() {
                 let y = 2 * y;
-                let wv = I16x8::from_u8x8(&std::array::from_fn::<_, 8, _>(|i| w_ver[y + i / 4]));
-                let l = I16x8::from_u8x8(&std::array::from_fn::<_, 8, _>(|i| left(y + i / 4)));
-                let p = blend::<MODE>(v_base, dt, wv, h_base, wh, l.sub(right));
+                let wv = weights(&std::array::from_fn::<_, 8, _>(|i| w_ver[y + i / 4]), k);
+                let l = P::load8(&std::array::from_fn::<_, 8, _>(|i| left(y + i / 4)));
+                let p = blend::<P, MODE>(c, dt, wv, wh, l.sub(c.right));
                 rows[..4].copy_from_slice(&p[..4]);
                 rows[stride..][..4].copy_from_slice(&p[4..]);
             }
@@ -612,15 +752,14 @@ mod rust_simd {
         let mut dt = [I16x8::splat(0); 8];
         let mut wh = [I16x8::splat(0); 8];
         for i in 0..W / 8 {
-            dt[i] = I16x8::from_u8x8(&top[8 * i..]).sub(bottom);
-            wh[i] = I16x8::from_u8x8(&w_hor[8 * i..]);
+            dt[i] = P::load8(&top[8 * i..]).sub(c.bottom);
+            wh[i] = weights(&w_hor[8 * i..], k);
         }
         for (y, row) in block.chunks_mut(stride).enumerate() {
-            let wv = I16x8::splat(w_ver[y] as i16);
-            let dl = I16x8::splat(left(y) as i16).sub(right);
+            let wv = I16x8::splat((w_ver[y] as i16) << k);
+            let dl = I16x8::splat(left(y).into() as i16).sub(c.right);
             for i in 0..W / 8 {
-                let p = blend::<MODE>(v_base, dt[i], wv, h_base, wh[i], dl);
-                row[8 * i..][..8].copy_from_slice(&p);
+                row[8 * i..][..8].copy_from_slice(&blend::<P, MODE>(c, dt[i], wv, wh[i], dl));
             }
         }
     }
@@ -631,52 +770,56 @@ mod rust_simd {
     )]
     fn smooth_128<BD: BitDepth, const MODE: u8>(
         dst: Rav1dPictureDataComponentOffset,
-        topleft: &[u8; SCRATCH_EDGE_LEN],
+        topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
         off: usize,
         w: c_int,
         h: usize,
     ) {
-        match w {
-            4 => smooth::<BD, 4, MODE>(dst, topleft, off, h),
-            8 => smooth::<BD, 8, MODE>(dst, topleft, off, h),
-            16 => smooth::<BD, 16, MODE>(dst, topleft, off, h),
-            32 => smooth::<BD, 32, MODE>(dst, topleft, off, h),
-            64 => smooth::<BD, 64, MODE>(dst, topleft, off, h),
-            _ => unreachable!(),
-        }
+        let stride = dst.pixel_stride::<BD>() as usize;
+        let mut block = dst.slice_mut::<BD>((h - 1) * stride + w as usize);
+        with_px!(BD, |P| {
+            let (b, t) = (px_mut::<P>(block.as_bytes_mut()), px::<P>(topleft.as_bytes()));
+            match w {
+                4 => smooth::<P, 4, MODE>(b, stride, t, off, h),
+                8 => smooth::<P, 8, MODE>(b, stride, t, off, h),
+                16 => smooth::<P, 16, MODE>(b, stride, t, off, h),
+                32 => smooth::<P, 32, MODE>(b, stride, t, off, h),
+                64 => smooth::<P, 64, MODE>(b, stride, t, off, h),
+                _ => unreachable!(),
+            }
+        })
     }
 
-    /// `dc + sign(alpha * ac) * ((|alpha * ac| + 32) >> 6)`, where the product fits as
-    /// `|ac| <= 2040` and `|alpha| <= 16`.
+    /// `dc + sign(alpha * ac) * ((|alpha * ac| + 32) >> 6)` clipped to the pixels, with
+    /// `alpha` as `|alpha| << 9` and its sign in `neg`: the rounding multiply-high of
+    /// `|ac| <= 8 << 12` divides by 64.
     #[inline(always)]
-    fn cfl_px(ac: I16x8, alpha: I16x8, dc: I16x8) -> [u8; 8] {
-        let x = ac.mul(alpha);
-        x.abs()
-            .add(I16x8::splat(32))
-            .shr_s::<6>()
-            .with_sign_of(x)
-            .add(dc)
-            .pack_u8()
+    fn cfl_px<P: Pix>(ac: I16x8, alpha: I16x8, neg: bool, dc: I16x8, max: I16x8) -> [P; 8] {
+        let m = ac.abs().mulhrs(alpha).with_sign_of(ac);
+        let p = if neg { dc.sub(m) } else { dc.add(m) };
+        P::px8(if size_of::<P>() == 1 { p } else { p.max(I16x8::splat(0)).min(max) })
     }
 
-    /// `dst` has a stride of at least `W`.
+    /// `block` has a stride of at least `W`.
     #[inline(always)]
-    fn cfl<BD: BitDepth, const W: usize, const H: usize, const GEN: u8>(
-        dst: Rav1dPictureDataComponentOffset,
-        topleft: &[u8; SCRATCH_EDGE_LEN],
+    fn cfl<P: Pix, const W: usize, const H: usize, const GEN: u8>(
+        block: &mut [P],
+        stride: usize,
+        topleft: &[P],
         off: usize,
         ac: &[i16; SCRATCH_AC_TXTP_LEN],
         alpha: c_int,
+        bitdepth_max: c_int,
     ) {
-        let dc = I16x8::splat(dc_value::<W, H, GEN>(topleft, off) as i16);
-        let alpha = I16x8::splat(alpha as i16);
+        let half = (bitdepth_max + 1) as u32 >> 1;
+        let dc = I16x8::splat(dc_value::<P, W, H, GEN>(topleft, off, half).into() as i16);
+        let max = I16x8::splat(bitdepth_max as i16);
+        let neg = alpha < 0;
+        let alpha = I16x8::splat((alpha.unsigned_abs() << 9) as i16);
         let ac = &ac[..W * H];
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
-        let block = block.as_bytes_mut();
         if W == 4 {
             for (rows, ac) in block.chunks_mut(2 * stride).zip(ac.chunks_exact(8)) {
-                let p = cfl_px(I16x8::load(ac), alpha, dc);
+                let p = cfl_px::<P>(I16x8::load(ac), alpha, neg, dc, max);
                 rows[..4].copy_from_slice(&p[..4]);
                 rows[stride..][..4].copy_from_slice(&p[4..]);
             }
@@ -684,7 +827,7 @@ mod rust_simd {
         }
         for (row, ac) in block.chunks_mut(stride).zip(ac.chunks_exact(W)) {
             for i in 0..W / 8 {
-                let p = cfl_px(I16x8::load(&ac[8 * i..]), alpha, dc);
+                let p = cfl_px::<P>(I16x8::load(&ac[8 * i..]), alpha, neg, dc, max);
                 row[8 * i..][..8].copy_from_slice(&p);
             }
         }
@@ -696,46 +839,54 @@ mod rust_simd {
     )]
     fn cfl_128<BD: BitDepth, const GEN: u8>(
         dst: Rav1dPictureDataComponentOffset,
-        topleft: &[u8; SCRATCH_EDGE_LEN],
+        topleft: &[BD::Pixel; SCRATCH_EDGE_LEN],
         off: usize,
         width: c_int,
         height: c_int,
         ac: &[i16; SCRATCH_AC_TXTP_LEN],
         alpha: c_int,
+        bitdepth_max: c_int,
     ) {
-        by_size!(width, height, |W, H| cfl::<BD, W, H, GEN>(
-            dst, topleft, off, ac, alpha
-        ))
+        let stride = dst.pixel_stride::<BD>() as usize;
+        let mut block = dst.slice_mut::<BD>((height as usize - 1) * stride + width as usize);
+        with_px!(BD, |P| {
+            let (b, t) = (px_mut::<P>(block.as_bytes_mut()), px::<P>(topleft.as_bytes()));
+            by_size!(width, height, |W, H| cfl::<P, W, H, GEN>(
+                b,
+                stride,
+                t,
+                off,
+                ac,
+                alpha,
+                bitdepth_max
+            ))
+        })
     }
 
     /// Luma at chroma column `x` of one row, the pairs across summed when subsampled: the low
     /// `HALF` four lanes, or eight.
     #[inline(always)]
-    fn luma_row<const SS_HOR: bool, const HALF: bool>(r: &[u8], x: usize) -> I16x8 {
+    fn luma_row<P: Pix, const SS_HOR: bool, const HALF: bool>(r: &[P], x: usize) -> I16x8 {
         match (SS_HOR, HALF) {
             (true, _) => {
-                let v = if HALF {
-                    I16x8::from_bytes_half(&r[2 * x..])
-                } else {
-                    I16x8::from_bytes(&r[2 * x..])
-                };
-                v.and(I16x8::splat(0xff)).add(v.shr_u(8))
+                let (even, odd) = P::pairs::<HALF>(&r[2 * x..]);
+                even.add(odd)
             }
-            (false, true) => I16x8::from_u8x4(&r[x..]),
-            (false, false) => I16x8::from_u8x8(&r[x..]),
+            (false, true) => P::load4(&r[x..]),
+            (false, false) => P::load8(&r[x..]),
         }
     }
 
     /// The subsampled sum scaled to eight times a pixel.
     #[inline(always)]
-    fn luma<const SS_HOR: bool, const SS_VER: bool, const HALF: bool>(
-        r0: &[u8],
-        r1: &[u8],
+    fn luma<P: Pix, const SS_HOR: bool, const SS_VER: bool, const HALF: bool>(
+        r0: &[P],
+        r1: &[P],
         x: usize,
     ) -> I16x8 {
-        let mut v = luma_row::<SS_HOR, HALF>(r0, x);
+        let mut v = luma_row::<P, SS_HOR, HALF>(r0, x);
         if SS_VER {
-            v = v.add(luma_row::<SS_HOR, HALF>(r1, x));
+            v = v.add(luma_row::<P, SS_HOR, HALF>(r1, x));
         }
         for _ in 0..1 + !SS_VER as u8 + !SS_HOR as u8 {
             v = v.add(v);
@@ -744,7 +895,7 @@ mod rust_simd {
     }
 
     #[inline(always)]
-    fn cfl_ac_rows<BD: BitDepth, const W: usize, const SS_HOR: bool, const SS_VER: bool>(
+    fn cfl_ac_rows<BD: BitDepth, P: Pix, const W: usize, const SS_HOR: bool, const SS_VER: bool>(
         ac: &mut [i16; SCRATCH_AC_TXTP_LEN],
         y_src: Rav1dPictureDataComponentOffset,
         w_pad: usize,
@@ -760,14 +911,15 @@ mod rust_simd {
             let src = y_src + (y as isize * stride << SS_VER as u8);
             let r0 = src.slice::<BD>(lw);
             let r1 = SS_VER.then(|| (src + stride).slice::<BD>(lw));
-            let (r0, r1) = (r0.as_bytes(), r1.as_deref().map_or(&[][..], |r| r.as_bytes()));
+            let r0 = px::<P>(r0.as_bytes());
+            let r1 = r1.as_deref().map_or(&[][..], |r| px::<P>(r.as_bytes()));
             let mut x = 0;
             while x + 8 <= wv {
-                luma::<SS_HOR, SS_VER, false>(r0, r1, x).store(&mut row[x..]);
+                luma::<P, SS_HOR, SS_VER, false>(r0, r1, x).store(&mut row[x..]);
                 x += 8;
             }
             if x < wv {
-                luma::<SS_HOR, SS_VER, true>(r0, r1, x).store_lo(&mut row[x..]);
+                luma::<P, SS_HOR, SS_VER, true>(r0, r1, x).store_lo(&mut row[x..]);
             }
             let last = row[wv - 1];
             row[wv..].fill(last);
@@ -776,23 +928,27 @@ mod rust_simd {
             ac.copy_within((hv - 1) * W..hv * W, y * W);
         }
 
-        // Each lane adds at most 32 values below 2048, which fits in `u16`.
-        let mut acc = [I16x8::splat(0); 4];
-        let mut quads = ac.chunks_exact(32);
-        for q in &mut quads {
-            for i in 0..4 {
-                acc[i] = acc[i].add(I16x8::load(&q[8 * i..]));
+        // A lane adds values below `8 << bitdepth` in 16 bits: 32 of them at 8 bpc, one above.
+        let group = if size_of::<P>() == 1 { 32 * 32 } else { 32 };
+        let mut wide = [I32x4::splat(0); 2];
+        for g in ac.chunks(group) {
+            let mut acc = [I16x8::splat(0); 4];
+            let mut quads = g.chunks_exact(32);
+            for q in &mut quads {
+                for i in 0..4 {
+                    acc[i] = acc[i].add(I16x8::load(&q[8 * i..]));
+                }
+            }
+            for (i, c) in quads.remainder().chunks_exact(8).enumerate() {
+                acc[i] = acc[i].add(I16x8::load(c));
+            }
+            for v in acc {
+                wide = v.addw_u(wide);
             }
         }
-        for (i, c) in quads.remainder().chunks_exact(8).enumerate() {
-            acc[i] = acc[i].add(I16x8::load(c));
-        }
-        let mut sum = 0;
-        for v in acc {
-            for l in v.to_array() {
-                sum += l as u16 as u32;
-            }
-        }
+        let mut lanes = [0; 4];
+        wide[0].add(wide[1]).store(&mut lanes);
+        let sum = lanes.iter().sum::<i32>() as u32;
         let log2sz = W.trailing_zeros() + h.trailing_zeros();
         let mean = I16x8::splat((sum + (1 << log2sz >> 1) >> log2sz) as i16);
         for c in ac.chunks_exact_mut(8) {
@@ -812,13 +968,13 @@ mod rust_simd {
         w: c_int,
         h: usize,
     ) {
-        match w {
-            4 => cfl_ac_rows::<BD, 4, SS_HOR, SS_VER>(ac, y_src, w_pad, h_pad, h),
-            8 => cfl_ac_rows::<BD, 8, SS_HOR, SS_VER>(ac, y_src, w_pad, h_pad, h),
-            16 => cfl_ac_rows::<BD, 16, SS_HOR, SS_VER>(ac, y_src, w_pad, h_pad, h),
-            32 => cfl_ac_rows::<BD, 32, SS_HOR, SS_VER>(ac, y_src, w_pad, h_pad, h),
+        with_px!(BD, |P| match w {
+            4 => cfl_ac_rows::<BD, P, 4, SS_HOR, SS_VER>(ac, y_src, w_pad, h_pad, h),
+            8 => cfl_ac_rows::<BD, P, 8, SS_HOR, SS_VER>(ac, y_src, w_pad, h_pad, h),
+            16 => cfl_ac_rows::<BD, P, 16, SS_HOR, SS_VER>(ac, y_src, w_pad, h_pad, h),
+            32 => cfl_ac_rows::<BD, P, 32, SS_HOR, SS_VER>(ac, y_src, w_pad, h_pad, h),
             _ => unreachable!(),
-        }
+        })
     }
 
     /// Room for a directional edge up to `max <= 127`, padded past it by [`dir_rows`].
@@ -827,25 +983,24 @@ mod rust_simd {
     /// `a + ((b - a) * frac + 32 >> 6)` for `a = e[i + STEP * x]`, `b` the next, with `frac`
     /// scaled by `1 << 9` so that the rounding multiply-high divides by 64.
     #[inline(always)]
-    fn dir8<const STEP: usize>(e: &[u8], i: usize, frac: I16x8) -> [u8; 8] {
+    fn dir8<P: Pix, const STEP: usize>(e: &[P], i: usize, frac: I16x8) -> [P; 8] {
         let (a, b) = if STEP == 1 {
-            (I16x8::from_u8x8(&e[i..]), I16x8::from_u8x8(&e[i + 1..]))
+            (P::load8(&e[i..]), P::load8(&e[i + 1..]))
         } else {
-            let v = I16x8::from_bytes(&e[i..]);
-            (v.and(I16x8::splat(0xff)), v.shr_u(8))
+            P::pairs::<false>(&e[i..])
         };
-        a.add(b.sub(a).mulhrs(frac)).pack_u8()
+        P::px8(a.add(b.sub(a).mulhrs(frac)))
     }
 
     /// `n` rows of `W` pixels `os` apart in `out`, row `r` read from `e` at `(r + 1) * d / 64`
     /// with steps of `STEP`: the directional prediction along an edge whose last pixel is
     /// `e[max]`. The edge is padded with that pixel, which the rows past it take.
     #[inline(always)]
-    fn dir_rows<const W: usize, const STEP: usize>(
-        out: &mut [u8],
+    fn dir_rows<P: Pix, const W: usize, const STEP: usize>(
+        out: &mut [P],
         os: usize,
         n: usize,
-        e: &mut [u8; EXT],
+        e: &mut [P; EXT],
         max: usize,
         d: usize,
     ) {
@@ -861,21 +1016,22 @@ mod rust_simd {
             let frac = I16x8::splat(((pos & 0x3e) << 9) as i16);
             for x in (0..W).step_by(8) {
                 let k = (W - x).min(8);
-                row[x..x + k].copy_from_slice(&dir8::<STEP>(e, base + STEP * x, frac)[..k]);
+                row[x..x + k].copy_from_slice(&dir8::<P, STEP>(e, base + STEP * x, frac)[..k]);
             }
         }
     }
 
-    /// [`filter_edge`] at 8 bpc: the clipped input laid out once, padded with its end pixels,
-    /// then the 5-tap kernel over 8 outputs at a time; the outputs outside `lim_from..lim_to`
-    /// are the input copied.
+    /// [`filter_edge`] in vectors: the clipped input laid out once, padded with its end
+    /// pixels, then the 5-tap kernel over 8 outputs at a time; the outputs outside
+    /// `lim_from..lim_to` are the input copied. The sums wrap in 16 bits, but their true
+    /// values fit in `u16`.
     #[inline(always)]
-    fn filter_edge8(
-        out: &mut [u8],
+    fn filter_edge_px<P: Pix>(
+        out: &mut [P],
         sz: usize,
         lim_from: usize,
         lim_to: usize,
-        r#in: &[u8; SCRATCH_EDGE_LEN],
+        r#in: &[P],
         in_off: usize,
         from: isize,
         to: isize,
@@ -884,7 +1040,7 @@ mod rust_simd {
         static KERNEL: [[i16; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
 
         // `p[k]` is the input at `clip(k - 2, from, to - 1)`.
-        let mut p = [0u8; 128 + 4 + 8];
+        let mut p = [P::default(); 128 + 4 + 8];
         let at = |i: isize| r#in[in_off.wrapping_add_signed(i)];
         let lo = (from + 2).clamp(0, (sz + 4) as isize) as usize;
         let hi = (to + 2).clamp(lo as isize, (sz + 4) as isize) as usize;
@@ -895,17 +1051,17 @@ mod rust_simd {
         for i in (0..sz).step_by(8) {
             let mut s = I16x8::splat(8);
             for j in 0..5 {
-                s = s.add(I16x8::from_u8x8(&p[i + j..]).mul(k[j]));
+                s = s.add(P::load8(&p[i + j..]).mul(k[j]));
             }
             let n = (sz - i).min(8);
-            out[i..i + n].copy_from_slice(&s.shr_u(4).pack_u8()[..n]);
+            out[i..i + n].copy_from_slice(&P::px8(s.shr_u(4))[..n]);
         }
         for i in (0..lim_from.min(sz)).chain(lim_to.min(sz)..sz) {
             out[i] = p[i + 2];
         }
     }
 
-    /// [`filter_edge8`] in the shape of [`filter_edge`], for the edge helpers.
+    /// [`filter_edge_px`] in the shape of [`filter_edge`], for the edge helpers.
     #[inline(always)]
     fn filter_edge_simd<BD: BitDepth>(
         out: &mut [BD::Pixel],
@@ -919,17 +1075,23 @@ mod rust_simd {
         strength: c_int,
     ) {
         let [sz, lim_from, lim_to, strength] = [sz, lim_from, lim_to, strength].map(|v| v.max(0) as usize);
-        filter_edge8(
-            out.as_bytes_mut(),
+        with_px!(BD, |P| filter_edge_px::<P>(
+            px_mut(out.as_bytes_mut()),
             sz,
             lim_from,
             lim_to,
-            r#in.as_bytes().try_into().unwrap(),
+            px(r#in.as_bytes()),
             in_off,
             from as isize,
             to as isize,
             strength,
-        )
+        ))
+    }
+
+    /// The edge `e` as `P`s, as long as it is.
+    #[inline(always)]
+    fn edge_px<P: Pix, const N: usize>(e: &mut [u8]) -> &mut [P; N] {
+        px_mut::<P>(e).try_into().unwrap()
     }
 
     /// `dst` has a stride of at least `width`.
@@ -949,21 +1111,23 @@ mod rust_simd {
         let mut e = [0.into(); EXT];
         let (dx, max, upsample) =
             z1_edge::<BD>(&mut e, topleft, off, width, height, angle, bd, filter_edge_simd::<BD>);
-        let e: &mut [u8; EXT] = e.as_bytes_mut().try_into().unwrap();
         let (w, h, dx) = (width as usize, height as usize, dx as usize);
         let stride = dst.pixel_stride::<BD>() as usize;
         let mut block = dst.slice_mut::<BD>((h - 1) * stride + w);
-        let block = block.as_bytes_mut();
-        match (w, upsample) {
-            (4, false) => dir_rows::<4, 1>(block, stride, h, e, max, dx),
-            (8, false) => dir_rows::<8, 1>(block, stride, h, e, max, dx),
-            (16, false) => dir_rows::<16, 1>(block, stride, h, e, max, dx),
-            (32, false) => dir_rows::<32, 1>(block, stride, h, e, max, dx),
-            (64, false) => dir_rows::<64, 1>(block, stride, h, e, max, dx),
-            (4, true) => dir_rows::<4, 2>(block, stride, h, e, max, dx),
-            (8, true) => dir_rows::<8, 2>(block, stride, h, e, max, dx),
-            _ => unreachable!(),
-        }
+        with_px!(BD, |P| {
+            let e = edge_px::<P, EXT>(e.as_bytes_mut());
+            let block = px_mut::<P>(block.as_bytes_mut());
+            match (w, upsample) {
+                (4, false) => dir_rows::<P, 4, 1>(block, stride, h, e, max, dx),
+                (8, false) => dir_rows::<P, 8, 1>(block, stride, h, e, max, dx),
+                (16, false) => dir_rows::<P, 16, 1>(block, stride, h, e, max, dx),
+                (32, false) => dir_rows::<P, 32, 1>(block, stride, h, e, max, dx),
+                (64, false) => dir_rows::<P, 64, 1>(block, stride, h, e, max, dx),
+                (4, true) => dir_rows::<P, 4, 2>(block, stride, h, e, max, dx),
+                (8, true) => dir_rows::<P, 8, 2>(block, stride, h, e, max, dx),
+                _ => unreachable!(),
+            }
+        })
     }
 
     /// The length of a scratch column, a block side and the 8 lanes a step may write past it.
@@ -971,7 +1135,7 @@ mod rust_simd {
 
     /// The `W` columns of `t`, `H` pixels each, as the rows of `out`, `os` apart.
     #[inline(always)]
-    fn transpose_cols<const W: usize, const H: usize>(t: &[[u8; TS]; W], out: &mut [u8], os: usize) {
+    fn transpose_cols<P: Pix, const W: usize, const H: usize>(t: &[[P; TS]; W], out: &mut [P], os: usize) {
         if W % 8 != 0 || H % 8 != 0 {
             for (y, row) in out.chunks_mut(os).take(H).enumerate() {
                 for x in 0..W {
@@ -985,11 +1149,11 @@ mod rust_simd {
                 // A loop, not a closure: a closure would not inherit the kernel's target features.
                 let mut v = [I16x8::splat(0); 8];
                 for i in 0..8 {
-                    v[i] = I16x8::from_u8x8(&t[x + i][y..]);
+                    v[i] = P::load8(&t[x + i][y..]);
                 }
                 transpose8x8(&mut v);
                 for (i, v) in v.into_iter().enumerate() {
-                    out[(y + i) * os + x..][..8].copy_from_slice(&v.pack_u8());
+                    out[(y + i) * os + x..][..8].copy_from_slice(&P::px8(v));
                 }
             }
         }
@@ -997,26 +1161,25 @@ mod rust_simd {
 
     /// Z3 is Z1 along the left edge read upwards, its columns the rows of `t`.
     #[inline(always)]
-    fn z3<BD: BitDepth, const W: usize, const H: usize, const STEP: usize>(
-        dst: Rav1dPictureDataComponentOffset,
-        e: &mut [u8; EXT],
+    fn z3<P: Pix, const W: usize, const H: usize, const STEP: usize>(
+        block: &mut [P],
+        stride: usize,
+        e: &mut [P; EXT],
         dy: usize,
         max: usize,
     ) {
-        let mut t = [[0u8; TS]; W];
-        dir_rows::<H, STEP>(t.as_flattened_mut(), TS, W, e, max, dy);
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
-        transpose_cols::<W, H>(&t, block.as_bytes_mut(), stride);
+        let mut t = [[P::default(); TS]; W];
+        dir_rows::<P, H, STEP>(t.as_flattened_mut(), TS, W, e, max, dy);
+        transpose_cols::<P, W, H>(&t, block, stride);
     }
 
     /// Two-tap interpolation of 8 pixels from `e[i..]`, the steps 2 apart where upsampled.
     #[inline(always)]
-    fn dir8_at(e: &[u8], i: usize, frac: I16x8, upsampled: bool) -> [u8; 8] {
+    fn dir8_at<P: Pix>(e: &[P], i: usize, frac: I16x8, upsampled: bool) -> [P; 8] {
         if upsampled {
-            dir8::<2>(e, i, frac)
+            dir8::<P, 2>(e, i, frac)
         } else {
-            dir8::<1>(e, i, frac)
+            dir8::<P, 1>(e, i, frac)
         }
     }
 
@@ -1025,9 +1188,10 @@ mod rust_simd {
     /// fraction, so the left part runs per column into a scratch turned into rows; the top part
     /// runs per row.
     #[inline(always)]
-    fn z2<BD: BitDepth, const W: usize, const H: usize>(
-        dst: Rav1dPictureDataComponentOffset,
-        edge: &[u8; 64 + 64 + 1],
+    fn z2<P: Pix, const W: usize, const H: usize>(
+        block: &mut [P],
+        stride: usize,
+        edge: &[P; 64 + 64 + 1],
         dx: usize,
         dy: usize,
         up_above: bool,
@@ -1037,9 +1201,9 @@ mod rust_simd {
         // the pixel `j` below it; the pads take the lanes before a row's or column's start.
         const TL: usize = 80;
         const PAD: usize = 16;
-        let mut e = [0u8; TL + 65 + 16];
+        let mut e = [P::default(); TL + 65 + 16];
         e[TL - 64..][..129].copy_from_slice(edge);
-        let mut r = [0u8; PAD + 128];
+        let mut r = [P::default(); PAD + 128];
         for (j, r) in r[PAD..][..65].iter_mut().enumerate() {
             *r = edge[64 - j];
         }
@@ -1060,7 +1224,7 @@ mod rust_simd {
             split[y] = s;
         }
 
-        let mut t = [[0u8; TS]; W];
+        let mut t = [[P::default(); TS]; W];
         for x in 0..left_cols {
             let c = (dy * (x + 1)) as isize;
             let frac = I16x8::splat(((-c & 0x3e) << 9) as i16);
@@ -1070,16 +1234,14 @@ mod rust_simd {
                 t[x][y..y + 8].copy_from_slice(&dir8_at(&r, j, frac, up_left));
             }
         }
-        let mut left = [[0u8; 64]; H];
+        let mut left = [[P::default(); 64]; H];
         if left_cols != 0 {
-            transpose_cols::<W, H>(&t, left.as_flattened_mut(), 64);
+            transpose_cols::<P, W, H>(&t, left.as_flattened_mut(), 64);
         }
 
-        let stride = dst.pixel_stride::<BD>() as usize;
-        let mut block = dst.slice_mut::<BD>((H - 1) * stride + W);
-        for (y, row) in block.as_bytes_mut().chunks_mut(stride).enumerate() {
+        for (y, row) in block.chunks_mut(stride).enumerate() {
             let s = split[y];
-            let mut px = [0u8; 64 + 8];
+            let mut px = [P::default(); 64 + 8];
             if s < W {
                 let pos = xpos(y);
                 let frac = I16x8::splat(((pos & 0x3e) << 9) as i16);
@@ -1122,11 +1284,16 @@ mod rust_simd {
             bd,
             filter_edge_simd::<BD>,
         );
-        let edge: &[u8; 64 + 64 + 1] = edge.as_bytes().try_into().unwrap();
         let (dx, dy) = (dx as usize, dy as usize);
-        by_size!(width, height, |W, H| z2::<BD, W, H>(
-            dst, edge, dx, dy, up_above, up_left
-        ))
+        let stride = dst.pixel_stride::<BD>() as usize;
+        let mut block = dst.slice_mut::<BD>((height as usize - 1) * stride + width as usize);
+        with_px!(BD, |P| {
+            let edge = edge_px::<P, { 64 + 64 + 1 }>(edge.as_bytes_mut());
+            let block = px_mut::<P>(block.as_bytes_mut());
+            by_size!(width, height, |W, H| z2::<P, W, H>(
+                block, stride, edge, dx, dy, up_above, up_left
+            ))
+        })
     }
 
     /// `dst` has a stride of at least `width`.
@@ -1146,23 +1313,26 @@ mod rust_simd {
         let mut left = [0.into(); 64 + 64];
         let (dy, left_off, max, upsample) =
             z3_edge::<BD>(&mut left, topleft, off, width, height, angle, bd, filter_edge_simd::<BD>);
-        let left = left.as_bytes();
-        let mut e = [0; EXT];
-        for (i, e) in e[..=max].iter_mut().enumerate() {
-            *e = left[left_off - i];
-        }
-        let e = &mut e;
-        by_size!(width, height, |W, H| if upsample {
-            z3::<BD, W, H, 2>(dst, e, dy, max)
-        } else {
-            z3::<BD, W, H, 1>(dst, e, dy, max)
+        let stride = dst.pixel_stride::<BD>() as usize;
+        let mut block = dst.slice_mut::<BD>((height as usize - 1) * stride + width as usize);
+        with_px!(BD, |P| {
+            let left = px::<P>(left.as_bytes());
+            let mut e = [P::default(); EXT];
+            for (i, e) in e[..=max].iter_mut().enumerate() {
+                *e = left[left_off - i];
+            }
+            let (e, block) = (&mut e, px_mut::<P>(block.as_bytes_mut()));
+            by_size!(width, height, |W, H| if upsample {
+                z3::<P, W, H, 2>(block, stride, e, dy, max)
+            } else {
+                z3::<P, W, H, 1>(block, stride, e, dy, max)
+            })
         })
     }
 
     /// # Safety
     ///
-    /// Must be called by [`angular_ipred::Fn::call`] at 8 bpc, on x86 once the CPU flags hold
-    /// SSE41.
+    /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_z1_erased<BD: BitDepth>(
@@ -1194,8 +1364,7 @@ mod rust_simd {
 
     /// # Safety
     ///
-    /// Must be called by [`angular_ipred::Fn::call`] at 8 bpc, on x86 once the CPU flags hold
-    /// SSE41.
+    /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_z2_erased<BD: BitDepth>(
@@ -1231,8 +1400,7 @@ mod rust_simd {
 
     /// # Safety
     ///
-    /// Must be called by [`angular_ipred::Fn::call`] at 8 bpc, on x86 once the CPU flags hold
-    /// SSE41.
+    /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_z3_erased<BD: BitDepth>(
@@ -1266,7 +1434,7 @@ mod rust_simd {
     ///
     /// # Safety
     ///
-    /// Must be called by [`angular_ipred::Fn::call`] at 8 bpc.
+    /// Must be called by [`angular_ipred::Fn::call`].
     #[deny(unsafe_op_in_unsafe_fn)]
     pub unsafe extern "C" fn ipred_dc_erased<BD: BitDepth, const GEN: u8>(
         _dst_ptr: *mut DynPixel,
@@ -1277,7 +1445,7 @@ mod rust_simd {
         _a: c_int,
         _max_width: c_int,
         _max_height: c_int,
-        _bitdepth_max: c_int,
+        bitdepth_max: c_int,
         topleft_off: usize,
         dst: FFISafeRav1dPictureDataComponentOffset,
     ) {
@@ -1285,20 +1453,23 @@ mod rust_simd {
         let dst = unsafe { FFISafe::from_with_offset(dst) };
         // SAFETY: `fn angular_ipred::Fn::call` makes `topleft` `topleft_off` from the beginning of the array.
         let topleft = unsafe { reconstruct_topleft::<BD>(topleft, topleft_off) };
-        let topleft: &[u8; SCRATCH_EDGE_LEN] = topleft.as_bytes().try_into().unwrap();
-        by_size!(width, height, |W, H| dc::<BD, W, H, GEN>(
-            dst,
-            topleft,
-            topleft_off
-        ))
+        let half = (bitdepth_max + 1) as u32 >> 1;
+        with_px!(BD, |P| {
+            let topleft = px::<P>(topleft.as_bytes());
+            by_size!(width, height, |W, H| dc::<BD, P, W, H, GEN>(
+                dst,
+                topleft,
+                topleft_off,
+                half
+            ))
+        })
     }
 
     /// `MODE` is [`SMOOTH`], [`SMOOTH_V`] or [`SMOOTH_H`].
     ///
     /// # Safety
     ///
-    /// Must be called by [`angular_ipred::Fn::call`] at 8 bpc, on x86 once the CPU flags hold
-    /// SSE41.
+    /// Must be called by [`angular_ipred::Fn::call`], on x86 once the CPU flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_smooth_erased<BD: BitDepth, const MODE: u8>(
@@ -1325,7 +1496,6 @@ mod rust_simd {
                 _ => ipred_smooth_h_rust::<BD>(dst, topleft, topleft_off, width, height),
             };
         }
-        let topleft: &[u8; SCRATCH_EDGE_LEN] = topleft.as_bytes().try_into().unwrap();
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
         unsafe { smooth_128::<BD, MODE>(dst, topleft, topleft_off, width, height as usize) }
     }
@@ -1334,7 +1504,7 @@ mod rust_simd {
     ///
     /// # Safety
     ///
-    /// Must be called by [`cfl_pred::Fn::call`] at 8 bpc, on x86 once the CPU flags hold SSE41.
+    /// Must be called by [`cfl_pred::Fn::call`], on x86 once the CPU flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn ipred_cfl_erased<BD: BitDepth, const GEN: u8>(
@@ -1356,18 +1526,19 @@ mod rust_simd {
         if dst.pixel_stride::<BD>() < width as isize {
             let dc = match DcGen::from_repr(GEN) {
                 Some(g) => g.call::<BD>(topleft, topleft_off, width, height) as c_int,
-                None => 128,
+                None => (bitdepth_max + 1) >> 1,
             };
             return super::cfl_pred(dst, width, height, dc, ac, alpha, BD::from_c(bitdepth_max));
         }
-        let topleft: &[u8; SCRATCH_EDGE_LEN] = topleft.as_bytes().try_into().unwrap();
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
-        unsafe { cfl_128::<BD, GEN>(dst, topleft, topleft_off, width, height, ac, alpha) }
+        unsafe {
+            cfl_128::<BD, GEN>(dst, topleft, topleft_off, width, height, ac, alpha, bitdepth_max)
+        }
     }
 
     /// # Safety
     ///
-    /// Must be called by [`cfl_ac::Fn::call`] at 8 bpc, on x86 once the CPU flags hold SSE41.
+    /// Must be called by [`cfl_ac::Fn::call`], on x86 once the CPU flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
     pub unsafe extern "C" fn cfl_ac_erased<
@@ -3218,15 +3389,12 @@ impl Rav1dIntraPredDSPContext {
         self.init_rust_simd::<BD>(flags)
     }
 
-    /// The Rust kernels at 8 bpc; they stand in where there is no asm, or over it with
+    /// The Rust kernels; they stand in where there is no asm, or over it with
     /// `--cfg rav1d_rust_simd="ipred"`.
     #[inline(always)]
     const fn init_rust_simd<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
         use self::rust_simd::*;
 
-        if BD::BITDEPTH != 8 {
-            return self;
-        }
         let a = &mut self.intra_pred;
         a[DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::TopLeft as u8 }>);
         a[TOP_DC_PRED as usize] = angular_ipred::Fn::new(ipred_dc_erased::<BD, { DcGen::Top as u8 }>);
@@ -3271,7 +3439,7 @@ mod tests {
     use super::*;
     use crate::align::AlignedVec64;
     use crate::cpu::{rav1d_get_cpu_flags, rav1d_init_cpu};
-    use crate::include::common::bitdepth::BitDepth8;
+    use crate::include::common::bitdepth::{BitDepth16, BitDepth8};
     use crate::include::dav1d::picture::Rav1dPictureDataComponent;
     use crate::with_offset::WithOffset;
 
@@ -3320,106 +3488,149 @@ mod tests {
     #[repr(align(64))]
     struct Ac([i16; SCRATCH_AC_TXTP_LEN]);
 
-    fn rust() -> Rav1dIntraPredDSPContext {
+    fn rust<BD: BitDepth>() -> Rav1dIntraPredDSPContext {
         rav1d_init_cpu();
         let flags = rav1d_get_cpu_flags();
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert!(flags.contains(CpuFlags::SSE41), "the SIMD kernels need SSE4.1");
-        Rav1dIntraPredDSPContext::default::<BitDepth8>().init_rust_simd::<BitDepth8>(flags)
+        Rav1dIntraPredDSPContext::default::<BD>().init_rust_simd::<BD>(flags)
     }
 
-    fn plane(fill: &[u8]) -> AlignedVec64<u8> {
-        let mut buf = AlignedVec64::<u8>::new();
-        buf.resize(STRIDE * ROWS, 0);
-        buf.as_mut_slice()[..fill.len()].copy_from_slice(fill);
+    fn px<BD: BitDepth>(v: u16) -> BD::Pixel {
+        (v as c_int).as_::<BD::Pixel>()
+    }
+
+    fn plane<BD: BitDepth>(fill: &[u16]) -> AlignedVec64<BD::Pixel> {
+        let mut buf = AlignedVec64::<BD::Pixel>::new();
+        buf.resize(STRIDE * ROWS, px::<BD>(0));
+        for (p, &v) in buf.as_mut_slice().iter_mut().zip(fill) {
+            *p = px::<BD>(v);
+        }
         buf
     }
 
-    /// The plane after `f` predicts a `w`x`h` block at (16, 4) from `edge`, whose top-left corner
-    /// is at the middle.
-    fn run(f: &angular_ipred::Fn, edge: &[u8; SCRATCH_EDGE_LEN], w: c_int, h: c_int) -> Vec<u8> {
-        run_angle(f, edge, w, h, 0)
+    fn pixels<BD: BitDepth>(edge: &[u16; SCRATCH_EDGE_LEN]) -> [BD::Pixel; SCRATCH_EDGE_LEN] {
+        edge.map(px::<BD>)
     }
 
-    fn run_angle(
+    /// The plane's bytes after `f` predicts a `w`x`h` block at (16, 4) from `edge`, whose
+    /// top-left corner is at the middle.
+    fn run<BD: BitDepth>(
         f: &angular_ipred::Fn,
-        edge: &[u8; SCRATCH_EDGE_LEN],
+        edge: &[u16; SCRATCH_EDGE_LEN],
+        w: c_int,
+        h: c_int,
+        max: c_int,
+    ) -> Vec<u8> {
+        run_angle::<BD>(f, edge, w, h, 0, max)
+    }
+
+    fn run_angle<BD: BitDepth>(
+        f: &angular_ipred::Fn,
+        edge: &[u16; SCRATCH_EDGE_LEN],
         w: c_int,
         h: c_int,
         angle: c_int,
+        max: c_int,
     ) -> Vec<u8> {
-        let mut buf = plane(&[]);
-        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+        let mut buf = plane::<BD>(&[]);
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), STRIDE);
         let dst = WithOffset {
             data: &comp,
             offset: 4 * STRIDE + 16,
         };
         let off = SCRATCH_EDGE_LEN / 2;
-        f.call::<BitDepth8>(dst, edge, off, w, h, angle, w, h, BitDepth8::from_c(255));
+        f.call::<BD>(dst, &pixels::<BD>(edge), off, w, h, angle, w, h, BD::from_c(max));
         drop(comp);
-        buf.as_slice().to_vec()
+        buf.as_slice().as_bytes().to_vec()
     }
 
-    fn run_cfl(
+    fn run_cfl<BD: BitDepth>(
         f: &cfl_pred::Fn,
-        edge: &[u8; SCRATCH_EDGE_LEN],
+        edge: &[u16; SCRATCH_EDGE_LEN],
         w: c_int,
         h: c_int,
         ac: &Ac,
         alpha: c_int,
+        max: c_int,
     ) -> Vec<u8> {
-        let mut buf = plane(&[]);
-        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+        let mut buf = plane::<BD>(&[]);
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), STRIDE);
         let dst = WithOffset {
             data: &comp,
             offset: 4 * STRIDE + 16,
         };
         let off = SCRATCH_EDGE_LEN / 2;
-        f.call::<BitDepth8>(dst, edge, off, w, h, &ac.0, alpha, BitDepth8::from_c(255));
+        f.call::<BD>(dst, &pixels::<BD>(edge), off, w, h, &ac.0, alpha, BD::from_c(max));
         drop(comp);
-        buf.as_slice().to_vec()
+        buf.as_slice().as_bytes().to_vec()
     }
 
     /// The AC of a `cw`x`ch` chroma block whose luma is at (16, 4) of `luma`.
-    fn run_ac(f: &cfl_ac::Fn, luma: &[u8], pad: (c_int, c_int), cw: c_int, ch: c_int) -> Vec<i16> {
-        let mut buf = plane(luma);
-        let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
+    fn run_ac<BD: BitDepth>(
+        f: &cfl_ac::Fn,
+        luma: &[u16],
+        pad: (c_int, c_int),
+        cw: c_int,
+        ch: c_int,
+    ) -> Vec<i16> {
+        let mut buf = plane::<BD>(luma);
+        let comp = Rav1dPictureDataComponent::wrap_buf::<BD>(buf.as_mut_slice(), STRIDE);
         let y = WithOffset {
             data: &comp,
             offset: 4 * STRIDE + 16,
         };
         let mut ac = Ac([0; SCRATCH_AC_TXTP_LEN]);
-        f.call::<BitDepth8>(&mut ac.0, y, pad.0, pad.1, cw, ch);
+        f.call::<BD>(&mut ac.0, y, pad.0, pad.1, cw, ch);
         ac.0[..(cw * ch) as usize].to_vec()
     }
 
-    fn edge(rng: &mut Rng) -> [u8; SCRATCH_EDGE_LEN] {
-        let base = rng.next() % 256;
+    /// Runs of near values around a base, one pixel in 8 anywhere up to `max`.
+    fn edge(rng: &mut Rng, max: c_int) -> [u16; SCRATCH_EDGE_LEN] {
+        let max = max as u32;
+        let base = rng.next() % (max + 1);
+        let spread = (max + 1) / 64 + 4;
         std::array::from_fn(|_| {
             if rng.next() % 8 == 0 {
-                rng.next() as u8
+                (rng.next() % (max + 1)) as u16
             } else {
-                (base as i32 + (rng.next() % 9) as i32 - 4).clamp(0, 255) as u8
+                let d = (rng.next() % (2 * spread + 1)) as i64 - spread as i64;
+                (base as i64 + d).clamp(0, max as i64) as u16
             }
         })
     }
 
-    #[test]
-    fn dc_and_smooth_match_scalar() {
-        let scalar = Rav1dIntraPredDSPContext::default::<BitDepth8>();
-        let rust = rust();
+    /// Each test at 8, 10 and 12 bpc.
+    macro_rules! at_bitdepths {
+        ($test:ident: $($name:ident $BD:ident $max:literal),*) => {
+            $(
+                #[test]
+                fn $name() {
+                    $test::<$BD>($max);
+                }
+            )*
+        };
+    }
+
+    at_bitdepths!(dc_and_smooth: dc_and_smooth_match_scalar_8 BitDepth8 255,
+        dc_and_smooth_match_scalar_10 BitDepth16 1023, dc_and_smooth_match_scalar_12 BitDepth16 4095);
+
+    fn dc_and_smooth<BD: BitDepth>(max: c_int) {
+        let scalar = Rav1dIntraPredDSPContext::default::<BD>();
+        let rust = rust::<BD>();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let m = max as u16;
         for round in 0..60 {
             let edge = match round {
-                0 => [255; SCRATCH_EDGE_LEN],
+                0 => [m; SCRATCH_EDGE_LEN],
                 1 => [0; SCRATCH_EDGE_LEN],
-                2 => std::array::from_fn(|i| if i % 2 == 0 { 255 } else { 0 }),
-                _ => edge(&mut rng),
+                2 => std::array::from_fn(|i| if i % 2 == 0 { m } else { 0 }),
+                _ => edge(&mut rng, max),
             };
             for (w, h) in SIZES {
                 for mode in DCS.into_iter().chain(SMOOTHS) {
-                    let want = run(&scalar.intra_pred[mode as usize], &edge, w, h);
-                    let got = run(&rust.intra_pred[mode as usize], &edge, w, h);
+                    let want = run::<BD>(&scalar.intra_pred[mode as usize], &edge, w, h, max);
+                    let got = run::<BD>(&rust.intra_pred[mode as usize], &edge, w, h, max);
                     assert_eq!(got, want, "{w}x{h} mode {mode} round {round}");
                 }
             }
@@ -3438,16 +3649,18 @@ mod tests {
         a
     };
 
+    at_bitdepths!(directional: directional_match_scalar_8 BitDepth8 255,
+        directional_match_scalar_10 BitDepth16 1023, directional_match_scalar_12 BitDepth16 4095);
+
     /// Every angle Z1, Z2 and Z3 take, with and without the edge filter and the smooth flag.
-    #[test]
-    fn directional_match_scalar() {
-        let scalar = Rav1dIntraPredDSPContext::default::<BitDepth8>();
-        let rust = rust();
+    fn directional<BD: BitDepth>(max: c_int) {
+        let scalar = Rav1dIntraPredDSPContext::default::<BD>();
+        let rust = rust::<BD>();
         let mut rng = Rng(0x5851_f42d_4c95_7f2d);
         for round in 0..6 {
             let edge = match round {
-                0 => std::array::from_fn(|i| if i % 2 == 0 { 255 } else { 0 }),
-                _ => edge(&mut rng),
+                0 => std::array::from_fn(|i| if i % 2 == 0 { max as u16 } else { 0 }),
+                _ => edge(&mut rng, max),
             };
             for (w, h) in SIZES {
                 for angle in ANGLES {
@@ -3459,8 +3672,9 @@ mod tests {
                     };
                     for flags in [0, 1 << 9, 1 << 10, 3 << 9] {
                         let a = angle | flags;
-                        let want = run_angle(&scalar.intra_pred[mode as usize], &edge, w, h, a);
-                        let got = run_angle(&rust.intra_pred[mode as usize], &edge, w, h, a);
+                        let f = &scalar.intra_pred[mode as usize];
+                        let want = run_angle::<BD>(f, &edge, w, h, a, max);
+                        let got = run_angle::<BD>(&rust.intra_pred[mode as usize], &edge, w, h, a, max);
                         assert_eq!(got, want, "{w}x{h} mode {mode} angle {a:#x} round {round}");
                     }
                 }
@@ -3468,19 +3682,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cfl_pred_matches_scalar() {
-        let scalar = Rav1dIntraPredDSPContext::default::<BitDepth8>();
-        let rust = rust();
+    at_bitdepths!(cfl_pred: cfl_pred_matches_scalar_8 BitDepth8 255,
+        cfl_pred_matches_scalar_10 BitDepth16 1023, cfl_pred_matches_scalar_12 BitDepth16 4095);
+
+    /// The AC within `8 * max`, as the luma scaled to eight times a pixel gives it.
+    fn cfl_pred<BD: BitDepth>(max: c_int) {
+        let scalar = Rav1dIntraPredDSPContext::default::<BD>();
+        let rust = rust::<BD>();
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         let mut ac = Ac([0; SCRATCH_AC_TXTP_LEN]);
+        let lim = 8 * max as i16;
         for round in 0..40 {
-            let edge = edge(&mut rng);
+            let edge = edge(&mut rng, max);
             for a in ac.0.iter_mut() {
                 *a = match round {
-                    0 => 2040,
-                    1 => -2040,
-                    _ => (rng.next() % 4081) as i16 - 2040,
+                    0 => lim,
+                    1 => -lim,
+                    _ => (rng.next() % (2 * lim as u32 + 1)) as i16 - lim,
                 };
             }
             for (w, h) in SIZES.into_iter().filter(|&(w, h)| w <= 32 && h <= 32) {
@@ -3490,30 +3708,32 @@ mod tests {
                         _ => (rng.next() % 33) as c_int - 16,
                     };
                     let f = &scalar.cfl_pred[mode as usize];
-                    let want = run_cfl(f, &edge, w, h, &ac, alpha);
-                    let got = run_cfl(&rust.cfl_pred[mode as usize], &edge, w, h, &ac, alpha);
+                    let want = run_cfl::<BD>(f, &edge, w, h, &ac, alpha, max);
+                    let got = run_cfl::<BD>(&rust.cfl_pred[mode as usize], &edge, w, h, &ac, alpha, max);
                     assert_eq!(got, want, "{w}x{h} mode {mode} alpha {alpha} round {round}");
                 }
             }
         }
     }
 
-    #[test]
-    fn cfl_ac_matches_scalar() {
-        let scalar = Rav1dIntraPredDSPContext::default::<BitDepth8>();
-        let rust = rust();
+    at_bitdepths!(cfl_ac: cfl_ac_matches_scalar_8 BitDepth8 255,
+        cfl_ac_matches_scalar_10 BitDepth16 1023, cfl_ac_matches_scalar_12 BitDepth16 4095);
+
+    fn cfl_ac<BD: BitDepth>(max: c_int) {
+        let scalar = Rav1dIntraPredDSPContext::default::<BD>();
+        let rust = rust::<BD>();
         let mut rng = Rng(0x1234_5678_9abc_def1);
         for round in 0..12 {
-            let luma: Vec<u8> = match round {
-                0 => vec![255; STRIDE * ROWS],
-                _ => (0..STRIDE * ROWS).map(|i| edge(&mut rng)[i % 7]).collect(),
+            let luma: Vec<u16> = match round {
+                0 => vec![max as u16; STRIDE * ROWS],
+                _ => (0..STRIDE * ROWS).map(|i| edge(&mut rng, max)[i % 7]).collect(),
             };
             for (l, layout) in LAYOUTS.into_iter().enumerate() {
                 for cw in [4, 8, 16, 32] {
                     for ch in [4, 8, 16, 32] {
                         for pad in [(0, 0), (cw / 4 - 1, 0), (0, ch / 4 - 1), (cw / 8, ch / 8)] {
-                            let want = run_ac(&scalar.cfl_ac[layout], &luma, pad, cw, ch);
-                            let got = run_ac(&rust.cfl_ac[layout], &luma, pad, cw, ch);
+                            let want = run_ac::<BD>(&scalar.cfl_ac[layout], &luma, pad, cw, ch);
+                            let got = run_ac::<BD>(&rust.cfl_ac[layout], &luma, pad, cw, ch);
                             assert_eq!(got, want, "layout {l} {cw}x{ch} pad {pad:?} round {round}");
                         }
                     }
@@ -3548,7 +3768,7 @@ mod tests {
         #[allow(unused_mut)]
         let mut dsps = vec![
             ("scalar", Rav1dIntraPredDSPContext::default::<BitDepth8>()),
-            ("rust", rust()),
+            ("rust", rust::<BitDepth8>()),
         ];
         #[cfg(all(feature = "asm", any(target_arch = "x86", target_arch = "x86_64")))]
         dsps.push((
@@ -3565,14 +3785,14 @@ mod tests {
         // The asm loads the edge aligned, as the decoder's scratch is.
         #[repr(align(64))]
         struct Edge([u8; SCRATCH_EDGE_LEN]);
-        let edge = Edge(edge(&mut rng));
+        let edge = Edge(pixels::<BitDepth8>(&edge(&mut rng, 255)));
         let edge = &edge.0;
         let mut ac = Ac([0; SCRATCH_AC_TXTP_LEN]);
         for a in ac.0.iter_mut() {
             *a = (rng.next() % 257) as i16 - 128;
         }
-        let luma: Vec<u8> = (0..STRIDE * ROWS).map(|_| rng.next() as u8).collect();
-        let mut buf = plane(&luma);
+        let luma: Vec<u16> = (0..STRIDE * ROWS).map(|_| rng.next() as u8 as u16).collect();
+        let mut buf = plane::<BitDepth8>(&luma);
         let comp = Rav1dPictureDataComponent::wrap_buf::<BitDepth8>(buf.as_mut_slice(), STRIDE);
         let at = WithOffset {
             data: &comp,
