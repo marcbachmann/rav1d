@@ -945,16 +945,13 @@ fn sgr_mix_rust<BD: BitDepth>(
 /// The 8 bpc filters on [`I16x8`].
 mod rust_simd {
     use super::*;
+    #[cfg(target_arch = "x86_64")]
+    use crate::simd128::I16x16;
     use crate::simd128::{I16x8, I32x4};
 
     const ROWS: usize = 64 + 3 + 3;
     /// A unit is at most 256 wide, the last of a row up to half as wide again.
     const MAX_W: usize = 256 * 3 / 2;
-
-    #[inline(always)]
-    fn px8(row: &[u8], i: usize) -> I16x8 {
-        I16x8::from_u8x8(&row[i..])
-    }
 
     /// Eight pixels of `row` from `i` as `i16` lanes.
     #[inline(always)]
@@ -966,24 +963,95 @@ mod rust_simd {
         }
     }
 
-    /// One row of 7 taps across, clipped to 13 bits, 8 pixels at a time with 32-bit sums. The
-    /// 128 of the centre tap is folded back into its coefficient.
+    /// The `i16` lanes Wiener runs on: [`I16x8`], and [`I16x16`] in the AVX2 kernels.
+    trait Lanes: Copy {
+        const N: usize;
+        fn splat(v: i16) -> Self;
+        fn add(self, o: Self) -> Self;
+        fn min(self, o: Self) -> Self;
+        fn max(self, o: Self) -> Self;
+        fn load(s: &[i16]) -> Self;
+        fn store(self, d: &mut [i16]);
+        fn load_u16(s: &[u16]) -> Self;
+        fn store_u16(self, d: &mut [u16]);
+        /// Bytes `b[..N]` zero-extended.
+        fn from_u8(b: &[u8]) -> Self;
+        /// The lanes saturated to `u8` into `d[..N]`.
+        fn store_u8(self, d: &mut [u8]);
+        fn madd_n<const S: i32, const K: usize>(v: [Self; K], k: [i16; K], rnd: i32) -> Self;
+    }
+
+    macro_rules! lanes {
+        ($V:ty, $n:literal, $from_u8:ident) => {
+            impl Lanes for $V {
+                const N: usize = $n;
+                #[inline(always)]
+                fn splat(v: i16) -> Self {
+                    Self::splat(v)
+                }
+                #[inline(always)]
+                fn add(self, o: Self) -> Self {
+                    self.add(o)
+                }
+                #[inline(always)]
+                fn min(self, o: Self) -> Self {
+                    self.min(o)
+                }
+                #[inline(always)]
+                fn max(self, o: Self) -> Self {
+                    self.max(o)
+                }
+                #[inline(always)]
+                fn load(s: &[i16]) -> Self {
+                    Self::load(s)
+                }
+                #[inline(always)]
+                fn store(self, d: &mut [i16]) {
+                    self.store(d)
+                }
+                #[inline(always)]
+                fn load_u16(s: &[u16]) -> Self {
+                    Self::load_u16(s)
+                }
+                #[inline(always)]
+                fn store_u16(self, d: &mut [u16]) {
+                    self.store_u16(d)
+                }
+                #[inline(always)]
+                fn from_u8(b: &[u8]) -> Self {
+                    Self::$from_u8(b)
+                }
+                #[inline(always)]
+                fn store_u8(self, d: &mut [u8]) {
+                    d[..$n].copy_from_slice(&self.pack_u8())
+                }
+                #[inline(always)]
+                fn madd_n<const S: i32, const K: usize>(
+                    v: [Self; K],
+                    k: [i16; K],
+                    rnd: i32,
+                ) -> Self {
+                    Self::madd_n::<S, K>(v, k, rnd)
+                }
+            }
+        };
+    }
+
+    lanes!(I16x8, 8, from_u8x8);
+    #[cfg(target_arch = "x86_64")]
+    lanes!(I16x16, 16, from_u8x16);
+
+    /// One row of 7 symmetric taps across, clipped to 13 bits, with 32-bit sums of the pairs
+    /// `p0 + p6`, `p1 + p5`, `p2 + p4` and of `p3`. The 128 of the centre tap is folded back
+    /// into its coefficient.
     #[inline(always)]
-    fn wiener_h(out: &mut [i16; MAX_W + 8], t: &[u8], w: usize, k: [i16; 8]) {
-        let zero = I16x8::splat(0);
-        let max = I16x8::splat((1 << 13) - 1);
-        for i in (0..w).step_by(8) {
-            let v = [
-                px8(t, i),
-                px8(t, i + 1),
-                px8(t, i + 2),
-                px8(t, i + 3),
-                px8(t, i + 4),
-                px8(t, i + 5),
-                px8(t, i + 6),
-                zero,
-            ];
-            I16x8::madd8::<3>(v, k, (1 << 14) + 4)
+    fn wiener_h<V: Lanes>(out: &mut [i16; MAX_W + 16], t: &[u8], w: usize, k: [i16; 4]) {
+        let zero = V::splat(0);
+        let max = V::splat((1 << 13) - 1);
+        for i in (0..w).step_by(V::N) {
+            let p = |d: usize| V::from_u8(&t[i + d..]);
+            let v = [p(0).add(p(6)), p(1).add(p(5)), p(2).add(p(4)), p(3)];
+            V::madd_n::<3, 4>(v, k, (1 << 14) + 4)
                 .max(zero)
                 .min(max)
                 .store(&mut out[i..]);
@@ -992,51 +1060,36 @@ mod rust_simd {
 
     /// Wiener over the padded `tmp`: rows across into a ring of the 7 the taps down read.
     #[inline(always)]
-    fn wiener(
+    fn wiener<V: Lanes>(
         mut dst: impl FnMut(usize, &[u8]),
         tmp: &[u8; ROWS * REST_UNIT_STRIDE],
         w: usize,
         h: usize,
         filter: &[[i16; 8]; 2],
     ) {
-        let mut kh = filter[0];
-        kh[3] += 128;
-        kh[7] = 0;
-        let mut kv = filter[1];
-        kv[7] = 0;
-        let zero = I16x8::splat(0);
-        let mut ring = [[0i16; MAX_W + 8]; 8];
+        let f = filter[0];
+        let kh = [f[0], f[1], f[2], f[3] + 128];
+        let f = filter[1];
+        let kv = [f[0], f[1], f[2], f[3]];
+        let mut ring = [[0i16; MAX_W + 16]; 8];
         let t = |r: usize| &tmp[r * REST_UNIT_STRIDE..][..REST_UNIT_STRIDE];
         for r in 0..6 {
-            wiener_h(&mut ring[r], t(r), w, kh);
+            wiener_h::<V>(&mut ring[r], t(r), w, kh);
         }
+        let mut row = [0u8; MAX_W + 16];
         for j in 0..h {
-            wiener_h(&mut ring[(j + 6) % 8], t(j + 6), w, kh);
-            let mut row = [0u8; MAX_W + 8];
-            for i in (0..w).step_by(8) {
-                let r = |k: usize| &ring[(j + k) % 8][i..];
-                let v = [
-                    I16x8::load(r(0)),
-                    I16x8::load(r(1)),
-                    I16x8::load(r(2)),
-                    I16x8::load(r(3)),
-                    I16x8::load(r(4)),
-                    I16x8::load(r(5)),
-                    I16x8::load(r(6)),
-                    zero,
-                ];
-                let p = I16x8::madd8::<11>(v, kv, (1 << 10) - (1 << 18)).pack_u8();
-                row[i..i + 8].copy_from_slice(&p);
+            wiener_h::<V>(&mut ring[(j + 6) % 8], t(j + 6), w, kh);
+            for i in (0..w).step_by(V::N) {
+                let r = |k: usize| V::load(&ring[(j + k) % 8][i..]);
+                let v = [r(0).add(r(6)), r(1).add(r(5)), r(2).add(r(4)), r(3)];
+                V::madd_n::<11, 4>(v, kv, (1 << 10) - (1 << 18)).store_u8(&mut row[i..]);
             }
             dst(j, &row[..w]);
         }
     }
 
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
-    fn wiener_128<BD: BitDepth>(
+    #[inline(always)]
+    fn wiener_8bpc<BD: BitDepth, V: Lanes>(
         p: Rav1dPictureDataComponentOffset,
         left: &[LeftPixelRow<BD::Pixel>],
         lpf: &DisjointMut<AlignedVec64<u8>>,
@@ -1056,8 +1109,49 @@ mod rust_simd {
                 .as_bytes_mut()
                 .copy_from_slice(row);
         };
-        wiener(store, tmp, w, h, &params.filter);
+        wiener::<V>(store, tmp, w, h, &params.filter);
     }
+
+    macro_rules! tiers {
+        ($inner:ident, $name128:ident, $name256:ident, ($($arg:ident: $ty:ty),*)) => {
+            #[cfg_attr(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                target_feature(enable = "sse4.1")
+            )]
+            fn $name128<BD: BitDepth>($($arg: $ty),*) {
+                $inner::<BD, I16x8>($($arg),*)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(enable = "avx2")]
+            fn $name256<BD: BitDepth>($($arg: $ty),*) {
+                $inner::<BD, I16x16>($($arg),*)
+            }
+        };
+    }
+
+    tiers!(wiener_8bpc, wiener_128, wiener_256, (
+        p: Rav1dPictureDataComponentOffset,
+        left: &[LeftPixelRow<BD::Pixel>],
+        lpf: &DisjointMut<AlignedVec64<u8>>,
+        lpf_off: isize,
+        w: usize,
+        h: usize,
+        params: &LooprestorationParams,
+        edges: LrEdgeFlags
+    ));
+
+    tiers!(wiener_16bpc, wiener16_128, wiener16_256, (
+        p: Rav1dPictureDataComponentOffset,
+        left: &[LeftPixelRow<BD::Pixel>],
+        lpf: &DisjointMut<AlignedVec64<u8>>,
+        lpf_off: isize,
+        w: usize,
+        h: usize,
+        params: &LooprestorationParams,
+        edges: LrEdgeFlags,
+        bitdepth: u8
+    ));
 
     /// # Safety
     ///
@@ -1065,7 +1159,7 @@ mod rust_simd {
     /// flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
-    pub unsafe extern "C" fn wiener_erased<BD: BitDepth>(
+    pub unsafe extern "C" fn wiener_erased<BD: BitDepth, const WIDE: bool>(
         _p_ptr: *mut DynPixel,
         _stride: ptrdiff_t,
         left: *const LeftPixelRow<DynPixel>,
@@ -1087,6 +1181,11 @@ mod rust_simd {
         let (w, h) = (w as usize, h as usize);
         // SAFETY: Length sliced in `loop_restoration_filter::Fn::call`.
         let left = unsafe { slice::from_raw_parts(left, h) };
+        #[cfg(target_arch = "x86_64")]
+        if WIDE {
+            // SAFETY: AVX2 is checked before this `fn` is chosen with `WIDE`.
+            return unsafe { wiener_256::<BD>(p, left, lpf, lpf_off, w, h, params, edges) };
+        }
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
         unsafe { wiener_128::<BD>(p, left, lpf, lpf_off, w, h, params, edges) }
     }
@@ -1095,22 +1194,22 @@ mod rust_simd {
     /// the pairs `p0 + p6`, `p1 + p5`, `p2 + p4` and on `p3`, rounded off by `S` bits.
     /// Saturating to `i16` is the clip below 2^15.
     #[inline(always)]
-    fn wiener_h16<const S: i32, const FIVE: bool>(
-        out: &mut [i16; MAX_W + 8],
+    fn wiener_h16<V: Lanes, const S: i32, const FIVE: bool>(
+        out: &mut [i16; MAX_W + 16],
         t: &[u16],
         w: usize,
         k: [i16; 4],
         rnd: i32,
     ) {
-        let zero = I16x8::splat(0);
-        for i in (0..w).step_by(8) {
-            let t = &t[i..i + 14];
-            let p = |d: usize| I16x8::load_u16(&t[d..]);
+        let zero = V::splat(0);
+        for i in (0..w).step_by(V::N) {
+            let t = &t[i..i + V::N + 6];
+            let p = |d: usize| V::load_u16(&t[d..]);
             let (p15, p24, p3) = (p(1).add(p(5)), p(2).add(p(4)), p(3));
             let v = if FIVE {
-                I16x8::madd_n::<S, 3>([p15, p24, p3], [k[1], k[2], k[3]], rnd)
+                V::madd_n::<S, 3>([p15, p24, p3], [k[1], k[2], k[3]], rnd)
             } else {
-                I16x8::madd_n::<S, 4>([p(0).add(p(6)), p15, p24, p3], k, rnd)
+                V::madd_n::<S, 4>([p(0).add(p(6)), p15, p24, p3], k, rnd)
             };
             v.max(zero).store(&mut out[i..]);
         }
@@ -1119,7 +1218,7 @@ mod rust_simd {
     /// [`wiener`] at 10 or 12 bits, rounding off `SH` bits across and `SV` down; with `FIVE`
     /// the outer taps are 0 and the rows only they read are skipped.
     #[inline(always)]
-    fn wiener16<const SH: i32, const SV: i32, const FIVE: bool>(
+    fn wiener16<V: Lanes, const SH: i32, const SV: i32, const FIVE: bool>(
         mut dst: impl FnMut(usize, &[u16]),
         tmp: &[u16; ROWS * REST_UNIT_STRIDE],
         w: usize,
@@ -1131,27 +1230,27 @@ mod rust_simd {
         let rnd_h = (1 << bitdepth + 6) + (1 << SH - 1);
         let kv = filter[1];
         let rnd_v = (1 << SV - 1) - (1 << bitdepth + SV - 1);
-        let zero = I16x8::splat(0);
-        let max = I16x8::splat((1 << bitdepth) - 1);
-        let mut ring = [[0i16; MAX_W + 8]; 8];
+        let zero = V::splat(0);
+        let max = V::splat((1 << bitdepth) - 1);
+        let mut ring = [[0i16; MAX_W + 16]; 8];
         let t = |r: usize| &tmp[r * REST_UNIT_STRIDE..][..REST_UNIT_STRIDE];
         let (first, ahead) = if FIVE { (1, 5) } else { (0, 6) };
         for r in first..ahead {
-            wiener_h16::<SH, FIVE>(&mut ring[r], t(r), w, kh, rnd_h);
+            wiener_h16::<V, SH, FIVE>(&mut ring[r], t(r), w, kh, rnd_h);
         }
-        let mut row = [0u16; MAX_W + 8];
+        let mut row = [0u16; MAX_W + 16];
         for j in 0..h {
-            wiener_h16::<SH, FIVE>(&mut ring[(j + ahead) % 8], t(j + ahead), w, kh, rnd_h);
-            for i in (0..w).step_by(8) {
-                let r = |k: usize| I16x8::load(&ring[(j + k) % 8][i..]);
+            wiener_h16::<V, SH, FIVE>(&mut ring[(j + ahead) % 8], t(j + ahead), w, kh, rnd_h);
+            for i in (0..w).step_by(V::N) {
+                let r = |k: usize| V::load(&ring[(j + k) % 8][i..]);
                 let v = if FIVE {
-                    I16x8::madd_n::<SV, 5>(
+                    V::madd_n::<SV, 5>(
                         [r(1), r(2), r(3), r(4), r(5)],
                         [kv[1], kv[2], kv[3], kv[4], kv[5]],
                         rnd_v,
                     )
                 } else {
-                    I16x8::madd_n::<SV, 7>(
+                    V::madd_n::<SV, 7>(
                         [r(0), r(1), r(2), r(3), r(4), r(5), r(6)],
                         [kv[0], kv[1], kv[2], kv[3], kv[4], kv[5], kv[6]],
                         rnd_v,
@@ -1163,11 +1262,8 @@ mod rust_simd {
         }
     }
 
-    #[cfg_attr(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature(enable = "sse4.1")
-    )]
-    fn wiener16_128<BD: BitDepth>(
+    #[inline(always)]
+    fn wiener_16bpc<BD: BitDepth, V: Lanes>(
         p: Rav1dPictureDataComponentOffset,
         left: &[LeftPixelRow<BD::Pixel>],
         lpf: &DisjointMut<AlignedVec64<u8>>,
@@ -1190,10 +1286,10 @@ mod rust_simd {
         };
         let f = &params.filter;
         match (bitdepth, f[0][0] == 0 && f[1][0] == 0) {
-            (10, false) => wiener16::<3, 11, false>(store, tmp, w, h, f, 10),
-            (10, true) => wiener16::<3, 11, true>(store, tmp, w, h, f, 10),
-            (_, false) => wiener16::<5, 9, false>(store, tmp, w, h, f, 12),
-            (_, true) => wiener16::<5, 9, true>(store, tmp, w, h, f, 12),
+            (10, false) => wiener16::<V, 3, 11, false>(store, tmp, w, h, f, 10),
+            (10, true) => wiener16::<V, 3, 11, true>(store, tmp, w, h, f, 10),
+            (_, false) => wiener16::<V, 5, 9, false>(store, tmp, w, h, f, 12),
+            (_, true) => wiener16::<V, 5, 9, true>(store, tmp, w, h, f, 12),
         }
     }
 
@@ -1203,7 +1299,7 @@ mod rust_simd {
     /// flags hold SSE41.
     #[deny(unsafe_op_in_unsafe_fn)]
     #[allow(unused_unsafe)]
-    pub unsafe extern "C" fn wiener16_erased<BD: BitDepth>(
+    pub unsafe extern "C" fn wiener16_erased<BD: BitDepth, const WIDE: bool>(
         _p_ptr: *mut DynPixel,
         _stride: ptrdiff_t,
         left: *const LeftPixelRow<DynPixel>,
@@ -1226,6 +1322,13 @@ mod rust_simd {
         // SAFETY: Length sliced in `loop_restoration_filter::Fn::call`.
         let left = unsafe { slice::from_raw_parts(left, h) };
         let bitdepth = BD::from_c(bitdepth_max).bitdepth();
+        #[cfg(target_arch = "x86_64")]
+        if WIDE {
+            // SAFETY: AVX2 is checked before this `fn` is chosen with `WIDE`.
+            return unsafe {
+                wiener16_256::<BD>(p, left, lpf, lpf_off, w, h, params, edges, bitdepth)
+            };
+        }
         // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
         unsafe { wiener16_128::<BD>(p, left, lpf, lpf_off, w, h, params, edges, bitdepth) }
     }
@@ -1637,9 +1740,6 @@ impl Rav1dLoopRestorationDSPContext {
         }
     }
 
-
-
-
     /// The Rust SIMD filters, at every bit depth.
     #[inline(always)]
     const fn init<BD: BitDepth>(mut self, flags: CpuFlags) -> Self {
@@ -1652,10 +1752,18 @@ impl Rav1dLoopRestorationDSPContext {
             return self;
         }
         let wiener = loop_restoration_filter::Fn::new(match BD::BPC {
-            BPC::BPC8 => rust_simd::wiener_erased::<BD>,
-            BPC::BPC16 => rust_simd::wiener16_erased::<BD>,
+            BPC::BPC8 => rust_simd::wiener_erased::<BD, false>,
+            BPC::BPC16 => rust_simd::wiener16_erased::<BD, false>,
         });
         self.wiener = [wiener; 2];
+        #[cfg(target_arch = "x86_64")]
+        if flags.contains(CpuFlags::AVX2) {
+            let wiener = loop_restoration_filter::Fn::new(match BD::BPC {
+                BPC::BPC8 => rust_simd::wiener_erased::<BD, true>,
+                BPC::BPC16 => rust_simd::wiener16_erased::<BD, true>,
+            });
+            self.wiener = [wiener; 2];
+        }
         self.sgr = [
             loop_restoration_filter::Fn::new(rust_simd::sgr_erased::<BD, false, true>),
             loop_restoration_filter::Fn::new(rust_simd::sgr_erased::<BD, true, false>),
@@ -1709,6 +1817,14 @@ mod tests {
         Rav1dLoopRestorationDSPContext::default::<BD>().init::<BD>(flags)
     }
 
+    /// [`rust`] without its AVX2 tier.
+    fn rust128<BD: BitDepth>() -> Rav1dLoopRestorationDSPContext {
+        rav1d_init_cpu();
+        let flags = rav1d_get_cpu_flags();
+        #[cfg(target_arch = "x86_64")]
+        let flags = flags.difference(CpuFlags::AVX2);
+        Rav1dLoopRestorationDSPContext::default::<BD>().init::<BD>(flags)
+    }
 
     /// Pixels near a base with some outliers, the way decoded planes look.
     fn plane(rng: &mut Rng, n: usize, bits: u8) -> Vec<u16> {
@@ -1852,6 +1968,7 @@ mod tests {
     fn wiener_matches_scalar<BD: BitDepth>(bits: u8) {
         let scalar = Rav1dLoopRestorationDSPContext::default::<BD>();
         let rust = rust::<BD>();
+        let rust128 = rust128::<BD>();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         for round in 0..300 {
             let mut unit = Unit::<BD>::new(&mut rng, bits);
@@ -1872,12 +1989,14 @@ mod tests {
             let edges = LrEdgeFlags::from_bits_truncate(rng.next() as u8);
             let f = five as usize;
             let want = unit.run(&scalar.wiener[f], w, h, &params, edges);
-            let got = unit.run(&rust.wiener[f], w, h, &params, edges);
-            assert!(
-                got == want,
-                "{bits} bits {w}x{h} edges {:#x} round {round}",
-                edges.bits()
-            );
+            for rust in [&rust, &rust128] {
+                let got = unit.run(&rust.wiener[f], w, h, &params, edges);
+                assert!(
+                    got == want,
+                    "{bits} bits {w}x{h} edges {:#x} round {round}",
+                    edges.bits()
+                );
+            }
         }
     }
 
@@ -1957,6 +2076,7 @@ mod tests {
         let dsps = vec![
             ("scalar", Rav1dLoopRestorationDSPContext::default::<BD>()),
             ("rust", rust::<BD>()),
+            ("rust 128", rust128::<BD>()),
         ];
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         let unit = Unit::<BD>::new(&mut rng, bits);
