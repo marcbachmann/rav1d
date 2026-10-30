@@ -13,32 +13,31 @@ pub type EcWin = usize;
 
 /// # Safety
 ///
-/// [`Self`] must be the first field of [`MsacAsmContext`] for asm layout purposes,
-/// and that [`MsacAsmContext`] must be a field of [`MsacContext`].
+/// [`Self`] must be a field of [`MsacState`], and that [`MsacState`] a field of [`MsacContext`].
 /// And [`Self::pos`] and [`Self::end`] must be either [`ptr::null`],
 /// or [`Self::pos`] must point into (or the end of) [`MsacContext::data`],
 /// and [`Self::end`] must point to the end of [`MsacContext::data`],
 /// where [`MsacContext::data`] is part of the [`MsacContext`]
-/// containing [`MsacAsmContext`] and thus also [`Self`].
+/// containing [`MsacState`] and thus also [`Self`].
 #[repr(C)]
-struct MsacAsmContextBuf {
+struct MsacBuf {
     pos: *const u8,
     end: *const u8,
 }
 
-/// SAFETY: [`MsacAsmContextBuf`] is always contained in [`MsacAsmContext::buf`],
-/// which is always contained in [`MsacContext::asm`], whose [`MsacContext::data`] field
-/// is what is stored in [`MsacAsmContextBuf::pos`] and [`MsacAsmContextBuf::end`].
-/// Since [`MsacContext::data`] is [`Send`], [`MsacAsmContextBuf`] is also [`Send`].
-unsafe impl Send for MsacAsmContextBuf {}
+/// SAFETY: [`MsacBuf`] is always contained in [`MsacState::buf`],
+/// which is always contained in [`MsacContext::state`], whose [`MsacContext::data`] field
+/// is what is stored in [`MsacBuf::pos`] and [`MsacBuf::end`].
+/// Since [`MsacContext::data`] is [`Send`], [`MsacBuf`] is also [`Send`].
+unsafe impl Send for MsacBuf {}
 
-/// SAFETY: [`MsacAsmContextBuf`] is always contained in [`MsacAsmContext::buf`],
-/// which is always contained in [`MsacContext::asm`], whose [`MsacContext::data`] field
-/// is what is stored in [`MsacAsmContextBuf::pos`] and [`MsacAsmContextBuf::end`].
-/// Since [`MsacContext::data`] is [`Sync`], [`MsacAsmContextBuf`] is also [`Sync`].
-unsafe impl Sync for MsacAsmContextBuf {}
+/// SAFETY: [`MsacBuf`] is always contained in [`MsacState::buf`],
+/// which is always contained in [`MsacContext::state`], whose [`MsacContext::data`] field
+/// is what is stored in [`MsacBuf::pos`] and [`MsacBuf::end`].
+/// Since [`MsacContext::data`] is [`Sync`], [`MsacBuf`] is also [`Sync`].
+unsafe impl Sync for MsacBuf {}
 
-impl Default for MsacAsmContextBuf {
+impl Default for MsacBuf {
     fn default() -> Self {
         Self {
             pos: ptr::null(),
@@ -47,7 +46,7 @@ impl Default for MsacAsmContextBuf {
     }
 }
 
-impl From<&[u8]> for MsacAsmContextBuf {
+impl From<&[u8]> for MsacBuf {
     fn from(value: &[u8]) -> Self {
         let Range { start, end } = value.as_ptr_range();
         Self { pos: start, end }
@@ -55,15 +54,15 @@ impl From<&[u8]> for MsacAsmContextBuf {
 }
 
 #[repr(C)]
-pub struct MsacAsmContext {
-    buf: MsacAsmContextBuf,
+pub struct MsacState {
+    buf: MsacBuf,
     pub dif: EcWin,
     pub rng: c_uint,
     pub cnt: c_int,
     allow_update_cdf: c_int,
 }
 
-impl Default for MsacAsmContext {
+impl Default for MsacState {
     fn default() -> Self {
         Self {
             buf: Default::default(),
@@ -75,7 +74,7 @@ impl Default for MsacAsmContext {
     }
 }
 
-impl MsacAsmContext {
+impl MsacState {
     fn allow_update_cdf(&self) -> bool {
         self.allow_update_cdf != 0
     }
@@ -83,21 +82,21 @@ impl MsacAsmContext {
 
 #[derive(Default)]
 pub struct MsacContext {
-    asm: MsacAsmContext,
+    state: MsacState,
     data: Option<CArc<[u8]>>,
 }
 
 impl Deref for MsacContext {
-    type Target = MsacAsmContext;
+    type Target = MsacState;
 
     fn deref(&self) -> &Self::Target {
-        &self.asm
+        &self.state
     }
 }
 
 impl DerefMut for MsacContext {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.asm
+        &mut self.state
     }
 }
 
@@ -107,9 +106,7 @@ impl MsacContext {
     }
 
     pub fn buf_index(&self) -> usize {
-        // We safely subtract instead of unsafely use `ptr::offset_from`
-        // as asm sets `buf_pos`, so we don't need to rely on its safety,
-        // and because codegen is no less optimal this way.
+        // A safe subtraction instead of `ptr::offset_from`; codegen is no worse.
         self.buf.pos as usize - self.data().as_ptr() as usize
     }
 }
@@ -663,7 +660,7 @@ fn rav1d_msac_decode_hi_tok_simd(s: &mut MsacContext, cdf: &mut [u16; 4]) -> u8 
 
 impl MsacContext {
     pub fn new(data: CArc<[u8]>, disable_cdf_update_flag: bool) -> Self {
-        let asm = MsacAsmContext {
+        let state = MsacState {
             buf: data.as_ref().into(),
             dif: 0,
             rng: 0x8000,
@@ -671,7 +668,7 @@ impl MsacContext {
             allow_update_cdf: (!disable_cdf_update_flag).into(),
         };
         let mut s = Self {
-            asm,
+            state,
             data: Some(data),
         };
         ctx_refill(&mut s);
