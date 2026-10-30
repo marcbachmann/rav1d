@@ -926,32 +926,76 @@ mod rust_simd {
         wd: usize,
     }
 
-    /// A lane type filtering a group of `N / 4` segments, `max` the longest filter among them.
+    /// A group: its first pixel, the vmask bits from its first segment on, and its levels.
+    #[derive(Clone, Copy)]
+    struct At<'a> {
+        dst: Rav1dPictureDataComponentOffset<'a>,
+        hv: super::HV,
+        yuv: super::YUV,
+        vmask: [u32; 3],
+        lvl: WithOffset<&'a DisjointMut<AlignedVec2<u8>>>,
+        /// From a segment's levels to the next one's, and to those across the edge.
+        b4_stridea: usize,
+        b4_strideb: usize,
+    }
+
+    impl At<'_> {
+        /// The `vmask` bits of the segments filtered at all, of those longer than 4, and of 16.
+        #[inline(always)]
+        fn masks(&self) -> [u32; 3] {
+            let [m0, m1, m2] = self.vmask;
+            match self.yuv {
+                super::YUV::Y => [m0 | m1 | m2, m1 | m2, m2],
+                super::YUV::UV => [m0 | m1, m1, 0],
+            }
+        }
+
+        /// Segment `j`'s thresholds and length, as [`loop_filter_sb128_rust`] reads them, if it
+        /// is filtered.
+        #[inline(always)]
+        fn seg(&self, j: usize, lut: &Align16<Av1FilterLUT>) -> Option<Seg> {
+            let [vm, gt4, wd16] = self.masks().map(|m| m >> j & 1 != 0);
+            if !vm {
+                return None;
+            }
+            let at = self.lvl + 4 * self.b4_stridea * j;
+            let l = match *at.data.index(at.offset) {
+                0 => {
+                    let at = at - 4 * self.b4_strideb;
+                    *at.data.index(at.offset)
+                }
+                l => l,
+            };
+            if l == 0 {
+                return None;
+            }
+            let wd = match (self.yuv, gt4, wd16) {
+                (_, _, true) => 16,
+                (super::YUV::Y, true, _) => 8,
+                (super::YUV::UV, true, _) => 6,
+                _ => 4,
+            };
+            let (e, i, h) = (lut.0.e[l as usize], lut.0.i[l as usize], l >> 4);
+            Some(Seg { e, i, h, wd })
+        }
+    }
+
+    /// A lane type filtering a group of `N / 4` segments.
     trait Groups {
         const N: usize;
-        fn group<BD: BitDepth>(
-            dst: Rav1dPictureDataComponentOffset,
-            hv: super::HV,
-            segs: &[Option<Seg>; 4],
-            max: usize,
-            bd: BD,
-        );
+        fn group<BD: BitDepth>(at: At, lut: &Align16<Av1FilterLUT>, bd: BD);
     }
 
     #[inline(always)]
-    fn group16<BD: BitDepth, V: Px>(
-        dst: Rav1dPictureDataComponentOffset,
-        hv: super::HV,
-        segs: &[Option<Seg>; 4],
-        max: usize,
-        bd: BD,
-    ) {
+    fn group16<BD: BitDepth, V: Px>(at: At, lut: &Align16<Av1FilterLUT>, bd: BD) {
         let s = bd.bitdepth() - 8;
         let mut lanes = [[0i16; 16]; 7];
-        for (j, seg) in segs.iter().enumerate().take(V::N / 4) {
-            let Some(Seg { e, i, h, wd }) = *seg else {
+        let mut max = 0;
+        for j in 0..V::N / 4 {
+            let Some(Seg { e, i, h, wd }) = at.seg(j, lut) else {
                 continue;
             };
+            max = max.max(wd);
             let flags = [
                 (e as i16) << s,
                 (i as i16) << s,
@@ -964,6 +1008,9 @@ mod rust_simd {
             for (lane, flag) in lanes.iter_mut().zip(flags) {
                 lane[4 * j..4 * j + 4].fill(flag);
             }
+        }
+        if max == 0 {
+            return;
         }
         let [e, i, h, active, gt4, gt6, wd16] = lanes.map(|l| V::load_i16(&l));
         let p = Params {
@@ -979,7 +1026,8 @@ mod rust_simd {
             hi: V::splat((128 << s) - 1),
             max: V::splat(bd.bitdepth_max().as_::<i16>()),
         };
-        match (hv, max) {
+        let dst = at.dst;
+        match (at.hv, max) {
             (super::HV::H, 4) => group_h::<BD, V, 4>(dst, p),
             (super::HV::H, 6) => group_h::<BD, V, 6>(dst, p),
             (super::HV::H, 8) => group_h::<BD, V, 8>(dst, p),
@@ -994,14 +1042,8 @@ mod rust_simd {
     impl Groups for I16x8 {
         const N: usize = 8;
         #[inline(always)]
-        fn group<BD: BitDepth>(
-            dst: Rav1dPictureDataComponentOffset,
-            hv: super::HV,
-            segs: &[Option<Seg>; 4],
-            max: usize,
-            bd: BD,
-        ) {
-            group16::<BD, Self>(dst, hv, segs, max, bd)
+        fn group<BD: BitDepth>(at: At, lut: &Align16<Av1FilterLUT>, bd: BD) {
+            group16::<BD, Self>(at, lut, bd)
         }
     }
 
@@ -1009,49 +1051,52 @@ mod rust_simd {
     impl Groups for I16x16 {
         const N: usize = 16;
         #[inline(always)]
-        fn group<BD: BitDepth>(
-            dst: Rav1dPictureDataComponentOffset,
-            hv: super::HV,
-            segs: &[Option<Seg>; 4],
-            max: usize,
-            bd: BD,
-        ) {
-            group16::<BD, Self>(dst, hv, segs, max, bd)
+        fn group<BD: BitDepth>(at: At, lut: &Align16<Av1FilterLUT>, bd: BD) {
+            group16::<BD, Self>(at, lut, bd)
         }
     }
 
-    /// 8 bpc only.
+    /// The low four bits of `m` as masks, each over four lanes.
+    #[inline(always)]
+    fn seg_masks(m: u32) -> U8x16 {
+        // Bit `j` to bit 0 of byte `j`, which `0xff` then fills.
+        U8x16::spread4(((m & 15) * 0x0020_4081 & 0x0101_0101) * 0xff)
+    }
+
+    /// 8 bpc only. The thresholds as the asm takes them: all four segments' levels at once, a
+    /// level of 0 replaced by the one across the edge, and E and I looked up per lane. A segment
+    /// whose level is 0 stays inactive, but the longest filter is the longest any segment's
+    /// bits ask for.
     impl Groups for U8x16 {
         const N: usize = 16;
         #[inline(always)]
-        fn group<BD: BitDepth>(
-            dst: Rav1dPictureDataComponentOffset,
-            hv: super::HV,
-            segs: &[Option<Seg>; 4],
-            max: usize,
-            _: BD,
-        ) {
+        fn group<BD: BitDepth>(at: At, lut: &Align16<Av1FilterLUT>, _: BD) {
             debug_assert_eq!(BD::BITDEPTH, 8);
-            let mut lanes = [[0u8; 16]; 6];
-            for (j, seg) in segs.iter().enumerate() {
-                let Some(Seg { e, i, h, wd }) = *seg else {
-                    continue;
-                };
-                let flags = [e, i, h, !0, 0u8.wrapping_sub((wd > 4) as u8), 0u8.wrapping_sub((wd == 16) as u8)];
-                for (lane, flag) in lanes.iter_mut().zip(flags) {
-                    lane[4 * j..4 * j + 4].fill(flag);
-                }
+            let [vm, gt4, wd16] = at.masks().map(|m| m & 15);
+            if vm == 0 {
+                return;
             }
-            let [e, i, h, active, gt4, wd16] = lanes.map(|l| U8x16::load(&l));
+            let (sa, sb) = (4 * at.b4_stridea, 4 * at.b4_strideb);
+            let levels = at.lvl.data.index(at.lvl.offset - sb..at.lvl.offset + 3 * sa + 1);
+            let zero = U8x16::splat(0);
+            let l = U8x16::gather4(&levels, sb, sa);
+            let l = U8x16::select(l.le(zero), U8x16::gather4(&levels, 0, sa), l);
             let p = Params8 {
-                e,
-                i,
-                h,
-                active,
-                gt4,
-                wd16,
+                e: l.lookup64(&lut.0.e),
+                i: l.lookup64(&lut.0.i),
+                h: l.shr_u::<4>(),
+                active: seg_masks(vm).andnot(l.le(zero)),
+                gt4: seg_masks(gt4),
+                wd16: seg_masks(wd16),
             };
-            match (hv, max) {
+            let dst = at.dst;
+            let max = match (wd16 != 0, gt4 != 0, at.yuv) {
+                (true, _, _) => 16,
+                (_, true, super::YUV::Y) => 8,
+                (_, true, super::YUV::UV) => 6,
+                _ => 4,
+            };
+            match (at.hv, max) {
                 (super::HV::H, 4) => group_h8::<BD, 4>(dst, p),
                 (super::HV::H, 6) => group_h8::<BD, 6>(dst, p),
                 (super::HV::H, 8) => group_h8::<BD, 8>(dst, p),
@@ -1068,9 +1113,9 @@ mod rust_simd {
     /// the `wh` segments inside the picture takes the scalar filter, so no lane reads beyond it.
     #[inline(always)]
     fn filter_sb<BD: BitDepth, G: Groups, const HV: usize, const YUV: usize>(
-        mut dst: Rav1dPictureDataComponentOffset,
+        dst: Rav1dPictureDataComponentOffset,
         vmask: &[u32; 3],
-        mut lvl: WithOffset<&DisjointMut<AlignedVec2<u8>>>,
+        lvl: WithOffset<&DisjointMut<AlignedVec2<u8>>>,
         b4_stride: usize,
         lut: &Align16<Av1FilterLUT>,
         wh: c_int,
@@ -1087,62 +1132,34 @@ mod rust_simd {
             super::HV::H => (b4_stride, 1),
             super::HV::V => (1, b4_stride),
         };
-        let vm = match yuv {
-            super::YUV::Y => vmask[0] | vmask[1] | vmask[2],
-            super::YUV::UV => vmask[0] | vmask[1],
+        let mut at = At {
+            dst,
+            hv,
+            yuv,
+            vmask: *vmask,
+            lvl,
+            b4_stridea,
+            b4_strideb,
         };
         let n = G::N / 4;
         let mut s0 = 0;
-        while s0 < 32 && vm >> s0 != 0 {
-            let mut segs = [None; 4];
-            let mut max = 0;
-            for (j, seg) in segs.iter_mut().enumerate().take(n) {
-                let xy = 1u32 << (s0 + j);
-                if vm & xy == 0 {
-                    continue;
-                }
-                let at = lvl + 4 * b4_stridea * j;
-                let l = match *at.data.index(at.offset) {
-                    0 => {
-                        let at = at - 4 * b4_strideb;
-                        *at.data.index(at.offset)
-                    }
-                    l => l,
-                };
-                if l == 0 {
-                    continue;
-                }
-                let idx = match yuv {
-                    super::YUV::Y => {
-                        if vmask[2] & xy != 0 {
-                            2
-                        } else {
-                            (vmask[1] & xy != 0) as usize
+        while s0 < 32 && at.masks()[0] != 0 {
+            if at.masks()[0] & ((1 << n) - 1) != 0 {
+                if s0 + n > wh as usize {
+                    for j in 0..n {
+                        if let Some(Seg { e, i, h, wd }) = at.seg(j, lut) {
+                            let dst = at.dst + (4 * j) as isize * stridea;
+                            loop_filter(dst, e, i, h, stridea, strideb, wd as c_int, bd);
                         }
                     }
-                    super::YUV::UV => (vmask[1] & xy != 0) as usize,
-                };
-                let wd = match yuv {
-                    super::YUV::Y => 4 << idx,
-                    super::YUV::UV => 4 + 2 * idx,
-                };
-                let (e, i, h) = (lut.0.e[l as usize], lut.0.i[l as usize], l >> 4);
-                *seg = Some(Seg { e, i, h, wd });
-                max = max.max(wd);
-            }
-            if max != 0 && s0 + n > wh as usize {
-                for (j, seg) in segs.into_iter().enumerate() {
-                    if let Some(Seg { e, i, h, wd }) = seg {
-                        let dst = dst + (4 * j) as isize * stridea;
-                        loop_filter(dst, e, i, h, stridea, strideb, wd as c_int, bd);
-                    }
+                } else {
+                    G::group(at, lut, bd);
                 }
-            } else if max != 0 {
-                G::group(dst, hv, &segs, max, bd);
             }
             s0 += n;
-            dst += (4 * n) as isize * stridea;
-            lvl += 4 * n * b4_stridea;
+            at.vmask = at.vmask.map(|m| m >> n);
+            at.dst += (4 * n) as isize * stridea;
+            at.lvl += 4 * n * b4_stridea;
         }
     }
 

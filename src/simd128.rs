@@ -288,6 +288,21 @@ impl U8x16 {
             unsafe { v.store_halves_at(p.offset(r * stride), p.offset((r + 1) * stride)) };
         }
     }
+
+    /// Byte `j` of `x` in lanes `4 * j..4 * j + 4`.
+    #[inline(always)]
+    pub fn spread4(x: u32) -> Self {
+        let v = Self::from_u32(x);
+        let v = v.zip_lo8(v);
+        v.zip_lo16(v)
+    }
+
+    /// [`Self::spread4`] of the bytes `b[start + j * stride]`.
+    #[inline(always)]
+    pub fn gather4(b: &[u8], start: usize, stride: usize) -> Self {
+        let b = &b[start..][..3 * stride + 1];
+        Self::spread4(u32::from_le_bytes([b[0], b[stride], b[2 * stride], b[3 * stride]]))
+    }
 }
 
 /// Sixteen rows of eight bytes, each in the low half of `r[i]`, as eight columns of sixteen:
@@ -1088,11 +1103,6 @@ mod imp {
     // SAFETY (every `unsafe` here): SSE4.1 holds where these are compiled in (see the module
     // docs), and loads and stores go through bounds-checked slices of 16 or 8 bytes.
     impl U8x16 {
-        #[inline(always)]
-        pub fn load(b: &[u8]) -> Self {
-            Self(unsafe { _mm_loadu_si128(b[..16].as_ptr().cast()) })
-        }
-
         /// # Safety
         ///
         /// The 16 bytes at `p` are readable.
@@ -1125,6 +1135,30 @@ mod imp {
             unsafe {
                 _mm_storel_epi64(lo.cast(), self.0);
                 _mm_storeh_pd(hi.cast(), _mm_castsi128_pd(self.0));
+            }
+        }
+
+        /// `x` in the low four lanes, the others 0.
+        #[inline(always)]
+        pub fn from_u32(x: u32) -> Self {
+            Self(unsafe { _mm_cvtsi32_si128(x as i32) })
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for the others.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            unsafe {
+                let mut r = _mm_setzero_si128();
+                for k in 0..4 {
+                    let t = _mm_loadu_si128(t[16 * k..].as_ptr().cast());
+                    // Indices outside this 16 saturate to the top bit, which zeroes them.
+                    let ik = _mm_adds_epu8(
+                        _mm_sub_epi8(self.0, _mm_set1_epi8(16 * k as i8)),
+                        _mm_set1_epi8(0x70),
+                    );
+                    r = _mm_or_si128(r, _mm_shuffle_epi8(t, ik));
+                }
+                Self(r)
             }
         }
 
@@ -1832,11 +1866,6 @@ mod imp {
     // SAFETY (every `unsafe` here): NEON is part of aarch64, and loads and stores go through
     // bounds-checked slices of 16 or 8 bytes.
     impl U8x16 {
-        #[inline(always)]
-        pub fn load(b: &[u8]) -> Self {
-            Self(unsafe { vld1q_u8(b[..16].as_ptr()) })
-        }
-
         /// # Safety
         ///
         /// The 16 bytes at `p` are readable.
@@ -1870,6 +1899,18 @@ mod imp {
                 vst1_u8(lo, vget_low_u8(self.0));
                 vst1_u8(hi, vget_high_u8(self.0));
             }
+        }
+
+        /// `x` in the low four lanes, the others 0.
+        #[inline(always)]
+        pub fn from_u32(x: u32) -> Self {
+            Self(unsafe { vreinterpretq_u8_u32(vsetq_lane_u32::<0>(x, vdupq_n_u32(0))) })
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for the others.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            Self(unsafe { vqtbl4q_u8(vld1q_u8_x4(t.as_ptr()), self.0) })
         }
 
         #[inline(always)]
@@ -2552,12 +2593,6 @@ mod imp {
     pub type Inner8 = v128;
 
     impl U8x16 {
-        #[inline(always)]
-        pub fn load(b: &[u8]) -> Self {
-            // SAFETY: 16 bytes are in bounds; the load takes unaligned pointers.
-            Self(unsafe { v128_load(b[..16].as_ptr().cast()) })
-        }
-
         /// # Safety
         ///
         /// The 16 bytes at `p` are readable.
@@ -2595,6 +2630,25 @@ mod imp {
                 v128_store64_lane::<0>(self.0, lo.cast());
                 v128_store64_lane::<1>(self.0, hi.cast());
             }
+        }
+
+        /// `x` in the low four lanes, the others 0.
+        #[inline(always)]
+        pub fn from_u32(x: u32) -> Self {
+            Self(u32x4(x, 0, 0, 0))
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for the others.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            let mut r = u8x16_splat(0);
+            for k in 0..4 {
+                // SAFETY: 16 bytes are in bounds; the load takes unaligned pointers.
+                let t = unsafe { v128_load(t[16 * k..].as_ptr().cast()) };
+                // Indices outside this 16 wrap to 16 or more, which the swizzle zeroes.
+                r = v128_or(r, i8x16_swizzle(t, u8x16_sub(self.0, u8x16_splat(16 * k as u8))));
+            }
+            Self(r)
         }
 
         #[inline(always)]
@@ -3222,11 +3276,6 @@ mod imp {
             }))
         }
 
-        #[inline(always)]
-        pub fn load(b: &[u8]) -> Self {
-            Self(b[..16].try_into().unwrap())
-        }
-
         /// # Safety
         ///
         /// The 16 bytes at `p` are readable.
@@ -3267,6 +3316,19 @@ mod imp {
                 lo.cast::<[u8; 8]>().write_unaligned(a);
                 hi.cast::<[u8; 8]>().write_unaligned(b);
             }
+        }
+
+        /// `x` in the low four lanes, the others 0.
+        #[inline(always)]
+        pub fn from_u32(x: u32) -> Self {
+            let x = x.to_le_bytes();
+            Self(std::array::from_fn(|i| if i < 4 { x[i] } else { 0 }))
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for the others.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            Self(self.0.map(|v| t.get(v as usize).copied().unwrap_or(0)))
         }
 
         #[inline(always)]
