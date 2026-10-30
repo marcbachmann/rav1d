@@ -28,6 +28,9 @@ pub struct I32x4(imp::Inner32);
 #[derive(Clone, Copy)]
 pub struct U8x16(imp::Inner8);
 
+#[cfg(target_arch = "aarch64")]
+pub use imp::Lut256;
+
 impl I16x8 {
     /// Bytes `b[..4]` zero-extended into the low four lanes.
     #[inline(always)]
@@ -810,6 +813,41 @@ mod wide {
             Self(unsafe { _mm256_cvtepu8_epi16(_mm_loadu_si128(b[..16].as_ptr().cast())) })
         }
 
+        #[inline(always)]
+        pub fn load_u16(s: &[u16]) -> Self {
+            Self(unsafe { _mm256_loadu_si256(s[..16].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store_u16(self, d: &mut [u16]) {
+            unsafe { _mm256_storeu_si256(d[..16].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn mul(self, o: Self) -> Self {
+            Self(unsafe { _mm256_mullo_epi16(self.0, o.0) })
+        }
+
+        /// `t[lane & mask]` by two `vpgatherdd`s of the dwords from each lane's byte on, the
+        /// lanes split by the in-lane unpacks so that the pack puts them back in order. `t`
+        /// holds three bytes past `mask`.
+        #[inline(always)]
+        pub fn gather_u8(self, t: &[u8], mask: u16) -> Self {
+            assert!(t.len() > mask as usize + 3);
+            unsafe {
+                let v = _mm256_and_si256(self.0, _mm256_set1_epi16(mask as i16));
+                let z = _mm256_setzero_si256();
+                let b = _mm256_set1_epi32(0xff);
+                let p = t.as_ptr().cast();
+                let g0 = _mm256_i32gather_epi32::<1>(p, _mm256_unpacklo_epi16(v, z));
+                let g1 = _mm256_i32gather_epi32::<1>(p, _mm256_unpackhi_epi16(v, z));
+                Self(_mm256_packus_epi32(
+                    _mm256_and_si256(g0, b),
+                    _mm256_and_si256(g1, b),
+                ))
+            }
+        }
+
         /// The lanes saturated to `u8`.
         #[inline(always)]
         pub fn pack_u8(self) -> [u8; 16] {
@@ -1353,6 +1391,12 @@ mod imp {
             I16x8(unsafe { _mm_packs_epi32(lo.0, hi.0) })
         }
 
+        /// `lo` then `hi` shifted right by `N`, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack_shr<const N: i32>(lo: Self, hi: Self) -> I16x8 {
+            Self::pack(lo.shr_s::<N>(), hi.shr_s::<N>())
+        }
+
         #[inline(always)]
         pub fn min(self, o: Self) -> Self {
             Self(unsafe { _mm_min_epi32(self.0, o.0) })
@@ -1463,6 +1507,23 @@ mod imp {
                 Self(_mm_cvtepu8_epi16(r))
             }
         }
+
+        /// `t[lane & mask]` by one `vpgatherdd` of the dwords from each lane's byte on: AVX2
+        /// only, and `t` holds three bytes past `mask`.
+        #[cfg(target_arch = "x86_64")]
+        #[inline(always)]
+        pub fn gather_u8(self, t: &[u8], mask: u16) -> Self {
+            assert!(t.len() > mask as usize + 3);
+            unsafe {
+                let i = _mm256_cvtepu16_epi32(_mm_and_si128(self.0, _mm_set1_epi16(mask as i16)));
+                let g = _mm256_i32gather_epi32::<1>(t.as_ptr().cast(), i);
+                let g = _mm256_and_si256(g, _mm256_set1_epi32(0xff));
+                Self(_mm_packus_epi32(
+                    _mm256_castsi256_si128(g),
+                    _mm256_extracti128_si256::<1>(g),
+                ))
+            }
+        }
     }
 
     // SAFETY (every `unsafe` here): SSE4.1, or SSE2 from `load_u16` on, holds where these are
@@ -1500,6 +1561,22 @@ mod imp {
         #[inline(always)]
         pub fn from_u8x8(b: &[u8]) -> Self {
             Self(unsafe { _mm_cvtepu8_epi16(_mm_loadl_epi64(b[..8].as_ptr().cast())) })
+        }
+
+        /// Bytes `b[..8]` as `i8`, sign-extended.
+        #[inline(always)]
+        pub fn from_i8x8(b: &[u8]) -> Self {
+            Self(unsafe { _mm_cvtepi8_epi16(_mm_loadl_epi64(b[..8].as_ptr().cast())) })
+        }
+
+        /// `(b[2 * i] + b[2 * i + 1] + 1) >> 1` of `b[..16]`.
+        #[inline(always)]
+        pub fn avg_pairs_u8(b: &[u8]) -> Self {
+            unsafe {
+                let v = _mm_loadu_si128(b[..16].as_ptr().cast());
+                let sum = _mm_maddubs_epi16(v, _mm_set1_epi8(1));
+                Self(_mm_avg_epu16(sum, _mm_setzero_si128()))
+            }
         }
 
         /// Little-endian lanes from `b[..16]`.
@@ -2103,6 +2180,12 @@ mod imp {
             I16x8(unsafe { vqmovn_high_s32(vqmovn_s32(lo.0), hi.0) })
         }
 
+        /// `lo` then `hi` shifted right by `N`, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack_shr<const N: i32>(lo: Self, hi: Self) -> I16x8 {
+            I16x8(unsafe { vqshrn_high_n_s32::<N>(vqshrn_n_s32::<N>(lo.0), hi.0) })
+        }
+
         #[inline(always)]
         pub fn min(self, o: Self) -> Self {
             Self(unsafe { vminq_s32(self.0, o.0) })
@@ -2235,6 +2318,18 @@ mod imp {
         #[inline(always)]
         pub fn from_u8x8(b: &[u8]) -> Self {
             Self(s(unsafe { vmovl_u8(vld1_u8(b[..8].as_ptr())) }))
+        }
+
+        /// Bytes `b[..8]` as `i8`, sign-extended.
+        #[inline(always)]
+        pub fn from_i8x8(b: &[u8]) -> Self {
+            Self(unsafe { vmovl_s8(vld1_s8(b[..8].as_ptr().cast())) })
+        }
+
+        /// `(b[2 * i] + b[2 * i + 1] + 1) >> 1` of `b[..16]`.
+        #[inline(always)]
+        pub fn avg_pairs_u8(b: &[u8]) -> Self {
+            Self(s(unsafe { vrshrq_n_u16::<1>(vpaddlq_u8(vld1q_u8(b[..16].as_ptr()))) }))
         }
 
         /// Little-endian lanes from `b[..16]`.
@@ -2640,6 +2735,19 @@ mod imp {
 
     pub type Inner8 = uint8x16_t;
 
+    /// A 256-byte table loaded for [`U8x16::lookup256`].
+    #[derive(Clone, Copy)]
+    pub struct Lut256([uint8x16x4_t; 4]);
+
+    impl Lut256 {
+        #[inline(always)]
+        pub fn new(t: &[u8; 256]) -> Self {
+            Self(std::array::from_fn(|k| unsafe {
+                vld1q_u8_x4(t[64 * k..].as_ptr())
+            }))
+        }
+    }
+
     #[inline(always)]
     fn s8(v: uint8x16_t) -> int8x16_t {
         unsafe { vreinterpretq_s8_u8(v) }
@@ -2844,6 +2952,27 @@ mod imp {
             Self(unsafe { vqrshrun_high_n_s16::<N>(vqrshrun_n_s16::<N>(lo.0), hi.0) })
         }
 
+        /// `lo` then `hi` saturated to `u8`.
+        #[inline(always)]
+        pub fn pack(lo: I16x8, hi: I16x8) -> Self {
+            Self(unsafe { vqmovun_high_s16(vqmovun_s16(lo.0), hi.0) })
+        }
+
+        /// `t[lane]`: one `tbl` and three `tbx` over the table in sixteen registers.
+        #[inline(always)]
+        pub fn lookup256(self, t: &Lut256) -> Self {
+            unsafe {
+                let k = vdupq_n_u8(64);
+                let i1 = vsubq_u8(self.0, k);
+                let i2 = vsubq_u8(i1, k);
+                let i3 = vsubq_u8(i2, k);
+                let r = vqtbl4q_u8(t.0[0], self.0);
+                let r = vqtbx4q_u8(r, t.0[1], i1);
+                let r = vqtbx4q_u8(r, t.0[2], i2);
+                Self(vqtbx4q_u8(r, t.0[3], i3))
+            }
+        }
+
         #[inline(always)]
         pub fn zip_lo8(self, o: Self) -> Self {
             Self(unsafe { vzip1q_u8(self.0, o.0) })
@@ -2976,6 +3105,12 @@ mod imp {
             I16x8(i16x8_narrow_i32x4(lo.0, hi.0))
         }
 
+        /// `lo` then `hi` shifted right by `N`, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack_shr<const N: i32>(lo: Self, hi: Self) -> I16x8 {
+            Self::pack(lo.shr_s::<N>(), hi.shr_s::<N>())
+        }
+
         #[inline(always)]
         pub fn min(self, o: Self) -> Self {
             Self(i32x4_min(self.0, o.0))
@@ -3104,6 +3239,23 @@ mod imp {
         pub fn from_u8x8(b: &[u8]) -> Self {
             // SAFETY: 8 bytes are in bounds; the load takes unaligned pointers.
             Self(unsafe { u16x8_load_extend_u8x8(b[..8].as_ptr()) })
+        }
+
+        /// Bytes `b[..8]` as `i8`, sign-extended.
+        #[inline(always)]
+        pub fn from_i8x8(b: &[u8]) -> Self {
+            // SAFETY: 8 bytes are in bounds; the load takes unaligned pointers.
+            Self(unsafe { i16x8_load_extend_i8x8(b[..8].as_ptr().cast()) })
+        }
+
+        /// `(b[2 * i] + b[2 * i + 1] + 1) >> 1` of `b[..16]`.
+        #[inline(always)]
+        pub fn avg_pairs_u8(b: &[u8]) -> Self {
+            let v = u8x16(
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
+                b[14], b[15],
+            );
+            Self(u16x8_avgr(u16x8_extadd_pairwise_u8x16(v), u16x8_splat(0)))
         }
 
         /// Little-endian lanes from `b[..16]`.
@@ -3509,7 +3661,10 @@ mod imp {
                 // SAFETY: 16 bytes are in bounds; the load takes unaligned pointers.
                 let t = unsafe { v128_load(t[16 * k..].as_ptr().cast()) };
                 // Indices outside this 16 wrap to 16 or more, which the swizzle zeroes.
-                r = v128_or(r, i8x16_swizzle(t, u8x16_sub(self.0, u8x16_splat(16 * k as u8))));
+                r = v128_or(
+                    r,
+                    i8x16_swizzle(t, u8x16_sub(self.0, u8x16_splat(16 * k as u8))),
+                );
             }
             Self(r)
         }
@@ -3521,7 +3676,10 @@ mod imp {
 
         #[inline(always)]
         pub fn abd(self, o: Self) -> Self {
-            Self(v128_or(u8x16_sub_sat(self.0, o.0), u8x16_sub_sat(o.0, self.0)))
+            Self(v128_or(
+                u8x16_sub_sat(self.0, o.0),
+                u8x16_sub_sat(o.0, self.0),
+            ))
         }
 
         #[inline(always)]
@@ -3613,16 +3771,46 @@ mod imp {
 
         #[inline(always)]
         pub fn zip_lo8(self, o: Self) -> Self {
-            Self(i8x16_shuffle::<0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23>(
-                self.0, o.0,
-            ))
+            Self(i8x16_shuffle::<
+                0,
+                16,
+                1,
+                17,
+                2,
+                18,
+                3,
+                19,
+                4,
+                20,
+                5,
+                21,
+                6,
+                22,
+                7,
+                23,
+            >(self.0, o.0))
         }
 
         #[inline(always)]
         pub fn zip_hi8(self, o: Self) -> Self {
-            Self(i8x16_shuffle::<8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31>(
-                self.0, o.0,
-            ))
+            Self(i8x16_shuffle::<
+                8,
+                24,
+                9,
+                25,
+                10,
+                26,
+                11,
+                27,
+                12,
+                28,
+                13,
+                29,
+                14,
+                30,
+                15,
+                31,
+            >(self.0, o.0))
         }
 
         #[inline(always)]
@@ -3735,6 +3923,12 @@ mod imp {
             }))
         }
 
+        /// `lo` then `hi` shifted right by `N`, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack_shr<const N: i32>(lo: Self, hi: Self) -> I16x8 {
+            Self::pack(lo.shr_s::<N>(), hi.shr_s::<N>())
+        }
+
         #[inline(always)]
         pub fn min(self, o: Self) -> Self {
             self.zip(o, i32::min)
@@ -3845,6 +4039,20 @@ mod imp {
         #[inline(always)]
         pub fn from_u8x8(b: &[u8]) -> Self {
             Self(std::array::from_fn(|i| b[i] as i16))
+        }
+
+        /// Bytes `b[..8]` as `i8`, sign-extended.
+        #[inline(always)]
+        pub fn from_i8x8(b: &[u8]) -> Self {
+            Self(std::array::from_fn(|i| b[i] as i8 as i16))
+        }
+
+        /// `(b[2 * i] + b[2 * i + 1] + 1) >> 1` of `b[..16]`.
+        #[inline(always)]
+        pub fn avg_pairs_u8(b: &[u8]) -> Self {
+            Self(std::array::from_fn(|i| {
+                ((b[2 * i] as u16 + b[2 * i + 1] as u16 + 1) >> 1) as i16
+            }))
         }
 
         /// Little-endian lanes from `b[..16]`.
@@ -4101,7 +4309,10 @@ mod imp {
         #[inline(always)]
         pub fn unzip(self, o: Self) -> (Self, Self) {
             let at = |k: usize| [self.0, o.0][k >> 3][k & 7];
-            (Self(std::array::from_fn(|i| at(2 * i))), Self(std::array::from_fn(|i| at(2 * i + 1))))
+            (
+                Self(std::array::from_fn(|i| at(2 * i))),
+                Self(std::array::from_fn(|i| at(2 * i + 1))),
+            )
         }
 
         #[inline(always)]

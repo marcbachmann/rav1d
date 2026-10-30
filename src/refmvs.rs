@@ -6,6 +6,7 @@ use std::{cmp, mem, ptr, slice};
 
 use zerocopy::{AsBytes, FromZeroes};
 
+use crate::cpu::CpuFlags;
 use crate::align::{Align16, AlignedVec64};
 use crate::disjoint_mut::{DisjointMut, DisjointMutArcSlice, DisjointMutGuard, DisjointMutSlice};
 use crate::env::{fix_mv_precision, get_gmv_2d, get_poc_diff};
@@ -1740,6 +1741,56 @@ fn splat_mv_rust<'a>(rr: impl Iterator<Item = &'a mut [RefMvsBlock]>, rmv: &Alig
     }
 }
 
+/// [`splat_mv_rust`] storing four 12-byte blocks as three 16-byte stores.
+mod rust_simd {
+    use super::*;
+    use crate::simd128::U8x16;
+
+    /// # Safety
+    ///
+    /// Must be called by [`splat_mv::Fn::call`].
+    pub unsafe extern "C" fn splat_mv_simd(
+        rr: *mut *mut RefMvsBlock,
+        rmv: &Align16<RefMvsBlock>,
+        bx4: i32,
+        bw4: i32,
+        bh4: i32,
+    ) {
+        let [bx4, bw4, bh4] = [bx4, bw4, bh4].map(|it| it as usize);
+        // SAFETY: Length sliced in `splat_mv::Fn::call`.
+        let rr = unsafe { slice::from_raw_parts(rr, bh4) };
+        let p = [rmv.0; 4];
+        // SAFETY: `RefMvsBlock` has no padding: its 48 bytes are initialized.
+        let v = [0, 16, 32].map(|o| unsafe { U8x16::load_at(p.as_ptr().cast::<u8>().add(o)) });
+        for &r in rr {
+            // SAFETY: `r` is from `rf.r.index_mut((ri + bx4.., ..bw4)).as_mut_ptr().sub(bx4)` in `splat_mv::Fn::call`.
+            let r = unsafe { slice::from_raw_parts_mut(r.add(bx4), bw4) };
+            match bw4 {
+                1 => r[0] = p[0],
+                2 => r.copy_from_slice(&p[..2]),
+                4 => store::<1>(r, &v),
+                8 => store::<2>(r, &v),
+                16 => store::<4>(r, &v),
+                32 => store::<8>(r, &v),
+                _ => r.fill(p[0]),
+            }
+        }
+    }
+
+    /// `N` times the four blocks in `v` at the start of `r`.
+    #[inline(always)]
+    fn store<const N: usize>(r: &mut [RefMvsBlock], v: &[U8x16; 3]) {
+        assert!(r.len() >= 4 * N);
+        let d = r.as_mut_ptr().cast::<u8>();
+        for k in 0..N {
+            for (j, v) in v.iter().enumerate() {
+                // SAFETY: Within the first `4 * N` blocks of `r`.
+                unsafe { v.store_at(d.add(48 * k + 16 * j)) };
+            }
+        }
+    }
+}
+
 impl Rav1dRefmvsDSPContext {
     pub const fn default() -> Self {
         Self {
@@ -1748,10 +1799,238 @@ impl Rav1dRefmvsDSPContext {
             splat_mv: splat_mv::Fn::new(splat_mv_c),
         }
     }
+
+    /// The Rust kernel for `splat_mv`. `save_tmvs` and `load_tmvs` stay as they are: a run
+    /// stored as one fixed-length array, and the candidates picked without branches, were no
+    /// faster than the scalar `save_tmvs`.
+    #[inline(always)]
+    const fn init(mut self) -> Self {
+        self.splat_mv = splat_mv::Fn::new(rust_simd::splat_mv_simd);
+        self
+    }
+
+    pub const fn new(_flags: CpuFlags) -> Self {
+        Self::default().init()
+    }
 }
 
 impl Default for Rav1dRefmvsDSPContext {
     fn default() -> Self {
         Self::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use strum::EnumCount;
+
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u32
+        }
+    }
+
+    fn contexts() -> Vec<(&'static str, Rav1dRefmvsDSPContext)> {
+        vec![
+            ("scalar", Rav1dRefmvsDSPContext::default()),
+            ("rust simd", Rav1dRefmvsDSPContext::default().init()),
+        ]
+    }
+
+    const W4: usize = 64;
+
+    fn block(rng: &mut Rng) -> RefMvsBlock {
+        let mut b = RefMvsBlock::new_zeroed();
+        let mut mv = || {
+            let v = rng.next();
+            let m = if v & 3 == 0 { 0x7fff } else { 0x1fff };
+            ((v >> 8) as i16 & m) - (m >> 1)
+        };
+        b.mv.mv = [Mv { y: mv(), x: mv() }, Mv { y: mv(), x: mv() }];
+        b.r#ref.r#ref = [(rng.next() % 9) as i8 - 1, (rng.next() % 9) as i8 - 1];
+        b.bs = BlockSize::from_repr((rng.next() % BlockSize::COUNT as u32) as u8).unwrap();
+        b.mf = rng.next() as u8;
+        b
+    }
+
+    /// The asm stores aligned, as the rows of `RefMvsFrame::r` are.
+    fn aligned(b: &[RefMvsBlock]) -> AlignedVec64<RefMvsBlock> {
+        let mut v = AlignedVec64::new();
+        v.resize(b.len(), RefMvsBlock::new_zeroed());
+        v.as_mut_slice().copy_from_slice(b);
+        v
+    }
+
+    fn rows(buf: &mut [RefMvsBlock]) -> Vec<*mut RefMvsBlock> {
+        buf.chunks_exact_mut(W4).map(|r| r.as_mut_ptr()).collect()
+    }
+
+    /// `rr` from [`rows`].
+    fn splat_rows(dsp: &Rav1dRefmvsDSPContext, rr: &mut [*mut RefMvsBlock], rmv: &Align16<RefMvsBlock>, bx4: usize, bw4: usize, bh4: usize) {
+        assert!(bh4 <= rr.len() && bx4 + bw4 <= W4);
+        // SAFETY: Each row pointer holds `W4 >= bx4 + bw4` blocks.
+        unsafe { dsp.splat_mv.get()(rr.as_mut_ptr(), rmv, bx4 as i32, bw4 as i32, bh4 as i32) };
+    }
+
+    fn splat(dsp: &Rav1dRefmvsDSPContext, buf: &mut [RefMvsBlock], rmv: RefMvsBlock, bx4: usize, bw4: usize, bh4: usize) {
+        splat_rows(dsp, &mut rows(buf), &Align16(rmv), bx4, bw4, bh4);
+    }
+
+    fn bytes(b: &[RefMvsBlock]) -> Vec<u8> {
+        b.iter()
+            .flat_map(|b| {
+                let mut v = b.mv.as_bytes().to_vec();
+                v.extend_from_slice(b.r#ref.as_bytes());
+                v.extend_from_slice(&[b.bs as u8, b.mf]);
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn splat_mv_matches_scalar() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let dsps = contexts();
+        for i in 0..2000 {
+            let bw4 = 1 << rng.next() % 6;
+            let bh4 = 1 << rng.next() % 6;
+            let bx4 = (rng.next() as usize % (W4 / bw4)) * bw4;
+            let rmv = block(&mut rng);
+            let orig: Vec<_> = (0..W4 * 32).map(|_| block(&mut rng)).collect();
+            let mut want = aligned(&orig);
+            splat(&dsps[0].1, want.as_mut_slice(), rmv, bx4, bw4, bh4);
+            for (name, dsp) in &dsps[1..] {
+                let mut got = aligned(&orig);
+                splat(dsp, got.as_mut_slice(), rmv, bx4, bw4, bh4);
+                assert!(
+                    bytes(got.as_mut_slice()) == bytes(want.as_mut_slice()),
+                    "{name} splat_mv differs, case {i}"
+                );
+            }
+        }
+    }
+
+    struct Tmvs {
+        r: DisjointMut<AlignedVec64<RefMvsBlock>>,
+        ri: [usize; 31],
+        ref_sign: [u8; 7],
+        cols: (i32, i32),
+        rows: (i32, i32),
+    }
+
+    const RP_STRIDE: usize = 64;
+
+    fn tmvs(rng: &mut Rng) -> Tmvs {
+        let mut r = AlignedVec64::new();
+        r.resize(32 * W4 + R_PAD, RefMvsBlock::new_zeroed());
+        r.as_mut_slice().fill_with(|| block(rng));
+        let col_start8 = (rng.next() % 16) as i32;
+        let row_start8 = (rng.next() % 16) as i32;
+        Tmvs {
+            r: DisjointMut::new(r),
+            ri: std::array::from_fn(|j| j * W4),
+            ref_sign: std::array::from_fn(|_| (rng.next() & 1) as u8),
+            cols: (col_start8, col_start8 + 1 + (rng.next() % 24) as i32),
+            rows: (row_start8, row_start8 + 1 + (rng.next() % 16) as i32),
+        }
+    }
+
+    fn new_rp() -> DisjointMutArcSlice<RefMvsTemporalBlock> {
+        (0..32 * RP_STRIDE).map(|_| RefMvsTemporalBlock::default()).collect()
+    }
+
+    fn save_into(dsp: &Rav1dRefmvsDSPContext, t: &Tmvs, rp: &DisjointMutArcSlice<RefMvsTemporalBlock>) {
+        let base = t.r.as_mut_ptr().cast_const();
+        // SAFETY: Every `ri` is in bounds, padded by `R_PAD`, as in `save_tmvs::Fn::call`.
+        let rr = &t.ri.map(|ri| unsafe { base.add(ri) });
+        let (col_start8, col_end8) = t.cols;
+        let (row_start8, row_end8) = t.rows;
+        // SAFETY: In bounds; the rows written are below `32` and the columns below `RP_STRIDE`.
+        let rp_ptr = unsafe { rp.inner.as_mut_ptr().add(row_start8 as usize * RP_STRIDE) };
+        // SAFETY: The arguments are as `save_tmvs::Fn::call` makes them.
+        unsafe {
+            dsp.save_tmvs.get()(
+                rp_ptr,
+                RP_STRIDE as isize,
+                rr,
+                &t.ref_sign,
+                col_end8,
+                row_end8,
+                col_start8,
+                row_start8,
+                FFISafe::new(&t.r),
+                &t.ri,
+                FFISafe::new(rp),
+            )
+        };
+    }
+
+    fn save(dsp: &Rav1dRefmvsDSPContext, t: &Tmvs) -> Vec<u8> {
+        let rp = new_rp();
+        save_into(dsp, t, &rp);
+        let out = rp.inner.index(..);
+        out.iter()
+            .flat_map(|b| {
+                let mv = b.mv;
+                let mut v = mv.into_aligned().as_bytes().to_vec();
+                v.push(b.r#ref as u8);
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn save_tmvs_matches_scalar() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let dsps = contexts();
+        for i in 0..2000 {
+            let t = tmvs(&mut rng);
+            let want = save(&dsps[0].1, &t);
+            for (name, dsp) in &dsps[1..] {
+                assert!(save(dsp, &t) == want, "{name} save_tmvs differs, case {i}");
+            }
+        }
+    }
+
+    /// `cargo test --release --lib refmvs::tests::time -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn time() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut t = tmvs(&mut rng);
+        (t.cols, t.rows) = ((0, 32), (0, 16));
+        let orig: Vec<_> = (0..W4 * 32).map(|_| block(&mut rng)).collect();
+        let rmv = block(&mut rng);
+        let rp = new_rp();
+        for (name, dsp) in contexts() {
+            let mut buf = aligned(&orig);
+            let mut rr = rows(buf.as_mut_slice());
+            let rmv = Align16(rmv);
+            let mut best = [f64::MAX; 2];
+            for _ in 0..7 {
+                let start = Instant::now();
+                for k in 0..1000 {
+                    let bw4 = 1 << k % 6;
+                    splat_rows(black_box(&dsp), &mut rr, &rmv, 0, bw4, bw4);
+                }
+                best[0] = best[0].min(start.elapsed().as_secs_f64() * 1e9 / 1000.);
+                let start = Instant::now();
+                for _ in 0..1000 {
+                    save_into(black_box(&dsp), &t, &rp);
+                }
+                best[1] = best[1].min(start.elapsed().as_secs_f64() * 1e9 / 1000.);
+            }
+            println!("{name:10} splat_mv {:7.1} ns  save_tmvs {:8.1} ns", best[0], best[1]);
+        }
     }
 }

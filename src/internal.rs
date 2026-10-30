@@ -70,8 +70,14 @@ impl Rav1dDSPContext {
     }
 
     pub fn get() -> &'static Self {
-        static DSP: Rav1dDSPContext = Rav1dDSPContext::default();
-        &DSP
+        static DSP: OnceLock<Rav1dDSPContext> = OnceLock::new();
+        DSP.get_or_init(|| {
+            let flags = rav1d_get_cpu_flags();
+            Self {
+                pal: Rav1dPalDSPContext::new(flags),
+                refmvs: Rav1dRefmvsDSPContext::new(flags),
+            }
+        })
     }
 }
 
@@ -106,7 +112,7 @@ impl Rav1dBitDepthDSPContext {
 
     pub const fn new<BD: BitDepth>(flags: CpuFlags, bpc: u8) -> Self {
         Self {
-            fg: Rav1dFilmGrainDSPContext::default::<BD>(),
+            fg: Rav1dFilmGrainDSPContext::new::<BD>(flags),
             ipred: Rav1dIntraPredDSPContext::new::<BD>(flags),
             mc: Rav1dMCDSPContext::default::<BD>(),
             itx: Rav1dInvTxfmDSPContext::new::<BD>(flags, bpc),
