@@ -114,7 +114,7 @@ impl Rav1dBitDepthDSPContext {
         Self {
             fg: Rav1dFilmGrainDSPContext::new::<BD>(flags),
             ipred: Rav1dIntraPredDSPContext::new::<BD>(flags),
-            mc: Rav1dMCDSPContext::default::<BD>(),
+            mc: Rav1dMCDSPContext::new::<BD>(flags),
             itx: Rav1dInvTxfmDSPContext::new::<BD>(flags, bpc),
             lf: Rav1dLoopFilterDSPContext::new::<BD>(flags),
             cdef: Rav1dCdefDSPContext::new::<BD>(flags),

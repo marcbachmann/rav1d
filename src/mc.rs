@@ -6,6 +6,7 @@ use std::{cmp, iter, mem, ptr, slice};
 use to_method::To;
 
 use crate::align::AlignedVec64;
+use crate::cpu::CpuFlags;
 use crate::enum_map::{enum_map, enum_map_ty, DefaultValue};
 use crate::ffi_safe::FFISafe;
 use crate::include::common::bitdepth::{AsPrimitive, BitDepth, DynPixel};
@@ -23,9 +24,13 @@ use crate::pic_or_buf::PicOrBuf;
 use crate::strided::Strided as _;
 use crate::tables::{
     DAV1D_MC_SUBPEL_FILTERS, DAV1D_MC_WARP_FILTER, DAV1D_OBMC_MASKS, DAV1D_RESIZE_FILTER,
+    WARP_FILTER,
 };
 use crate::with_offset::WithOffset;
 use crate::wrap_fn_ptr::wrap_fn_ptr;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+mod rust_simd;
 
 #[inline(never)]
 fn put_rust<BD: BitDepth>(
@@ -2002,5 +2007,77 @@ impl Rav1dMCDSPContext {
             emu_edge: emu_edge::Fn::new(emu_edge_c_erased::<BD>),
             resize: resize::Fn::new(resize_c_erased::<BD>),
         }
+    }
+
+    /// Sixteen lanes once the CPU flags hold AVX2, the 8 bpc first pass in `sdot`s once they
+    /// hold DOTPROD.
+    #[inline(always)]
+    const fn init<BD: BitDepth>(self, flags: CpuFlags) -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if !flags.contains(CpuFlags::SSE41) {
+            return self;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if flags.contains(CpuFlags::AVX2) {
+            return self.rust_simd_tier::<BD, true>();
+        }
+        #[cfg(all(target_arch = "aarch64", rav1d_sdot))]
+        if flags.contains(CpuFlags::DOTPROD) {
+            return self.rust_simd_tier::<BD, true>();
+        }
+        let _ = flags;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        return self.rust_simd_tier::<BD, false>();
+        #[allow(unreachable_code)]
+        self
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+    #[inline(always)]
+    const fn rust_simd_tier<BD: BitDepth, const WIDE: bool>(mut self) -> Self {
+        use self::rust_simd::*;
+
+        self.mc = enum_map!(Filter2d => mc::Fn; match key {
+            Regular8Tap => mc::Fn::new(put_erased::<BD, {Regular8Tap as _}, WIDE>),
+            RegularSmooth8Tap => mc::Fn::new(put_erased::<BD, {RegularSmooth8Tap as _}, WIDE>),
+            RegularSharp8Tap => mc::Fn::new(put_erased::<BD, {RegularSharp8Tap as _}, WIDE>),
+            SharpRegular8Tap => mc::Fn::new(put_erased::<BD, {SharpRegular8Tap as _}, WIDE>),
+            SharpSmooth8Tap => mc::Fn::new(put_erased::<BD, {SharpSmooth8Tap as _}, WIDE>),
+            Sharp8Tap => mc::Fn::new(put_erased::<BD, {Sharp8Tap as _}, WIDE>),
+            SmoothRegular8Tap => mc::Fn::new(put_erased::<BD, {SmoothRegular8Tap as _}, WIDE>),
+            Smooth8Tap => mc::Fn::new(put_erased::<BD, {Smooth8Tap as _}, WIDE>),
+            SmoothSharp8Tap => mc::Fn::new(put_erased::<BD, {SmoothSharp8Tap as _}, WIDE>),
+            Bilinear => mc::Fn::new(put_erased::<BD, {Bilinear as _}, WIDE>),
+        });
+        self.mct = enum_map!(Filter2d => mct::Fn; match key {
+            Regular8Tap => mct::Fn::new(prep_erased::<BD, {Regular8Tap as _}, WIDE>),
+            RegularSmooth8Tap => mct::Fn::new(prep_erased::<BD, {RegularSmooth8Tap as _}, WIDE>),
+            RegularSharp8Tap => mct::Fn::new(prep_erased::<BD, {RegularSharp8Tap as _}, WIDE>),
+            SharpRegular8Tap => mct::Fn::new(prep_erased::<BD, {SharpRegular8Tap as _}, WIDE>),
+            SharpSmooth8Tap => mct::Fn::new(prep_erased::<BD, {SharpSmooth8Tap as _}, WIDE>),
+            Sharp8Tap => mct::Fn::new(prep_erased::<BD, {Sharp8Tap as _}, WIDE>),
+            SmoothRegular8Tap => mct::Fn::new(prep_erased::<BD, {SmoothRegular8Tap as _}, WIDE>),
+            Smooth8Tap => mct::Fn::new(prep_erased::<BD, {Smooth8Tap as _}, WIDE>),
+            SmoothSharp8Tap => mct::Fn::new(prep_erased::<BD, {SmoothSharp8Tap as _}, WIDE>),
+            Bilinear => mct::Fn::new(prep_erased::<BD, {Bilinear as _}, WIDE>),
+        });
+        self.avg = avg::Fn::new(avg_erased::<BD, WIDE>);
+        self.w_avg = w_avg::Fn::new(w_avg_erased::<BD, WIDE>);
+        self.mask = mask::Fn::new(mask_erased::<BD, WIDE>);
+        self.w_mask = enum_map!(Rav1dPixelLayoutSubSampled => w_mask::Fn; match key {
+            I420 => w_mask::Fn::new(w_mask_erased::<BD, true, true, WIDE>),
+            I422 => w_mask::Fn::new(w_mask_erased::<BD, true, false, WIDE>),
+            I444 => w_mask::Fn::new(w_mask_erased::<BD, false, false, WIDE>),
+        });
+        self.blend = blend::Fn::new(blend_erased::<BD, WIDE>);
+        self.blend_v = blend_dir::Fn::new(blend_dir_erased::<BD, true, WIDE>);
+        self.blend_h = blend_dir::Fn::new(blend_dir_erased::<BD, false, WIDE>);
+        self.warp8x8 = warp8x8::Fn::new(warp8x8_erased::<BD, WIDE>);
+        self.warp8x8t = warp8x8t::Fn::new(warp8x8t_erased::<BD, WIDE>);
+        self
+    }
+
+    pub const fn new<BD: BitDepth>(flags: CpuFlags) -> Self {
+        Self::default::<BD>().init::<BD>(flags)
     }
 }

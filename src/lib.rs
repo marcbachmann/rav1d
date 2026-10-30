@@ -1,3 +1,7 @@
+#![cfg_attr(
+    all(target_arch = "aarch64", rav1d_sdot_feature),
+    feature(stdarch_neon_dotprod)
+)]
 #![cfg_attr(target_arch = "arm", feature(stdarch_arm_feature_detection))]
 #![cfg_attr(
     any(target_arch = "riscv32", target_arch = "riscv64"),

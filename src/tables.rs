@@ -796,7 +796,9 @@ pub static DAV1D_MC_SUBPEL_FILTERS: Align8<[[[i8; 8]; 15]; 6]> = Align8([
     ],
 ]);
 
-pub static DAV1D_MC_WARP_FILTER: Align8<[[i8; 8]; 193]> = Align8([
+pub static DAV1D_MC_WARP_FILTER: Align8<[[i8; 8]; 193]> = Align8(WARP_FILTER);
+
+pub const WARP_FILTER: [[i8; 8]; 193] = [
     [0, 0, 127, 1, 0, 0, 0, 0],
     [0, -1, 127, 2, 0, 0, 0, 0],
     [1, -3, 127, 4, -1, 0, 0, 0],
@@ -990,7 +992,7 @@ pub static DAV1D_MC_WARP_FILTER: Align8<[[i8; 8]; 193]> = Align8([
     [0, 0, 0, -1, 4, 127, -3, 1],
     [0, 0, 0, 0, 2, 127, -1, 0],
     [0, 0, 0, 0, 2, 127, -1, 0],
-]);
+];
 
 pub static DAV1D_RESIZE_FILTER: Align8<[[i8; 8]; 64]> = Align8([
     [0, 0, 0, -128, 0, 0, 0, 0],
