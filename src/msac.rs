@@ -270,44 +270,73 @@ impl MsacContext {
     }
 }
 
+/// Only x86 measured faster with the state in registers.
+const IN_REGS: bool = cfg!(target_arch = "x86_64");
+
 impl Drop for MsacLocal<'_> {
     #[inline(always)]
     fn drop(&mut self) {
-        self.s.state.dif = self.dif;
-        self.s.state.rng = self.rng;
-        self.s.state.cnt = self.cnt;
+        if IN_REGS {
+            self.s.state.dif = self.dif;
+            self.s.state.rng = self.rng;
+            self.s.state.cnt = self.cnt;
+        }
     }
 }
 
 impl Ec for MsacLocal<'_> {
     #[inline(always)]
     fn dif(&self) -> EcWin {
-        self.dif
+        if IN_REGS {
+            self.dif
+        } else {
+            self.s.state.dif
+        }
     }
 
     #[inline(always)]
     fn rng(&self) -> c_uint {
-        self.rng
+        if IN_REGS {
+            self.rng
+        } else {
+            self.s.state.rng
+        }
     }
 
     #[inline(always)]
     fn cnt(&self) -> c_int {
-        self.cnt
+        if IN_REGS {
+            self.cnt
+        } else {
+            self.s.state.cnt
+        }
     }
 
     #[inline(always)]
     fn set_dif(&mut self, dif: EcWin) {
-        self.dif = dif;
+        if IN_REGS {
+            self.dif = dif
+        } else {
+            self.s.state.dif = dif
+        }
     }
 
     #[inline(always)]
     fn set_rng(&mut self, rng: c_uint) {
-        self.rng = rng;
+        if IN_REGS {
+            self.rng = rng
+        } else {
+            self.s.state.rng = rng
+        }
     }
 
     #[inline(always)]
     fn set_cnt(&mut self, cnt: c_int) {
-        self.cnt = cnt;
+        if IN_REGS {
+            self.cnt = cnt
+        } else {
+            self.s.state.cnt = cnt
+        }
     }
 
     #[inline(always)]
@@ -317,6 +346,9 @@ impl Ec for MsacLocal<'_> {
 
     #[inline(always)]
     fn refill(&mut self) {
+        if !IN_REGS {
+            return ctx_refill(self.s);
+        }
         self.s.state.dif = self.dif;
         self.s.state.cnt = self.cnt;
         ctx_refill(self.s);
@@ -327,7 +359,7 @@ impl Ec for MsacLocal<'_> {
 
 impl MsacLocal<'_> {
     pub fn rng(&self) -> c_uint {
-        self.rng
+        Ec::rng(self)
     }
 
     #[inline(always)]
