@@ -241,8 +241,6 @@ pub trait Bytes: Copy {
     fn zip_hi64(self, o: Self) -> Self;
     /// Byte `j` of `x` in lanes `4 * j..4 * j + 4`, for each of the `N / 4` low bytes.
     fn spread4(x: u64) -> Self;
-    /// [`Bytes::spread4`] of the bytes `b[start + j * stride]`.
-    fn gather4(b: &[u8], start: usize, stride: usize) -> Self;
     /// `v[r]` from the `N` bytes at `b[start + r * stride..]`.
     fn load_rows(v: &mut [Self], b: &[u8], start: usize, stride: isize);
     fn store_rows(v: &[Self], b: &mut [u8], start: usize, stride: isize);
@@ -370,10 +368,6 @@ macro_rules! forward_bytes {
             #[inline(always)]
             fn spread4(x: u64) -> Self {
                 <$t>::spread4(x as _)
-            }
-            #[inline(always)]
-            fn gather4(b: &[u8], start: usize, stride: usize) -> Self {
-                <$t>::gather4(b, start, stride)
             }
             #[inline(always)]
             fn load_rows(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
@@ -612,13 +606,6 @@ impl U8x16 {
         let v = Self::from_u32(x);
         let v = v.zip_lo8(v);
         v.zip_lo16(v)
-    }
-
-    /// [`Self::spread4`] of the bytes `b[start + j * stride]`.
-    #[inline(always)]
-    pub fn gather4(b: &[u8], start: usize, stride: usize) -> Self {
-        let b = &b[start..][..3 * stride + 1];
-        Self::spread4(u32::from_le_bytes([b[0], b[stride], b[2 * stride], b[3 * stride]]))
     }
 }
 
@@ -1151,16 +1138,6 @@ mod wide {
             }
         }
 
-        /// [`Self::spread4`] of the bytes `b[start + j * stride]`.
-        #[inline(always)]
-        pub fn gather4(b: &[u8], start: usize, stride: usize) -> Self {
-            let b = &b[start..][..7 * stride + 1];
-            let mut l = [0; 8];
-            for (j, l) in l.iter_mut().enumerate() {
-                *l = b[j * stride];
-            }
-            Self::spread4(u64::from_le_bytes(l))
-        }
 
         /// `v[r]` from the 32 bytes at `b[start + r * stride..]`.
         #[inline(always)]

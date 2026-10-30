@@ -1050,15 +1050,18 @@ mod rust_simd {
         }
     }
 
-    /// [`Bytes::gather4`] of the first `n` levels, the others 0.
+    /// [`Bytes::spread4`] of the first `n` levels from `lvl[start]`, `stride` apart, the others 0.
+    /// One byte at a time: the bytes between belong to blocks other threads may be writing.
     #[inline(always)]
-    fn levels8<B: Bytes>(b: &[u8], start: usize, stride: usize, n: usize) -> B {
-        if n == B::N / 4 {
-            return B::gather4(b, start, stride);
-        }
+    fn levels8<B: Bytes>(
+        lvl: &DisjointMut<AlignedVec2<u8>>,
+        start: usize,
+        stride: usize,
+        n: usize,
+    ) -> B {
         let mut l = [0; 8];
         for (j, l) in l.iter_mut().enumerate().take(n) {
-            *l = b[start + j * stride];
+            *l = *lvl.index(start + j * stride);
         }
         B::spread4(u64::from_le_bytes(l))
     }
@@ -1265,13 +1268,9 @@ mod rust_simd {
             return;
         }
         let (sa, sb) = (4 * at.b4_stridea, 4 * at.b4_strideb);
-        let levels = at
-            .lvl
-            .data
-            .index(at.lvl.offset - sb..at.lvl.offset + (n - 1) * sa + 1);
         let zero = B::splat(0);
-        let l = levels8::<B>(&levels, sb, sa, n);
-        let l = B::select(l.le(zero), levels8(&levels, 0, sa, n), l);
+        let l = levels8::<B>(at.lvl.data, at.lvl.offset, sa, n);
+        let l = B::select(l.le(zero), levels8(at.lvl.data, at.lvl.offset - sb, sa, n), l);
         let p = Params8 {
             e: l.lookup64(&lut.0.e),
             i: l.lookup64(&lut.0.i),
