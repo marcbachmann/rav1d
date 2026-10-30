@@ -289,7 +289,9 @@ mod rust_simd {
     use super::*;
     #[cfg(target_arch = "x86_64")]
     use crate::simd128::I16x16;
-    use crate::simd128::{transpose16x8, transpose8x16, transpose8x8, I16x8, Lanes, U8x16};
+    use crate::simd128::{
+        transpose16x4, transpose16x8, transpose4x16, transpose8x16, transpose8x8, I16x8, Lanes, U8x16,
+    };
 
     /// A lane type with its pixel loads and stores.
     pub trait Px: Lanes {
@@ -886,9 +888,20 @@ mod rust_simd {
         U8x16::store_rows(&px[7 - w..7 + w], rows.as_bytes_mut(), start, stride);
     }
 
-    /// [`group_h`] at 8 bpc: sixteen rows of 8 (or 16) bytes turned into columns.
+    /// [`group_h`] at 8 bpc: sixteen rows of 4, 8 or 16 bytes turned into columns.
     #[inline(always)]
     fn group_h8<BD: BitDepth, const MAX: usize>(dst: Rav1dPictureDataComponentOffset, p: Params8) {
+        if MAX == 4 {
+            // As the asm, only the four columns the filter reads.
+            let (mut rows, stride, start) = rows_mut::<BD>(dst - 2usize, 16, 4);
+            let mut v = [U8x16::splat(0); 16];
+            U8x16::load_rows_s(&mut v, rows.as_bytes(), start, stride);
+            let mut px = [U8x16::splat(0); 14];
+            px[5..9].copy_from_slice(&transpose16x4(&v));
+            filter8::<MAX>(&mut px, p);
+            let v = transpose4x16(&[px[5], px[6], px[7], px[8]]);
+            return U8x16::store_rows_quarters(&v, rows.as_bytes_mut(), start, stride);
+        }
         let (n, x0) = if MAX == 16 { (2, -8) } else { (1, -4) };
         let (mut rows, stride, start) = rows_mut::<BD>(dst + x0, 16, 8 * n);
         let mut win = [[U8x16::splat(0); 8]; 2];

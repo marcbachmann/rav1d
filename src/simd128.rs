@@ -289,6 +289,33 @@ impl U8x16 {
         }
     }
 
+    /// [`Self::load_rows`] of four bytes, in the low quarters.
+    #[inline(always)]
+    pub fn load_rows_s(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
+        rows_fit(b.len(), start, stride, v.len(), 4);
+        let p = b.as_ptr().wrapping_add(start);
+        for (r, v) in v.iter_mut().enumerate() {
+            // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
+            let x = unsafe { p.offset(r as isize * stride).cast::<u32>().read_unaligned() };
+            *v = Self::from_u32(x);
+        }
+    }
+
+    /// The quarters of `v[i]` into rows `4 * i..4 * i + 4` of four bytes.
+    #[inline(always)]
+    pub fn store_rows_quarters(v: &[Self], b: &mut [u8], start: usize, stride: isize) {
+        rows_fit(b.len(), start, stride, 4 * v.len(), 4);
+        let p = b.as_mut_ptr().wrapping_add(start);
+        for (i, v) in v.iter().enumerate() {
+            let x = [v.lane32::<0>(), v.lane32::<1>(), v.lane32::<2>(), v.lane32::<3>()];
+            for (k, x) in x.into_iter().enumerate() {
+                let r = (4 * i + k) as isize;
+                // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
+                unsafe { p.offset(r * stride).cast::<u32>().write_unaligned(x) };
+            }
+        }
+    }
+
     /// Byte `j` of `x` in lanes `4 * j..4 * j + 4`.
     #[inline(always)]
     pub fn spread4(x: u32) -> Self {
@@ -341,6 +368,53 @@ pub fn transpose16x8(r: &[U8x16; 16]) -> [U8x16; 8] {
         out[2 * i + 1] = c[i].zip_hi64(c[i + 4]);
     }
     out
+}
+
+/// [`transpose16x8`] of sixteen rows of four bytes, each in the low quarter of `r[i]`.
+#[inline(always)]
+pub fn transpose16x4(r: &[U8x16; 16]) -> [U8x16; 4] {
+    let mut a = [r[0]; 8];
+    for (j, a) in a.iter_mut().enumerate() {
+        *a = r[2 * j].zip_lo8(r[2 * j + 1]);
+    }
+    // Four rows each, the four columns.
+    let b = [
+        a[0].zip_lo16(a[1]),
+        a[2].zip_lo16(a[3]),
+        a[4].zip_lo16(a[5]),
+        a[6].zip_lo16(a[7]),
+    ];
+    // Eight rows each, two columns at a time.
+    let c = [
+        b[0].zip_lo32(b[1]),
+        b[0].zip_hi32(b[1]),
+        b[2].zip_lo32(b[3]),
+        b[2].zip_hi32(b[3]),
+    ];
+    [
+        c[0].zip_lo64(c[2]),
+        c[0].zip_hi64(c[2]),
+        c[1].zip_lo64(c[3]),
+        c[1].zip_hi64(c[3]),
+    ]
+}
+
+/// [`transpose16x4`] back: rows `4 * i..4 * i + 4` in the quarters of `out[i]`.
+#[inline(always)]
+pub fn transpose4x16(c: &[U8x16; 4]) -> [U8x16; 4] {
+    // Rows 0-7 then 8-15, two columns each.
+    let a = [
+        c[0].zip_lo8(c[1]),
+        c[2].zip_lo8(c[3]),
+        c[0].zip_hi8(c[1]),
+        c[2].zip_hi8(c[3]),
+    ];
+    [
+        a[0].zip_lo16(a[1]),
+        a[0].zip_hi16(a[1]),
+        a[2].zip_lo16(a[3]),
+        a[2].zip_hi16(a[3]),
+    ]
 }
 
 /// [`transpose16x8`] back: eight columns of sixteen bytes as sixteen rows of eight, rows `2 * i`
@@ -1138,6 +1212,12 @@ mod imp {
             }
         }
 
+        /// Bytes `4 * L..4 * L + 4`.
+        #[inline(always)]
+        pub fn lane32<const L: i32>(self) -> u32 {
+            unsafe { _mm_extract_epi32::<L>(self.0) as u32 }
+        }
+
         /// `x` in the low four lanes, the others 0.
         #[inline(always)]
         pub fn from_u32(x: u32) -> Self {
@@ -1901,6 +1981,12 @@ mod imp {
             }
         }
 
+        /// Bytes `4 * L..4 * L + 4`.
+        #[inline(always)]
+        pub fn lane32<const L: i32>(self) -> u32 {
+            unsafe { vgetq_lane_u32::<L>(vreinterpretq_u32_u8(self.0)) }
+        }
+
         /// `x` in the low four lanes, the others 0.
         #[inline(always)]
         pub fn from_u32(x: u32) -> Self {
@@ -2632,6 +2718,12 @@ mod imp {
             }
         }
 
+        /// Bytes `4 * L..4 * L + 4`.
+        #[inline(always)]
+        pub fn lane32<const L: i32>(self) -> u32 {
+            u32x4_extract_lane::<{ L as usize }>(self.0)
+        }
+
         /// `x` in the low four lanes, the others 0.
         #[inline(always)]
         pub fn from_u32(x: u32) -> Self {
@@ -3316,6 +3408,13 @@ mod imp {
                 lo.cast::<[u8; 8]>().write_unaligned(a);
                 hi.cast::<[u8; 8]>().write_unaligned(b);
             }
+        }
+
+        /// Bytes `4 * L..4 * L + 4`.
+        #[inline(always)]
+        pub fn lane32<const L: i32>(self) -> u32 {
+            let l = 4 * L as usize;
+            u32::from_le_bytes(self.0[l..l + 4].try_into().unwrap())
         }
 
         /// `x` in the low four lanes, the others 0.
