@@ -3896,7 +3896,8 @@ mod tests {
                 } else {
                     name.to_string()
                 };
-                if (k >= 11 && w != 8) || (w == 4 && k >= 6 && k != 9) || !name.contains(&*only) {
+                let key = format!("{max} {name} {w}x{w}");
+                if (k >= 11 && w != 8) || (w == 4 && k >= 6 && k != 9) || !key.contains(&*only) {
                     continue;
                 }
                 let mut line = format!("{max:4} {name:10} {w:3}x{w:<3}");
