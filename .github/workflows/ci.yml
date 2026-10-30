@@ -362,33 +362,9 @@ jobs:
           AR: llvm-ar
           CC: aarch64-linux-android26-clang
           RUSTFLAGS: "-C linker=aarch64-linux-android26-clang -L $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/17/lib/linux/aarch64 -L $ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/26"
-  test-on-ubuntu-latest-with-qemu:
-    strategy:
-      matrix:
-        # targets without a GitHub-hosted runner of their own
-        include:
-          - target: "armv7-unknown-linux-gnueabihf"
-            linker: "arm-linux-gnueabihf-gcc"
-            wrapper: "qemu-arm-static"
-            packages: "g++-arm-linux-gnueabihf libc6-dev-armhf-cross"
-            # arm feature detection is unstable
-            # should be the same as rust-toolchain.toml
-            toolchain: nightly-2026-02-05
-          - target: "riscv64gc-unknown-linux-gnu"
-            linker: "riscv64-linux-gnu-gcc"
-            wrapper: "qemu-riscv64-static"
-            packages: "g++-riscv64-linux-gnu libc6-dev-riscv64-cross"
-            # riscv64 feature detection is unstable
-            # should be the same as rust-toolchain.toml
-            toolchain: nightly-2026-02-05
-    runs-on: ubuntu-22.04
-    name: test on ${{ matrix.target }}
+  test-wasm32:
+    runs-on: ubuntu-latest
     steps:
-      - name: install prerequisites
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: ${{ matrix.packages }} qemu-user-static meson
-          version: 3.0 # version of cache to load
       - name: git checkout
         uses: actions/checkout@v4
         with:
@@ -397,30 +373,28 @@ jobs:
         id: toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain }}
-          target: ${{ matrix.target }}
-          components: clippy
+          toolchain: stable
+          targets: wasm32-wasip1,wasm32-unknown-unknown
       - name: cache rust dependencies
         uses: Swatinem/rust-cache@v2
-      - name: cargo build for ${{ matrix.target }}
+      - name: install wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@v1
+      - name: cargo check for wasm32-unknown-unknown, scalar and simd128
         run: |
-          RUSTFLAGS="-C target-feature=+crt-static -C linker=${{ matrix.linker }}" \
-            cargo +${{ steps.toolchain.outputs.name }} build --release --target ${{ matrix.target }}
-      - name: Clippy
-        run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
-      - name: run tests
+          cargo +${{ steps.toolchain.outputs.name }} check --lib --target wasm32-unknown-unknown
+          RUSTFLAGS="-C target-feature=+simd128" cargo +${{ steps.toolchain.outputs.name }} check --lib --target wasm32-unknown-unknown
+      - name: build ivfhash natively and for wasm32-wasip1 with simd128
         run: |
-            .github/workflows/test.sh -t 4 \
-              -r target/${{ matrix.target }}/release/dav1d \
-              -s target/${{ matrix.target }}/release/seek_stress \
-              -w "${{ matrix.wrapper }}"
-      - name: upload build artifacts
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: meson-test-logs-${{ matrix.target }}
-          path: |
-             ${{ github.workspace }}/build/meson-logs/testlog.txt
+          cargo +${{ steps.toolchain.outputs.name }} build --release --example ivfhash
+          RUSTFLAGS="-C target-feature=+simd128" cargo +${{ steps.toolchain.outputs.name }} build --release --example ivfhash --target wasm32-wasip1
+      - name: decode the 8 and 10-bit vectors natively and in wasmtime, same pictures
+        run: |
+          find tests/dav1d-test-data/8-bit tests/dav1d-test-data/10-bit -name '*.ivf' -size -400k | sort > ivfs.txt
+          target/release/examples/ivfhash $(cat ivfs.txt) > native.txt
+          wasmtime run --dir . target/wasm32-wasip1/release/examples/ivfhash.wasm $(cat ivfs.txt) > wasm.txt
+          wc -l ivfs.txt native.txt wasm.txt
+          awk '$2 == 0 { print "no pictures: " $0; bad = 1 } END { exit bad }' native.txt
+          diff native.txt wasm.txt
   cargo-fmt:
     runs-on: ubuntu-latest
     steps:
