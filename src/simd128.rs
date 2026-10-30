@@ -255,6 +255,7 @@ impl U8x16 {
     }
 
     /// [`Self::load_rows`] of eight bytes, in the low halves.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     #[inline(always)]
     pub fn load_rows_lo(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
         rows_fit(b.len(), start, stride, v.len(), 8);
@@ -277,6 +278,7 @@ impl U8x16 {
     }
 
     /// The halves of `v[i]` into rows `2 * i` and `2 * i + 1` of eight bytes.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     #[inline(always)]
     pub fn store_rows_halves(v: &[Self], b: &mut [u8], start: usize, stride: isize) {
         rows_fit(b.len(), start, stride, 2 * v.len(), 8);
@@ -289,6 +291,7 @@ impl U8x16 {
     }
 
     /// [`Self::load_rows`] of four bytes, in the low quarters.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     #[inline(always)]
     pub fn load_rows_s(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
         rows_fit(b.len(), start, stride, v.len(), 4);
@@ -301,6 +304,7 @@ impl U8x16 {
     }
 
     /// The quarters of `v[i]` into rows `4 * i..4 * i + 4` of four bytes.
+    #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     #[inline(always)]
     pub fn store_rows_quarters(v: &[Self], b: &mut [u8], start: usize, stride: isize) {
         rows_fit(b.len(), start, stride, 4 * v.len(), 4);
@@ -313,6 +317,87 @@ impl U8x16 {
                 unsafe { p.offset(r * stride).cast::<u32>().write_unaligned(x) };
             }
         }
+    }
+
+    /// Sixteen rows of eight bytes from `b[start + r * stride..]` as eight columns of sixteen.
+    #[inline(always)]
+    pub fn load_cols8(b: &[u8], start: usize, stride: isize) -> [Self; 8] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            rows_fit(b.len(), start, stride, 16, 8);
+            let p = b.as_ptr().wrapping_add(start);
+            let mut v = [Self::splat(0); 8];
+            for (i, v) in v.iter_mut().enumerate() {
+                let r = i as isize;
+                // SAFETY: Rows `r` and `r + 8` lie in `b`, checked by `rows_fit`.
+                *v = unsafe { Self::load_halves_at(p.offset(r * stride), p.offset((r + 8) * stride)) };
+            }
+            imp::transpose_8x16b(v)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut r = [Self::splat(0); 16];
+            Self::load_rows_lo(&mut r, b, start, stride);
+            transpose16x8(&r)
+        }
+    }
+
+    /// [`Self::load_cols8`] back.
+    #[inline(always)]
+    pub fn store_cols8(c: &[Self; 8], b: &mut [u8], start: usize, stride: isize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            rows_fit(b.len(), start, stride, 16, 8);
+            let p = b.as_mut_ptr().wrapping_add(start);
+            for (i, v) in imp::transpose_8x16b(*c).into_iter().enumerate() {
+                let r = i as isize;
+                // SAFETY: Rows `r` and `r + 8` lie in `b`, checked by `rows_fit`.
+                unsafe { v.store_halves_at(p.offset(r * stride), p.offset((r + 8) * stride)) };
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        Self::store_rows_halves(&transpose8x16(c), b, start, stride);
+    }
+
+    /// [`Self::load_cols8`] of four bytes per row.
+    #[inline(always)]
+    pub fn load_cols4(b: &[u8], start: usize, stride: isize) -> [Self; 4] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            rows_fit(b.len(), start, stride, 16, 4);
+            let p = b.as_ptr().wrapping_add(start);
+            let mut v = [Self::splat(0); 4];
+            for (j, v) in v.iter_mut().enumerate() {
+                // Rows `j`, `j + 4`, `j + 8` and `j + 12`, as the asm's transpose takes them.
+                let row = |l: usize| p.wrapping_offset((j + 4 * l) as isize * stride);
+                // SAFETY: The four rows lie in `b`, checked by `rows_fit`.
+                *v = unsafe { Self::load_lanes32_at([row(0), row(1), row(2), row(3)]) };
+            }
+            imp::transpose_4x16b(v)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut r = [Self::splat(0); 16];
+            Self::load_rows_s(&mut r, b, start, stride);
+            transpose16x4(&r)
+        }
+    }
+
+    /// [`Self::load_cols4`] back.
+    #[inline(always)]
+    pub fn store_cols4(c: &[Self; 4], b: &mut [u8], start: usize, stride: isize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            rows_fit(b.len(), start, stride, 16, 4);
+            let p = b.as_mut_ptr().wrapping_add(start);
+            for (j, v) in imp::transpose_4x16b(*c).into_iter().enumerate() {
+                let row = |l: usize| p.wrapping_offset((j + 4 * l) as isize * stride);
+                // SAFETY: The four rows lie in `b`, checked by `rows_fit`.
+                unsafe { v.store_lanes32_at([row(0), row(1), row(2), row(3)]) };
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        Self::store_rows_quarters(&transpose4x16(c), b, start, stride);
     }
 
     /// Byte `j` of `x` in lanes `4 * j..4 * j + 4`.
@@ -333,6 +418,7 @@ impl U8x16 {
 
 /// Sixteen rows of eight bytes, each in the low half of `r[i]`, as eight columns of sixteen:
 /// pairs of rows interleaved into 16-bit elements, then [`transpose8x8`]'s rounds on those.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 pub fn transpose16x8(r: &[U8x16; 16]) -> [U8x16; 8] {
     let mut a = [r[0]; 8];
@@ -370,6 +456,7 @@ pub fn transpose16x8(r: &[U8x16; 16]) -> [U8x16; 8] {
 }
 
 /// [`transpose16x8`] of sixteen rows of four bytes, each in the low quarter of `r[i]`.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 pub fn transpose16x4(r: &[U8x16; 16]) -> [U8x16; 4] {
     let mut a = [r[0]; 8];
@@ -399,6 +486,7 @@ pub fn transpose16x4(r: &[U8x16; 16]) -> [U8x16; 4] {
 }
 
 /// [`transpose16x4`] back: rows `4 * i..4 * i + 4` in the quarters of `out[i]`.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 pub fn transpose4x16(c: &[U8x16; 4]) -> [U8x16; 4] {
     // Rows 0-7 then 8-15, two columns each.
@@ -418,6 +506,7 @@ pub fn transpose4x16(c: &[U8x16; 4]) -> [U8x16; 4] {
 
 /// [`transpose16x8`] back: eight columns of sixteen bytes as sixteen rows of eight, rows `2 * i`
 /// and `2 * i + 1` in the halves of `out[i]`. Three rounds, as halves need no fourth.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 pub fn transpose8x16(c: &[U8x16; 8]) -> [U8x16; 8] {
     // Rows 0-7 then 8-15, two columns each.
@@ -1935,6 +2024,55 @@ mod imp {
         }
     }
 
+    /// dav1d's `transpose_8x16b`: `v[i]` holding rows `i` and `i + 8` in its halves become the
+    /// eight columns of sixteen, and back. 24 `trn`s where interleaves take 32.
+    #[inline(always)]
+    pub fn transpose_8x16b(v: [U8x16; 8]) -> [U8x16; 8] {
+        let v = v.map(|v| v.0);
+        unsafe {
+            let h = |v: uint8x16_t| vreinterpretq_u16_u8(v);
+            let w = |v: uint16x8_t| vreinterpretq_u32_u16(v);
+            let (t8, t9) = (vtrn1q_u8(v[0], v[1]), vtrn2q_u8(v[0], v[1]));
+            let (r1, r3) = (vtrn1q_u8(v[2], v[3]), vtrn2q_u8(v[2], v[3]));
+            let (r0, r5) = (vtrn1q_u8(v[4], v[5]), vtrn2q_u8(v[4], v[5]));
+            let (r2, r7) = (vtrn1q_u8(v[6], v[7]), vtrn2q_u8(v[6], v[7]));
+            let (r4, r2) = (vtrn1q_u16(h(r0), h(r2)), vtrn2q_u16(h(r0), h(r2)));
+            let (r6, r7) = (vtrn1q_u16(h(r5), h(r7)), vtrn2q_u16(h(r5), h(r7)));
+            let (r5, t9) = (vtrn1q_u16(h(t9), h(r3)), vtrn2q_u16(h(t9), h(r3)));
+            let (r3, t8) = (vtrn1q_u16(h(t8), h(r1)), vtrn2q_u16(h(t8), h(r1)));
+            let c = [
+                vtrn1q_u32(w(r3), w(r4)),
+                vtrn1q_u32(w(r5), w(r6)),
+                vtrn1q_u32(w(t8), w(r2)),
+                vtrn1q_u32(w(t9), w(r7)),
+                vtrn2q_u32(w(r3), w(r4)),
+                vtrn2q_u32(w(r5), w(r6)),
+                vtrn2q_u32(w(t8), w(r2)),
+                vtrn2q_u32(w(t9), w(r7)),
+            ];
+            c.map(|c| U8x16(vreinterpretq_u8_u32(c)))
+        }
+    }
+
+    /// dav1d's `transpose_4x16b`: `v[j]` holding rows `j`, `j + 4`, `j + 8` and `j + 12` in its
+    /// quarters become the four columns of sixteen, and back.
+    #[inline(always)]
+    pub fn transpose_4x16b(v: [U8x16; 4]) -> [U8x16; 4] {
+        let v = v.map(|v| v.0);
+        unsafe {
+            let h = |v: uint8x16_t| vreinterpretq_u16_u8(v);
+            let (t4, t5) = (vtrn1q_u8(v[0], v[1]), vtrn2q_u8(v[0], v[1]));
+            let (t6, t7) = (vtrn1q_u8(v[2], v[3]), vtrn2q_u8(v[2], v[3]));
+            let c = [
+                vtrn1q_u16(h(t4), h(t6)),
+                vtrn1q_u16(h(t5), h(t7)),
+                vtrn2q_u16(h(t4), h(t6)),
+                vtrn2q_u16(h(t5), h(t7)),
+            ];
+            c.map(|c| U8x16(vreinterpretq_u8_u16(c)))
+        }
+    }
+
     pub type Inner8 = uint8x16_t;
 
     #[inline(always)]
@@ -1989,6 +2127,49 @@ mod imp {
         #[inline(always)]
         pub fn lane32<const L: i32>(self) -> u32 {
             unsafe { vgetq_lane_u32::<L>(vreinterpretq_u32_u8(self.0)) }
+        }
+
+        /// # Safety
+        ///
+        /// The 8 bytes at `lo` and at `hi` are readable.
+        #[inline(always)]
+        pub unsafe fn load_halves_at(lo: *const u8, hi: *const u8) -> Self {
+            Self(unsafe { vcombine_u8(vld1_u8(lo), vld1_u8(hi)) })
+        }
+
+        /// # Safety
+        ///
+        /// The 4 bytes at each `p[l]` are readable.
+        #[inline(always)]
+        pub unsafe fn load_lanes32_at(p: [*const u8; 4]) -> Self {
+            // SAFETY: The caller's; the reads are unaligned.
+            let x = p.map(|p| unsafe { p.cast::<u32>().read_unaligned() });
+            unsafe {
+                let v = vdupq_n_u32(x[0]);
+                let v = vsetq_lane_u32::<1>(x[1], v);
+                let v = vsetq_lane_u32::<2>(x[2], v);
+                Self(vreinterpretq_u8_u32(vsetq_lane_u32::<3>(x[3], v)))
+            }
+        }
+
+        /// # Safety
+        ///
+        /// The 4 bytes at each `p[l]` are writable.
+        #[inline(always)]
+        pub unsafe fn store_lanes32_at(self, p: [*mut u8; 4]) {
+            let x = unsafe {
+                let v = vreinterpretq_u32_u8(self.0);
+                [
+                    vgetq_lane_u32::<0>(v),
+                    vgetq_lane_u32::<1>(v),
+                    vgetq_lane_u32::<2>(v),
+                    vgetq_lane_u32::<3>(v),
+                ]
+            };
+            for (p, x) in p.into_iter().zip(x) {
+                // SAFETY: The caller's; the writes are unaligned.
+                unsafe { p.cast::<u32>().write_unaligned(x) };
+            }
         }
 
         /// `x` in the low four lanes, the others 0.

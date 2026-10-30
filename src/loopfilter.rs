@@ -290,7 +290,7 @@ mod rust_simd {
     #[cfg(target_arch = "x86_64")]
     use crate::simd128::I16x16;
     use crate::simd128::{
-        transpose16x4, transpose16x8, transpose4x16, transpose8x16, transpose8x8, I16x8, Lanes, U8x16,
+        transpose8x8, I16x8, Lanes, U8x16,
     };
 
     /// A lane type with its pixel loads and stores.
@@ -937,13 +937,11 @@ mod rust_simd {
         if MAX == 4 {
             // As the asm, only the four columns the filter reads.
             let (mut rows, stride, start) = rows_mut::<BD>(dst - 2usize, 16, 4);
-            let mut v = [U8x16::splat(0); 16];
-            U8x16::load_rows_s(&mut v, rows.as_bytes(), start, stride);
             let mut px = [U8x16::splat(0); 14];
-            px[5..9].copy_from_slice(&transpose16x4(&v));
+            px[5..9].copy_from_slice(&U8x16::load_cols4(rows.as_bytes(), start, stride));
             if filter8::<MAX>(&mut px, p) != 0 {
-                let v = transpose4x16(&[px[5], px[6], px[7], px[8]]);
-                U8x16::store_rows_quarters(&v, rows.as_bytes_mut(), start, stride);
+                let c = [px[5], px[6], px[7], px[8]];
+                U8x16::store_cols4(&c, rows.as_bytes_mut(), start, stride);
             }
             return;
         }
@@ -951,9 +949,7 @@ mod rust_simd {
         let (mut rows, stride, start) = rows_mut::<BD>(dst + x0, 16, 8 * n);
         let mut win = [[U8x16::splat(0); 8]; 2];
         for (w, win) in win.iter_mut().enumerate().take(n) {
-            let mut v = [U8x16::splat(0); 16];
-            U8x16::load_rows_lo(&mut v, rows.as_bytes(), start + 8 * w, stride);
-            *win = transpose16x8(&v);
+            *win = U8x16::load_cols8(rows.as_bytes(), start + 8 * w, stride);
         }
         let mut px = [U8x16::splat(0); 14];
         for k in -7..7isize {
@@ -969,12 +965,11 @@ mod rust_simd {
         match changed {
             0 => {}
             2 => {
-                let v = transpose4x16(&[px[5], px[6], px[7], px[8]]);
-                U8x16::store_rows_quarters(&v, rows, at(-2), stride);
+                U8x16::store_cols4(&[px[5], px[6], px[7], px[8]], rows, at(-2), stride);
             }
             3 => {
                 let c = [px[3], px[4], px[5], px[6], px[7], px[8], px[9], px[10]];
-                U8x16::store_rows_halves(&transpose8x16(&c), rows, at(-4), stride);
+                U8x16::store_cols8(&c, rows, at(-4), stride);
             }
             _ if MAX == 16 => {
                 for k in -7..7isize {
@@ -982,8 +977,7 @@ mod rust_simd {
                     win[c / 8][c % 8] = px[(7 + k) as usize];
                 }
                 for (w, win) in win.iter().enumerate() {
-                    let v = transpose8x16(win);
-                    U8x16::store_rows_halves(&v, rows, start + 8 * w, stride);
+                    U8x16::store_cols8(win, rows, start + 8 * w, stride);
                 }
             }
             _ => {}
