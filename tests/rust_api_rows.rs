@@ -3,9 +3,7 @@
 //! sequence headers parsed alone.
 
 use std::hash::{DefaultHasher, Hasher};
-use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -726,29 +724,30 @@ fn fails_a_frame_its_allocator_breaks() {
     assert!(decoded.out.first().is_some_and(|o| o.is_err()), "{:?}", decoded.out);
 }
 
+/// The sequence header parsed alone is the one the decoder decodes the first frame under.
 #[test]
 fn parses_a_sequence_header_alone() {
     let mut checked = 0;
     for file in streams().iter().step_by(16) {
         let data = std::fs::read(file).unwrap();
         let Some(&frame) = ivf_frames(&data).first() else { continue };
-        let mut c = MaybeUninit::<rav1d::include::dav1d::headers::Dav1dSequenceHeader>::zeroed();
-        let res = unsafe {
-            rav1d::dav1d_parse_sequence_header(NonNull::new(c.as_mut_ptr()), NonNull::new(frame.as_ptr() as *mut u8), frame.len())
-        };
-        let rust = parse_sequence_header(frame);
-        assert_eq!(res.0 == 0, rust.is_ok(), "{}", file.display());
-        let Ok(seq) = rust else { continue };
-        let c = unsafe { c.assume_init() };
-        assert_eq!((seq.max_width, seq.max_height), (c.max_width, c.max_height));
-        assert_eq!(seq.layout as u32, c.layout as u32);
-        assert_eq!(seq.hbd, c.hbd);
-        assert_eq!(seq.film_grain_present, c.film_grain_present);
-        assert_eq!(seq.reduced_still_picture_header, c.reduced_still_picture_header);
-        assert_eq!(seq.num_operating_points, c.num_operating_points);
-        assert_eq!(seq.operating_points[0].idc, c.operating_points[0].idc);
-        assert_eq!(seq.screen_content_tools as u32, c.screen_content_tools as u32);
-        assert_eq!(seq.order_hint_n_bits, c.order_hint_n_bits);
+        let Ok(seq) = parse_sequence_header(frame) else { continue };
+        let mut decoder = Decoder::with_settings(&Settings::new()).unwrap();
+        if decoder.send_data(frame.into(), None, None, None).is_err() {
+            continue;
+        }
+        let Ok(picture) = decoder.get_picture() else { continue };
+        let decoded = picture.sequence_header().unwrap();
+        let f = file.display();
+        assert_eq!((seq.max_width, seq.max_height), (decoded.max_width, decoded.max_height), "{f}");
+        assert_eq!(seq.layout as u32, decoded.layout as u32, "{f}");
+        assert_eq!(seq.hbd, decoded.hbd, "{f}");
+        assert_eq!(seq.film_grain_present, decoded.film_grain_present, "{f}");
+        assert_eq!(seq.reduced_still_picture_header, decoded.reduced_still_picture_header, "{f}");
+        assert_eq!(seq.num_operating_points, decoded.num_operating_points, "{f}");
+        assert_eq!(seq.operating_points[0].idc, decoded.operating_points[0].idc, "{f}");
+        assert_eq!(seq.screen_content_tools as u32, decoded.screen_content_tools as u32, "{f}");
+        assert_eq!(seq.order_hint_n_bits, decoded.order_hint_n_bits, "{f}");
         checked += 1;
     }
     assert!(checked > 20, "{checked} sequence headers");

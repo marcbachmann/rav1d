@@ -246,6 +246,7 @@ pub fn rav1d_set_cpu_flags_mask(mask: c_uint) {
 
 #[no_mangle]
 #[cold]
+#[cfg(feature = "capi")]
 pub extern "C" fn dav1d_set_cpu_flags_mask(mask: c_uint) {
     rav1d_set_cpu_flags_mask(mask)
 }

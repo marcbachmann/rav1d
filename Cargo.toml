@@ -18,9 +18,6 @@ license = "BSD-2-Clause"
 repository = "https://github.com/memorysafety/rav1d"
 exclude = ["*.c", "*.h", "*.in", "meson*", "tests/", "doc/"]
 
-[lib]
-crate-type = ["staticlib", "rlib"]
-
 [dependencies]
 assert_matches = "1.5.0"
 atomig = { version = "0.4.0", features = ["derive"] }
@@ -43,6 +40,16 @@ default = ["bitdepth_8", "bitdepth_16"]
 bitdepth_8 = []
 bitdepth_16 = []
 encoder = []
+# The dav1d-compatible `dav1d_*` functions, for the CLI and its tests; the library's API is `rust_api`.
+capi = []
+
+[[test]]
+name = "decode_rows"
+required-features = ["capi"]
+
+[[test]]
+name = "uninit"
+required-features = ["capi"]
 
 [profile.dev]
 panic = "abort"
