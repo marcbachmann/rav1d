@@ -1173,14 +1173,28 @@ pub trait Vw: Vx {
     }
 }
 
-/// The warp filters with their taps in the order `0, 2, 1, 3, 4, 6, 5, 7`: pairs of taps two
-/// apart, whose products of 8 bpc pixels sum within `i16` (`0, 1` and `2, 3` overflow).
-static WARP_FILTER_PAIRED: [[i8; 8]; 193] = {
-    let mut t = WARP_FILTER;
+/// The warp filters with their taps in the order `0, 2, 4, 6, 1, 3, 5, 7`: pairs of taps two
+/// apart, whose products of 8 bpc pixels sum within `i16` (`0, 1` and `2, 3` overflow), even
+/// taps first (dav1d's `mc_warp_filter2`). A zero filter after the last lets every filter be
+/// loaded in 16 bytes.
+static WARP_FILTER_PAIRED: [[i8; 8]; 194] = {
+    let mut t = [[0; 8]; 194];
     let mut i = 0;
     while i < 193 {
         let f = WARP_FILTER[i];
-        t[i] = [f[0], f[2], f[1], f[3], f[4], f[6], f[5], f[7]];
+        t[i] = [f[0], f[2], f[4], f[6], f[1], f[3], f[5], f[7]];
+        i += 1;
+    }
+    t
+};
+
+/// `DAV1D_MC_WARP_FILTER` with `WARP_FILTER_PAIRED`'s zero filter after the last.
+#[cfg(target_arch = "x86_64")]
+static WARP_FILTER_PADDED: [[i8; 8]; 194] = {
+    let mut t = [[0; 8]; 194];
+    let mut i = 0;
+    while i < 193 {
+        t[i] = WARP_FILTER[i];
         i += 1;
     }
     t
@@ -1190,8 +1204,8 @@ static WARP_FILTER_PAIRED: [[i8; 8]; 193] = {
 /// where `V::PAIRED_WARP`.
 #[inline(always)]
 fn warp_filter_refs<V: Vw>(m: i32, step: i32) -> [&'static [i8; 8]; 8] {
-    let t = if V::PAIRED_WARP {
-        &WARP_FILTER_PAIRED
+    let t: &[[i8; 8]; 193] = if V::PAIRED_WARP {
+        WARP_FILTER_PAIRED[..193].try_into().unwrap()
     } else {
         &DAV1D_MC_WARP_FILTER.0
     };
@@ -1753,7 +1767,7 @@ mod x86 {
         #[inline(always)]
         fn warp_h8(s: &[u8], f: [&[i8; 8]; 8]) -> Self {
             unsafe {
-                // The filters' tap pairs (0, 2), (1, 3), (4, 6), (5, 7) gathered by pair, so
+                // The filters' tap pairs (0, 2), (4, 6), (1, 3), (5, 7) gathered by pair, so
                 // pmaddubsw sums them with the pixel pairs as far apart, without phaddw.
                 let l = [
                     _mm_loadl_epi64(f[0].as_ptr().cast()),
@@ -1778,61 +1792,221 @@ mod x86 {
                     _mm_unpackhi_epi64(b1, b3),
                 ];
                 let v = load15(s);
-                let a = _mm_add_epi16(ptap::<0>(v, k[0]), ptap::<1>(v, k[1]));
+                let a = _mm_add_epi16(ptap::<0>(v, k[0]), ptap::<4>(v, k[1]));
                 Self(_mm_add_epi16(
                     a,
-                    _mm_add_epi16(ptap::<4>(v, k[2]), ptap::<5>(v, k[3])),
+                    _mm_add_epi16(ptap::<1>(v, k[2]), ptap::<5>(v, k[3])),
                 ))
             }
         }
     }
 
-    /// The 8 bpc vertical warp pass's row pairs `(j, j + 2)`, word-interleaved, columns 0 to 3
-    /// in the low lane, as the tap pairs of `WARP_FILTER_PAIRED` take them.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    pub fn warp_pairs8(mid: &[S; 15]) -> [__m256i; 13] {
-        let mut r = [_mm256_setzero_si256(); 13];
-        for j in 0..13 {
-            let (a, b) = (mid[j].0, mid[j + 2].0);
-            let lo = _mm256_castsi128_si256(_mm_unpacklo_epi16(a, b));
-            r[j] = _mm256_inserti128_si256::<1>(lo, _mm_unpackhi_epi16(a, b));
+    /// dav1d's `warp_8x8_shufA` and `shufB` over `load15`'s layout: the bytes of pixels 0, 1
+    /// (`A`) or 2, 3 (`B`) in the low lane and 4 more on in the high lane, taps two apart,
+    /// even taps first.
+    const fn warp_shuf(k: i8) -> [i8; 32] {
+        let mut s = [0i8; 32];
+        let mut i = 0;
+        while i < 32 {
+            let (px, t) = ((i / 8) as i8 % 2 + (i / 16) as i8 * 4, (i % 8) as i8);
+            let j = k + px + if t < 4 { 2 * t } else { 2 * (t - 4) + 1 };
+            s[i] = j + (j >= 8) as i8;
+            i += 1;
         }
-        r
+        s
     }
+    static WARP_SHUF: [[i8; 32]; 2] = [warp_shuf(0), warp_shuf(2)];
 
-    /// Filters `a` and `b`, one a lane.
+    pub type WarpTable = [[i8; 8]; 194];
+
+    /// Filter `m + x * step >> 10` of `t`.
+    ///
+    /// # Safety
+    ///
+    /// The position must be non-negative and the index below 193.
     #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    fn q2(a: &[i8; 8], b: &[i8; 8]) -> __m256i {
-        // SAFETY: Both are 8 bytes.
+    #[inline(always)]
+    unsafe fn wfp(t: &WarpTable, m: i32, step: i32, x: i32) -> *const i8 {
+        // SAFETY: The caller's.
         unsafe {
-            let lo = _mm256_castsi128_si256(_mm_loadl_epi64(a.as_ptr().cast()));
-            _mm256_inserti128_si256::<1>(lo, _mm_loadl_epi64(b.as_ptr().cast()))
+            t.as_ptr()
+                .add(((m + x * step) as u32 >> 10) as usize)
+                .cast()
         }
     }
 
-    /// One row of the 8 bpc vertical warp pass, `(sum(rows * taps) + rnd) >> sh`, from the
-    /// row pairs `r[0], r[1], r[4], r[5]` and the columns' filters `f` in `WARP_FILTER_PAIRED`'s
-    /// order. The filters' tap pairs are transposed as bytes, then widened into the high bytes
-    /// of words (no sign extension): the sums are 256 times the dot products.
+    /// The filters at `m + a * step >> 10` and `m + b * step >> 10` in the low quadwords of
+    /// the two lanes.
+    ///
+    /// # Safety
+    ///
+    /// As for `wfp`.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     #[inline]
-    pub fn warp_v8(r: &[__m256i], f: [&[i8; 8]; 8], rnd: i32, sh: u32) -> S {
-        let ab = _mm256_unpacklo_epi16(q2(f[0], f[4]), q2(f[1], f[5]));
-        let cd = _mm256_unpacklo_epi16(q2(f[2], f[6]), q2(f[3], f[7]));
+    unsafe fn wf2(t: &WarpTable, m: i32, step: i32, a: i32, b: i32) -> __m256i {
+        // SAFETY: The caller's; 16 bytes from a filter below 193 lie in the table.
+        unsafe {
+            let lo = _mm_loadl_epi64(wfp(t, m, step, a).cast());
+            let hi = _mm_loadu_si128(wfp(t, m, step, b).cast());
+            _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi)
+        }
+    }
+
+    /// The filters at `m + x * step >> 10` for `x` 0, 1 in the low lane and 4, 5 in the high
+    /// one, from `x0` on.
+    ///
+    /// # Safety
+    ///
+    /// As for `wfp`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn wf4(t: &WarpTable, m: i32, step: i32, x0: i32) -> __m256i {
+        // SAFETY: The caller's.
+        unsafe {
+            _mm256_unpacklo_epi64(wf2(t, m, step, x0, x0 + 4), wf2(t, m, step, x0 + 1, x0 + 5))
+        }
+    }
+
+    /// The 8 bpc warp's first pass of a row as dav1d's `.h`: pixel `x`'s `(sum + 4) >> 3` in the
+    /// high word of dword `x`, from the row's 15 pixels and its filters at `m + x * alpha >> 10`
+    /// in `WARP_FILTER_PAIRED`.
+    ///
+    /// # Safety
+    ///
+    /// As for `wfp`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn warp_h8_row(s: &[u8], m: i32, alpha: i32) -> __m256i {
+        let t = &super::WARP_FILTER_PAIRED;
+        let lo = i64::from_le_bytes(s[..8].try_into().unwrap());
+        let hi = i64::from_le_bytes(s[7..15].try_into().unwrap());
+        let v = _mm256_blend_epi32::<0b1100_1100>(_mm256_set1_epi64x(lo), _mm256_set1_epi64x(hi));
+        // SAFETY: The caller's; the shuffles are 32 bytes.
+        unsafe {
+            let fa = wf4(t, m, alpha, 0);
+            let fb = wf4(t, m, alpha, 2);
+            let sa = _mm256_loadu_si256(WARP_SHUF[0].as_ptr().cast());
+            let sb = _mm256_loadu_si256(WARP_SHUF[1].as_ptr().cast());
+            let a = _mm256_maddubs_epi16(_mm256_shuffle_epi8(v, sa), fa);
+            let b = _mm256_maddubs_epi16(_mm256_shuffle_epi8(v, sb), fb);
+            let h = _mm256_madd_epi16(_mm256_hadd_epi16(a, b), _mm256_set1_epi16(8192));
+            _mm256_add_epi32(h, _mm256_set1_epi32(32768))
+        }
+    }
+
+    /// Pixels `x` and `x + 4` of a row times their filters (widened into the high bytes of
+    /// words), summed in four dwords each.
+    ///
+    /// # Safety
+    ///
+    /// As for `wfp`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn warp_h16_px(s: &[u16], x: usize, m: i32, alpha: i32) -> __m256i {
+        let (lo, hi) = (&s[x..x + 8], &s[x + 4..x + 12]);
+        // SAFETY: Both are 16 bytes; the caller's.
+        unsafe {
+            let v = _mm256_loadu2_m128i(hi.as_ptr().cast(), lo.as_ptr().cast());
+            let f = wf2(&super::WARP_FILTER_PADDED, m, alpha, x as i32, x as i32 + 4);
+            _mm256_madd_epi16(v, _mm256_unpacklo_epi8(_mm256_setzero_si256(), f))
+        }
+    }
+
+    /// `warp_h8_row` above 8 bpc as dav1d's `.h`: pixel `x`'s `(sum + rnd) >> (7 - ib)` in the
+    /// high word of dword `x`, the sum `256 << sh` times the dot product, `sh` `1 + ib`.
+    ///
+    /// # Safety
+    ///
+    /// As for `wfp`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn warp_h16_row(s: &[u16], m: i32, alpha: i32, sh: __m128i) -> __m256i {
+        let s = &s[..15];
+        // SAFETY: The caller's.
+        unsafe {
+            let a = _mm256_hadd_epi32(warp_h16_px(s, 0, m, alpha), warp_h16_px(s, 1, m, alpha));
+            let b = _mm256_hadd_epi32(warp_h16_px(s, 2, m, alpha), warp_h16_px(s, 3, m, alpha));
+            let h = _mm256_sll_epi32(_mm256_hadd_epi32(a, b), sh);
+            _mm256_add_epi32(h, _mm256_set1_epi32(32768))
+        }
+    }
+
+    /// `warp_h8_row` or `warp_h16_row` by bit depth.
+    ///
+    /// # Safety
+    ///
+    /// As for `wfp`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn warp_h_row<BD: super::BitDepth>(
+        s: &[BD::Pixel],
+        m: i32,
+        alpha: i32,
+        sh: __m128i,
+    ) -> __m256i {
+        // SAFETY: The caller's.
+        unsafe {
+            if BD::BITDEPTH == 8 {
+                warp_h8_row(super::cast(s), m, alpha)
+            } else {
+                warp_h16_row(super::cast(s), m, alpha, sh)
+            }
+        }
+    }
+
+    /// Two first-pass rows as word pairs, as the vertical pass takes them.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub fn warp_pair(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_blend_epi16::<0b1010_1010>(_mm256_srli_epi32::<16>(a), b)
+    }
+
+    /// One row of the vertical warp pass, `(sum(rows * taps) + rnd) >> sh`, from the row pairs
+    /// `p` the filters' tap pairs take in `t` and the columns' filters at `m + x * gamma >> 10`.
+    /// The filters' tap pairs are transposed as bytes, then widened into the high bytes of
+    /// words (no sign extension): the sums are 256 times the dot products.
+    ///
+    /// # Safety
+    ///
+    /// As for `wfp`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn warp_v(
+        t: &WarpTable,
+        p: [__m256i; 4],
+        m: i32,
+        gamma: i32,
+        rnd: i32,
+        sh: u32,
+    ) -> S {
+        // SAFETY: The caller's.
+        let (ae, bf, cg, dh) = unsafe {
+            (
+                wf2(t, m, gamma, 0, 4),
+                wf2(t, m, gamma, 1, 5),
+                wf2(t, m, gamma, 2, 6),
+                wf2(t, m, gamma, 3, 7),
+            )
+        };
+        let ab = _mm256_unpacklo_epi16(ae, bf);
+        let cd = _mm256_unpacklo_epi16(cg, dh);
         let (x, y) = (_mm256_unpacklo_epi32(ab, cd), _mm256_unpackhi_epi32(ab, cd));
         let z = _mm256_setzero_si256();
         let s = _mm256_add_epi32(
-            _mm256_madd_epi16(r[0], _mm256_unpacklo_epi8(z, x)),
-            _mm256_madd_epi16(r[1], _mm256_unpackhi_epi8(z, x)),
+            _mm256_madd_epi16(p[0], _mm256_unpacklo_epi8(z, x)),
+            _mm256_madd_epi16(p[1], _mm256_unpackhi_epi8(z, x)),
         );
         let t = _mm256_add_epi32(
-            _mm256_madd_epi16(r[4], _mm256_unpacklo_epi8(z, y)),
-            _mm256_madd_epi16(r[5], _mm256_unpackhi_epi8(z, y)),
+            _mm256_madd_epi16(p[2], _mm256_unpacklo_epi8(z, y)),
+            _mm256_madd_epi16(p[3], _mm256_unpackhi_epi8(z, y)),
         );
         let s = _mm256_add_epi32(_mm256_add_epi32(s, t), _mm256_set1_epi32(rnd << 8));
         let s = _mm256_sra_epi32(s, _mm_cvtsi32_si128(sh as i32 + 8));
@@ -2835,11 +3009,22 @@ fn warp_128<BD: BitDepth>(
     warp::<BD, S>(out, w, src, abcd, mx, my, bd)
 }
 
-/// `warp_128` on an AVX2 CPU, in VEX encoding; the 8 bpc vertical pass in ymm.
+/// Whether the warp filter positions `m + x * dx + y * dy` for `x < 8`, `y < ny` index the
+/// filter table: `m` holds the rounding and the table's offset, so the index is `>> 10`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn warp_in_table(m: i32, dx: i32, dy: i32, ny: i32) -> bool {
+    let (a, b) = (m.min(m + 7 * dx), m.max(m + 7 * dx));
+    let (lo, hi) = (a.min(a + (ny - 1) * dy), b.max(b + (ny - 1) * dy));
+    lo >= 0 && hi >> 10 < 193
+}
+
+/// `warp_128` on an AVX2 CPU as dav1d's AVX2 passes: a first-pass row per ymm, the rows paired
+/// in dwords for the second.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 fn warp_vex<BD: BitDepth>(
-    mut out: Out<BD>,
+    out: Out<BD>,
     w: usize,
     src: Rav1dPictureDataComponentOffset,
     abcd: &[i16; 4],
@@ -2847,17 +3032,92 @@ fn warp_vex<BD: BitDepth>(
     my: i32,
     bd: BD,
 ) {
-    let mid = warp_h::<BD, S>(src, abcd, mx, bd);
-    if BD::BITDEPTH != 8 {
-        return warp_v::<BD, S>(out, w, &mid, abcd, my, bd);
-    }
     let prep = out.is_prep();
-    let (rnd, sh) = warp_rnd(prep, bd);
-    let r = x86::warp_pairs8(&mid);
-    for y in 0..8 {
-        let f = warp_filter_refs::<S>(my + y as i32 * abcd[3] as i32, abcd[2] as i32);
-        let v = x86::warp_v8(&r[y..], f, rnd, sh);
-        out.emit::<S, 0>(v, 0, y, w, 0);
+    match out {
+        Out::Put(d) => warp_vex_to::<BD, _>(PutRows { d }, prep, src, abcd, mx, my, bd),
+        Out::Prep(t) => warp_vex_to::<BD, _>(PrepRows { t, w }, prep, src, abcd, mx, my, bd),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn warp_vex_to<BD: BitDepth, O: Sink<BD>>(
+    mut out: O,
+    prep: bool,
+    src: Rav1dPictureDataComponentOffset,
+    abcd: &[i16; 4],
+    mx: i32,
+    my: i32,
+    bd: BD,
+) {
+    use std::arch::x86_64::*;
+
+    use x86::{warp_pair as pair, warp_v};
+
+    let [alpha, beta, gamma, delta] = abcd.map(|v| v as i32);
+    let (mx, my) = (mx + 512 + (64 << 10), my + 512 + (64 << 10));
+    assert!(warp_in_table(mx, alpha, beta, 15) && warp_in_table(my, gamma, delta, 8));
+    // SAFETY: The first pass reads 15 rows of 15 pixels from (-3, -3).
+    let src = unsafe { src.block_unchecked::<BD>(-3..12, -3..12) };
+    let sh = _mm_cvtsi32_si128(1 + bd.get_intermediate_bits() as i32);
+    let (rnd, vsh) = warp_rnd(prep, bd);
+    let max = bd.bitdepth_max().as_::<i32>() as i16;
+    let row = |y: usize| src.row(y as isize - 3, -3, 15);
+    // SAFETY: `warp_in_table` holds.
+    let h: [__m256i; 7] = unsafe {
+        [
+            x86::warp_h_row::<BD>(&row(0), mx, alpha, sh),
+            x86::warp_h_row::<BD>(&row(1), mx + beta, alpha, sh),
+            x86::warp_h_row::<BD>(&row(2), mx + 2 * beta, alpha, sh),
+            x86::warp_h_row::<BD>(&row(3), mx + 3 * beta, alpha, sh),
+            x86::warp_h_row::<BD>(&row(4), mx + 4 * beta, alpha, sh),
+            x86::warp_h_row::<BD>(&row(5), mx + 5 * beta, alpha, sh),
+            x86::warp_h_row::<BD>(&row(6), mx + 6 * beta, alpha, sh),
+        ]
+    };
+    if BD::BITDEPTH == 8 {
+        // Rows two apart, for `WARP_FILTER_PAIRED`'s tap pairs; a pair's high words are its
+        // second row, the next pair's first.
+        let mut p = [
+            pair(h[0], h[2]),
+            pair(h[1], h[3]),
+            pair(h[2], h[4]),
+            pair(h[3], h[5]),
+            pair(h[4], h[6]),
+        ];
+        for y in 0..8 {
+            let s = row(y as usize + 7);
+            // SAFETY: `warp_in_table` holds.
+            let n = pair(p[3], unsafe {
+                x86::warp_h_row::<BD>(&s, mx + (y + 7) * beta, alpha, sh)
+            });
+            let k = [p[0], p[4], p[1], n];
+            // SAFETY: `warp_in_table` holds.
+            let v = unsafe { warp_v(&WARP_FILTER_PAIRED, k, my + y * delta, gamma, rnd, vsh) };
+            out.emit::<S, 0>(v, 0, y as usize, max);
+            p = [p[1], p[2], p[3], p[4], n];
+        }
+    } else {
+        let mut p = [
+            pair(h[0], h[1]),
+            pair(h[1], h[2]),
+            pair(h[2], h[3]),
+            pair(h[3], h[4]),
+            pair(h[4], h[5]),
+            pair(h[5], h[6]),
+        ];
+        for y in 0..8 {
+            let s = row(y as usize + 7);
+            // SAFETY: `warp_in_table` holds.
+            let r = unsafe { x86::warp_h_row::<BD>(&s, mx + (y + 7) * beta, alpha, sh) };
+            let n = pair(p[5], r);
+            let k = [p[0], p[2], p[4], n];
+            // SAFETY: `warp_in_table` holds.
+            let v = unsafe { warp_v(&WARP_FILTER_PADDED, k, my + y * delta, gamma, rnd, vsh) };
+            out.emit::<S, 0>(v, 0, y as usize, max);
+            p = [p[1], p[2], p[3], p[4], p[5], n];
+        }
     }
 }
 
