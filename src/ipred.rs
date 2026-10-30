@@ -3,7 +3,7 @@
 use std::ffi::{c_int, c_uint};
 use std::{cmp, slice};
 
-use libc::ptrdiff_t;
+use crate::c_types::ptrdiff_t;
 use strum::FromRepr;
 use zerocopy::{AsBytes, FromBytes};
 

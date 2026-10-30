@@ -5,7 +5,7 @@ use std::ops::Add;
 use std::{cmp, iter, mem, slice};
 
 use bitflags::bitflags;
-use libc::ptrdiff_t;
+use crate::c_types::ptrdiff_t;
 use to_method::To;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 

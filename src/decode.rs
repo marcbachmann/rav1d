@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{array, cmp, iter, mem};
 
-use libc::ptrdiff_t;
+use crate::c_types::ptrdiff_t;
 use parking_lot::{Condvar, Mutex};
 use strum::EnumCount;
 

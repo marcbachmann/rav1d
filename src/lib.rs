@@ -84,6 +84,7 @@ pub mod include {
 } // mod include
 
 pub mod align;
+pub(crate) mod c_types;
 pub(crate) mod c_arc;
 pub(crate) mod c_box;
 #[cfg(feature = "capi")]

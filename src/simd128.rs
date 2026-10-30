@@ -4022,7 +4022,12 @@ mod imp {
         /// Bytes `4 * L..4 * L + 4`.
         #[inline(always)]
         pub fn lane32<const L: i32>(self) -> u32 {
-            u32x4_extract_lane::<{ L as usize }>(self.0)
+            match L {
+                0 => u32x4_extract_lane::<0>(self.0),
+                1 => u32x4_extract_lane::<1>(self.0),
+                2 => u32x4_extract_lane::<2>(self.0),
+                _ => u32x4_extract_lane::<3>(self.0),
+            }
         }
 
         /// `x` in the low four lanes, the others 0.
