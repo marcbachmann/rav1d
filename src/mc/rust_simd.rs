@@ -53,6 +53,8 @@ pub trait Vx: Copy {
     fn h8<const T6: bool>(s: &[u8], f: &[i8; 8]) -> Self;
     /// `min(38 + (sat_u16(|a - b| + rnd) >> sh), 64)`, `w_mask`'s weight.
     fn wmask(self, o: Self, rnd: i16, sh: u32) -> Self;
+    /// The sums of adjacent lanes, `a`'s then `b`'s.
+    fn hadd(a: Self, b: Self) -> Self;
 
     #[inline(always)]
     fn rshr(self, rnd: i16, sh: u32) -> Self {
@@ -61,6 +63,59 @@ pub trait Vx: Copy {
 
     /// `(self + (1 << SH >> 1)) >> SH`, exact for every lane value.
     fn rshr_c<const SH: i32>(self) -> Self;
+
+    /// The block rows a vector holds: 2 where its lanes are two rows' strips of `N / 2`, the
+    /// upper row in the low half. Only the 8-tap filters take two-row tiers.
+    const ROWS: usize = 1;
+    /// Two rows' `u8` strips, zero-extended.
+    fn load2_u8(_: &[u8], _: &[u8]) -> Self {
+        unreachable!()
+    }
+    fn load2_u16(_: &[u16], _: &[u16]) -> Self {
+        unreachable!()
+    }
+    /// `h8` of two rows, from `a[..N / 2 + 7]` and `b[..N / 2 + 7]`.
+    fn h8x2<const T6: bool>(_: &[u8], _: &[u8], _: &[i8; 8]) -> Self {
+        unreachable!()
+    }
+    /// The second row of `a` and the first of `b`.
+    fn mid(_: Self, _: Self) -> Self {
+        unreachable!()
+    }
+    /// Row `I`'s lanes as `store_u8`, `store_u16` and `store` store them.
+    #[inline(always)]
+    fn store_row_u8<const I: usize>(self, d: &mut [u8]) {
+        self.store_u8(d)
+    }
+    #[inline(always)]
+    fn store_row_u16<const I: usize>(self, d: &mut [u16]) {
+        self.store_u16(d)
+    }
+    #[inline(always)]
+    fn store_row<const I: usize>(self, d: &mut [i16]) {
+        self.store(d)
+    }
+
+    /// Whether the 8 bpc vertical pass multiplies byte pairs (`pairb`, `maddb`).
+    const BYTE_PAIRS: bool = false;
+    /// The `u8` lanes of `a` and `b` as the low and high bytes of each lane.
+    fn pairb(_: Self, _: Self) -> Self {
+        unreachable!()
+    }
+    /// `sum(p[i]'s bytes times (k[2 * i], k[2 * i + 1]))`, in `i16`.
+    fn maddb(_: &[Self], _: &[i16; 8]) -> Self {
+        unreachable!()
+    }
+}
+
+/// The pixels of a strip's row: `N / ROWS`, or `PW`.
+#[inline(always)]
+const fn px<V: Vx, const PW: usize>() -> usize {
+    if PW == 0 {
+        V::N / V::ROWS
+    } else {
+        PW
+    }
 }
 
 /// Two vectors as one of `2 * V::N` lanes: a strip twice as wide, its rows borrowed once.
@@ -180,6 +235,10 @@ impl<V: Vx> Vx for D<V> {
         D(self.0.wmask(o.0, rnd, sh), self.1.wmask(o.1, rnd, sh))
     }
     #[inline(always)]
+    fn hadd(a: Self, b: Self) -> Self {
+        D(V::hadd(a.0, a.1), V::hadd(b.0, b.1))
+    }
+    #[inline(always)]
     fn rshr_c<const SH: i32>(self) -> Self {
         D(self.0.rshr_c::<SH>(), self.1.rshr_c::<SH>())
     }
@@ -293,6 +352,26 @@ fn h_u16<V: Vx, const PW: usize, const T6: bool>(s: &[u16], k: &[i16; 8], rnd: i
     }
 }
 
+/// `h_u16` of two rows, as a two-row tier holds them.
+#[inline(always)]
+fn h_u16x2<V: Vx, const T6: bool>(a: &[u16], b: &[u16], k: &[i16; 8], rnd: i32, sh: u32) -> V {
+    let w = [
+        V::load2_u16(&a[0..], &b[0..]),
+        V::load2_u16(&a[1..], &b[1..]),
+        V::load2_u16(&a[2..], &b[2..]),
+        V::load2_u16(&a[3..], &b[3..]),
+        V::load2_u16(&a[4..], &b[4..]),
+        V::load2_u16(&a[5..], &b[5..]),
+        V::load2_u16(&a[6..], &b[6..]),
+        V::load2_u16(&a[7..], &b[7..]),
+    ];
+    if T6 {
+        V::maddr(&w[1..7], k, rnd, sh)
+    } else {
+        V::maddr(&w, k, rnd, sh)
+    }
+}
+
 /// The filter's taps as `i16`; with `T6` (`f[0]` and `f[7]` are 0) taps 1 to 6 first.
 #[inline(always)]
 fn taps<const T6: bool>(f: &[i8; 8]) -> [i16; 8] {
@@ -325,10 +404,20 @@ fn mac<V: Vx>(v: &[V], k: &[i16; 8]) -> V {
 /// `v`'s lanes as pixels into `d`: saturated at 8 bpc, clipped to `[0, max]` above.
 #[inline(always)]
 fn store_px<BD: BitDepth, V: Vx, const PW: usize>(v: V, d: &mut [BD::Pixel], max: i16) {
+    store_px_row::<BD, V, PW, 0>(v, d, max)
+}
+
+/// `store_px` of row `I` of `v`.
+#[inline(always)]
+fn store_px_row<BD: BitDepth, V: Vx, const PW: usize, const I: usize>(
+    v: V,
+    d: &mut [BD::Pixel],
+    max: i16,
+) {
     if BD::BITDEPTH == 8 {
         let d = cast_mut::<_, u8>(d);
         if PW == 0 {
-            return v.store_u8(d);
+            return v.store_row_u8::<I>(d);
         }
         let mut t = [0; 16];
         v.store_u8(&mut t);
@@ -337,7 +426,7 @@ fn store_px<BD: BitDepth, V: Vx, const PW: usize>(v: V, d: &mut [BD::Pixel], max
         let v = v.max(V::splat(0)).min(V::splat(max));
         let d = cast_mut::<_, u16>(d);
         if PW == 0 {
-            return v.store_u16(d);
+            return v.store_row_u16::<I>(d);
         }
         let mut t = [0; 16];
         v.store_u16(&mut t);
@@ -398,9 +487,13 @@ impl Sink for PutRows<'_> {
 
     #[inline(always)]
     fn emit<BD: BitDepth, V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, max: i16) {
-        let n = if PW == 0 { V::N } else { PW };
+        let n = px::<V, PW>();
         let d = self.d + (y as isize * self.stride + x as isize);
-        store_px::<BD, V, PW>(v, &mut d.slice_mut::<BD>(n), max);
+        store_px_row::<BD, V, PW, 0>(v, &mut d.slice_mut::<BD>(n), max);
+        if V::ROWS == 2 {
+            let d = d + self.stride;
+            store_px_row::<BD, V, PW, 1>(v, &mut d.slice_mut::<BD>(n), max);
+        }
     }
 }
 
@@ -410,7 +503,12 @@ impl Sink for PrepRows<'_> {
     #[inline(always)]
     fn emit<BD: BitDepth, V: Vx, const PW: usize>(&mut self, v: V, x: usize, y: usize, _: i16) {
         let v = v.sub(V::splat(BD::PREP_BIAS));
-        st_i16::<V, PW>(v, &mut self.t[y * self.w + x..]);
+        let i = y * self.w + x;
+        if V::ROWS == 2 {
+            v.store_row::<0>(&mut self.t[i..]);
+            return v.store_row::<1>(&mut self.t[i + self.w..]);
+        }
+        st_i16::<V, PW>(v, &mut self.t[i..][..px::<V, PW>()]);
     }
 }
 
@@ -452,6 +550,48 @@ fn hrow<BD: BitDepth, V: Vx, const PW: usize, const T6: bool>(
     }
 }
 
+/// Source rows `a` and `b` of the strip at `x`, in a two-row tier.
+#[inline(always)]
+fn vrow2<BD: BitDepth, V: Vx>(
+    src: Rav1dPictureDataComponentOffset,
+    stride: isize,
+    a: isize,
+    b: isize,
+    x: usize,
+    n: usize,
+) -> V {
+    let sa = (src + (a * stride + x as isize)).slice::<BD>(n);
+    let sb = (src + (b * stride + x as isize)).slice::<BD>(n);
+    if BD::BITDEPTH == 8 {
+        V::load2_u8(cast(&sa), cast(&sb))
+    } else {
+        V::load2_u16(cast(&sa), cast(&sb))
+    }
+}
+
+/// The first pass of source rows `a` and `b` of the strip at `x`, in a two-row tier.
+#[inline(always)]
+fn hrow2<BD: BitDepth, V: Vx, const T6: bool>(
+    src: Rav1dPictureDataComponentOffset,
+    stride: isize,
+    a: isize,
+    b: isize,
+    x: usize,
+    n: usize,
+    fh: &[i8; 8],
+    kh: &[i16; 8],
+    hrnd: i32,
+    hsh: u32,
+) -> V {
+    let sa = (src + (a * stride + x as isize - 3)).slice::<BD>(n + 7);
+    let sb = (src + (b * stride + x as isize - 3)).slice::<BD>(n + 7);
+    if BD::BITDEPTH == 8 {
+        rshr8(V::h8x2::<T6>(cast(&sa), cast(&sb), fh), hrnd as i16, hsh)
+    } else {
+        h_u16x2::<V, T6>(cast(&sa), cast(&sb), kh, hrnd, hsh)
+    }
+}
+
 /// The source rows of a strip's vertical pass: as they are, or through the first pass (`H`).
 /// A closure would not inherit the tier's target features where it is not inlined.
 struct Rows<'a, BD, const PW: usize, const H: bool, const T6: bool> {
@@ -460,7 +600,7 @@ struct Rows<'a, BD, const PW: usize, const H: bool, const T6: bool> {
     y0: isize,
     x: usize,
     n: usize,
-    fh: &'a [i8; 8],
+    fh: [i8; 8],
     kh: [i16; 8],
     hrnd: i32,
     hsh: u32,
@@ -479,13 +619,35 @@ impl<BD: BitDepth, const PW: usize, const H: bool, const T6: bool> Rows<'_, BD, 
                 y,
                 self.x,
                 self.n,
-                self.fh,
+                &self.fh,
                 &self.kh,
                 self.hrnd,
                 self.hsh,
             )
         } else {
             vrow::<BD, V, PW>(self.src, self.stride, y, self.x, self.n)
+        }
+    }
+
+    /// Rows `i` and `j` in a two-row tier.
+    #[inline(always)]
+    fn get2<V: Vx>(&self, i: usize, j: usize) -> V {
+        let (a, b) = (i as isize + self.y0, j as isize + self.y0);
+        if H {
+            hrow2::<BD, V, T6>(
+                self.src,
+                self.stride,
+                a,
+                b,
+                self.x,
+                self.n,
+                &self.fh,
+                &self.kh,
+                self.hrnd,
+                self.hsh,
+            )
+        } else {
+            vrow2::<BD, V>(self.src, self.stride, a, b, self.x, self.n)
         }
     }
 }
@@ -546,24 +708,46 @@ fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
 ) {
     let ib = bd.get_intermediate_bits() as u32;
     let max = bd.bitdepth_max().as_::<i32>() as i16;
-    let n = if PW == 0 { V::N } else { PW };
+    let n = px::<V, PW>();
     let stride = src.pixel_stride::<BD>();
     let hsh = 6 - ib;
     let hrnd = 1 << (hsh - 1);
-    let k = taps::<T6>(fh);
+    // By value, not behind the reference: stores could alias that, and keep the taps in the loop.
+    let f = *fh;
+    let k = taps::<T6>(&f);
     // `put`: `(sum + 32 + hrnd) >> 6`, `prep`: `(sum + hrnd) >> hsh`.
     let (rnd, sh) = if S::PREP { (hrnd, hsh) } else { (32 + hrnd, 6) };
+    if V::ROWS == 2 {
+        for x in (0..w).step_by(n) {
+            let row = Rows::<BD, PW, true, T6> {
+                src,
+                stride,
+                y0: 0,
+                x,
+                n,
+                fh: f,
+                kh: k,
+                hrnd: rnd,
+                hsh: sh,
+                bd: PhantomData,
+            };
+            for y in (0..h).step_by(2) {
+                s.emit::<BD, V, PW>(row.get2(y, y + 1), x, y, max);
+            }
+        }
+        return;
+    }
     for y in 0..h {
         let r = (src + (y as isize * stride - 3)).slice::<BD>(w + 7);
         for x in (0..w).step_by(n) {
             let v = if BD::BITDEPTH == 8 {
                 rshr8(
-                    h8_u8::<V, PW, T6>(&cast::<_, u8>(&r)[x..], fh),
+                    h8_u8::<V, PW, T6>(&cast::<_, u8>(&r)[x..][..n + 7], &f),
                     rnd as i16,
                     sh,
                 )
             } else {
-                h_u16::<V, PW, T6>(&cast::<_, u16>(&r)[x..], &k, rnd, sh)
+                h_u16::<V, PW, T6>(&cast::<_, u16>(&r)[x..][..n + 7], &k, rnd, sh)
             };
             s.emit::<BD, V, PW>(v, x, y, max);
         }
@@ -581,7 +765,7 @@ fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
 ) {
     let ib = bd.get_intermediate_bits() as u32;
     let max = bd.bitdepth_max().as_::<i32>() as i16;
-    let n = if PW == 0 { V::N } else { PW };
+    let n = px::<V, PW>();
     let stride = src.pixel_stride::<BD>();
     let hsh = 6 - ib;
     let hrnd = 1 << (hsh - 1);
@@ -595,13 +779,15 @@ fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const T6: bool>(
             y0,
             x,
             n,
-            fh: fv,
+            fh: *fv,
             kh: k,
             hrnd: 0,
             hsh: 0,
             bd: PhantomData,
         };
-        if BD::BITDEPTH == 8 {
+        if BD::BITDEPTH == 8 && V::BYTE_PAIRS {
+            vpairs::<BD, V, PW, S, Bytes, T6, false, false>(s, x, h, &row, &k, rnd, sh, max);
+        } else if BD::BITDEPTH == 8 {
             vmac::<BD, V, PW, S, T6, false, false>(s, x, h, &row, &k, rnd as i16, sh, max);
         } else {
             v32::<BD, V, PW, S, T6, false, false>(s, x, h, &row, &k, rnd, sh, max);
@@ -621,7 +807,7 @@ fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const H6: bool, const 
 ) {
     let ib = bd.get_intermediate_bits() as u32;
     let max = bd.bitdepth_max().as_::<i32>() as i16;
-    let n = if PW == 0 { V::N } else { PW };
+    let n = px::<V, PW>();
     let stride = src.pixel_stride::<BD>();
     let hsh = 6 - ib;
     let hrnd = 1 << (hsh - 1);
@@ -640,7 +826,7 @@ fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink, const H6: bool, const 
             y0,
             x,
             n,
-            fh,
+            fh: *fh,
             kh,
             hrnd,
             hsh,
@@ -671,7 +857,7 @@ fn v32<
     max: i16,
 ) {
     if V::PAIRS {
-        vpairs::<BD, V, PW, S, T6, RT6, H>(s, x, h, row, k, rnd, sh, max)
+        vpairs::<BD, V, PW, S, Words, T6, RT6, H>(s, x, h, row, k, rnd, sh, max)
     } else {
         vrows::<BD, V, PW, S, T6, RT6, H>(s, x, h, row, k, rnd, sh, max)
     }
@@ -699,6 +885,22 @@ fn vrows<
 ) {
     let t = if T6 { 6 } else { 8 };
     let mut r = [V::splat(0); 9];
+    if V::ROWS == 2 {
+        let mut last = row.get2::<V>(0, 0);
+        for i in 0..t / 2 - 1 {
+            let a = row.get2(2 * i + 1, 2 * i + 2);
+            (r[2 * i], r[2 * i + 1]) = (V::mid(last, a), a);
+            last = a;
+        }
+        for y in (0..h).step_by(2) {
+            let a = row.get2(y + t - 1, y + t);
+            (r[t - 2], r[t - 1]) = (V::mid(last, a), a);
+            s.emit::<BD, V, PW>(V::maddr(&r[..t], k, rnd, sh), x, y, max);
+            r = [r[2], r[3], r[4], r[5], r[6], r[7], r[7], r[7], r[7]];
+            last = a;
+        }
+        return;
+    }
     for i in 0..t - 1 {
         r[i] = row.get(i);
     }
@@ -741,6 +943,22 @@ fn vmac<
 ) {
     let t = if T6 { 6 } else { 8 };
     let mut r = [V::splat(0); 9];
+    if V::ROWS == 2 {
+        let mut last = row.get2::<V>(0, 0);
+        for i in 0..t / 2 - 1 {
+            let a = row.get2(2 * i + 1, 2 * i + 2);
+            (r[2 * i], r[2 * i + 1]) = (V::mid(last, a), a);
+            last = a;
+        }
+        for y in (0..h).step_by(2) {
+            let a = row.get2(y + t - 1, y + t);
+            (r[t - 2], r[t - 1]) = (V::mid(last, a), a);
+            s.emit::<BD, V, PW>(rshr8(mac(&r[..t], k), rnd, sh), x, y, max);
+            r = [r[2], r[3], r[4], r[5], r[6], r[7], r[7], r[7], r[7]];
+            last = a;
+        }
+        return;
+    }
     for i in 0..t - 1 {
         r[i] = row.get(i);
     }
@@ -762,15 +980,57 @@ fn vmac<
     }
 }
 
-/// The vertical pass in 32 bits, two rows a step, over `row` as `vmac`. Rows are taken in
+/// How `vpairs` sums rows: 32-bit products of `i16` pairs, or (8 bpc) `i16` sums of products of
+/// byte pairs.
+trait Acc<V: Vx> {
+    type P: Copy;
+    fn pair(a: V, b: V) -> Self::P;
+    fn madd(p: &[Self::P], k: &[i16; 8], rnd: i32, sh: u32) -> V;
+}
+
+struct Words;
+
+impl<V: Vx> Acc<V> for Words {
+    type P = V::P;
+
+    #[inline(always)]
+    fn pair(a: V, b: V) -> V::P {
+        V::pair(a, b)
+    }
+
+    #[inline(always)]
+    fn madd(p: &[V::P], k: &[i16; 8], rnd: i32, sh: u32) -> V {
+        V::maddp(p, k, rnd, sh)
+    }
+}
+
+struct Bytes;
+
+impl<V: Vx> Acc<V> for Bytes {
+    type P = V;
+
+    #[inline(always)]
+    fn pair(a: V, b: V) -> V {
+        V::pairb(a, b)
+    }
+
+    #[inline(always)]
+    fn madd(p: &[V], k: &[i16; 8], rnd: i32, sh: u32) -> V {
+        rshr8(V::maddb(p, k), rnd as i16, sh)
+    }
+}
+
+/// The vertical pass over row pairs, two rows a step, over `row` as `vmac`. Rows are taken in
 /// pairs, `e` for the even output row, `o` for the odd one; the next step keeps all pairs but
-/// the first of each.
+/// the first of each. A two-row tier's vectors hold rows `(j, j + 1)`: pairs of them make
+/// both output rows, `mid` the vectors between those loaded.
 #[inline(always)]
 fn vpairs<
     BD: BitDepth,
     V: Vx,
     const PW: usize,
     S: Sink,
+    K: Acc<V>,
     const T6: bool,
     const RT6: bool,
     const H: bool,
@@ -786,32 +1046,48 @@ fn vpairs<
 ) {
     let t = if T6 { 6 } else { 8 };
     let m = t / 2 - 1;
-    let z = V::pair(V::splat(0), V::splat(0));
+    let z = K::pair(V::splat(0), V::splat(0));
     let (mut e, mut o) = ([z; 4], [z; 4]);
+    if V::ROWS == 2 {
+        let mut last = row.get2::<V>(0, 0);
+        for i in 0..m {
+            let a = row.get2(2 * i + 1, 2 * i + 2);
+            e[i] = K::pair(V::mid(last, a), a);
+            last = a;
+        }
+        for y in (0..h).step_by(2) {
+            let a = row.get2(y + t - 1, y + t);
+            e[m] = K::pair(V::mid(last, a), a);
+            s.emit::<BD, V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
+            e = [e[1], e[2], e[3], e[3]];
+            last = a;
+        }
+        return;
+    }
     let mut last = row.get(0);
     for i in 0..m {
         let a = row.get(2 * i + 1);
         let b = row.get(2 * i + 2);
-        e[i] = V::pair(last, a);
-        o[i] = V::pair(a, b);
+        e[i] = K::pair(last, a);
+        o[i] = K::pair(a, b);
         last = b;
     }
     let mut y = 0;
     while y + 2 <= h {
         let a = row.get(y + t - 1);
         let b = row.get(y + t);
-        e[m] = V::pair(last, a);
-        o[m] = V::pair(a, b);
-        s.emit::<BD, V, PW>(V::maddp(&e[..m + 1], k, rnd, sh), x, y, max);
-        s.emit::<BD, V, PW>(V::maddp(&o[..m + 1], k, rnd, sh), x, y + 1, max);
+        e[m] = K::pair(last, a);
+        o[m] = K::pair(a, b);
+        s.emit::<BD, V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
+        s.emit::<BD, V, PW>(K::madd(&o[..m + 1], k, rnd, sh), x, y + 1, max);
         e = [e[1], e[2], e[3], e[3]];
         o = [o[1], o[2], o[3], o[3]];
         last = b;
         y += 2;
     }
     if y < h {
-        e[m] = V::pair(last, row.get(y + t - 1));
-        s.emit::<BD, V, PW>(V::maddp(&e[..m + 1], k, rnd, sh), x, y, max);
+        e[m] = K::pair(last, row.get(y + t - 1));
+        s.emit::<BD, V, PW>(K::madd(&e[..m + 1], k, rnd, sh), x, y, max);
     }
 }
 
@@ -869,6 +1145,24 @@ fn comp_k<BD: BitDepth, V: Vx, const PW: usize, const K: u8>(
     };
     let (t1, t2) = (&t1[..w * h], &t2[..w * h]);
     let m = if K == 2 { &m[..w * h] } else { &[] };
+    if V::ROWS == 2 {
+        // A strip is the block: two rows of the compound buffers lie side by side.
+        for (y, (a, b)) in t1.chunks_exact(V::N).zip(t2.chunks_exact(V::N)).enumerate() {
+            let (a, b) = (V::load(a), V::load(b));
+            let v = match K {
+                0 if BD::BITDEPTH == 8 => a.add(b).rshr_c::<5>(),
+                0 | 1 => V::madd2(a, b, ka, kb, rnd, sh),
+                _ => {
+                    let m = V::load_u8(&m[y * V::N..][..V::N]);
+                    V::madd2(a, b, m, V::splat(64).sub(m), rnd, sh)
+                }
+            };
+            let d = dst + 2 * y as isize * stride;
+            store_px_row::<BD, V, 0, 0>(v, &mut d.slice_mut::<BD>(w), max);
+            store_px_row::<BD, V, 0, 1>(v, &mut (d + stride).slice_mut::<BD>(w), max);
+        }
+        return;
+    }
     for (y, (r1, r2)) in t1.chunks_exact(w).zip(t2.chunks_exact(w)).enumerate() {
         let mut row = (dst + y as isize * stride).slice_mut::<BD>(w);
         let rm = if K == 2 { &m[y * w..][..w] } else { &[] };
@@ -961,7 +1255,7 @@ fn warp_filters<V: Vw>(m: i32, step: i32) -> [V; 8] {
 /// in registers, then eight rows with a filter per column. `w` is `prep`'s row stride.
 #[inline(always)]
 pub fn warp<BD: BitDepth, V: Vw>(
-    mut out: Out,
+    out: Out,
     w: usize,
     src: Rav1dPictureDataComponentOffset,
     abcd: &[i16; 4],
@@ -969,8 +1263,30 @@ pub fn warp<BD: BitDepth, V: Vw>(
     my: i32,
     bd: BD,
 ) {
+    let mid = warp_h::<BD, V>(src, abcd, mx, bd);
+    warp_v::<BD, V>(out, w, &mid, abcd, my, bd)
+}
+
+/// The rounding of the vertical warp pass, `prep`'s or `put`'s.
+#[inline(always)]
+fn warp_rnd<BD: BitDepth>(prep: bool, bd: BD) -> (i32, u32) {
     let ib = bd.get_intermediate_bits() as u32;
-    let max = bd.bitdepth_max().as_::<i32>() as i16;
+    if prep {
+        (64, 7)
+    } else {
+        (1 << (6 + ib), 7 + ib)
+    }
+}
+
+/// The warp's 15 first-pass rows.
+#[inline(always)]
+fn warp_h<BD: BitDepth, V: Vw>(
+    src: Rav1dPictureDataComponentOffset,
+    abcd: &[i16; 4],
+    mx: i32,
+    bd: BD,
+) -> [V; 15] {
+    let ib = bd.get_intermediate_bits() as u32;
     let stride = src.pixel_stride::<BD>();
     let mut mid = [V::splat(0); 15];
     for y in 0..15 {
@@ -1000,12 +1316,22 @@ pub fn warp<BD: BitDepth, V: Vw>(
             V::hdot8(&v, &f, 1 << (6 - ib), 7 - ib)
         };
     }
+    mid
+}
+
+/// The warp's vertical pass over `mid`.
+#[inline(always)]
+fn warp_v<BD: BitDepth, V: Vw>(
+    mut out: Out,
+    w: usize,
+    mid: &[V; 15],
+    abcd: &[i16; 4],
+    my: i32,
+    bd: BD,
+) {
+    let max = bd.bitdepth_max().as_::<i32>() as i16;
     let prep = out.is_prep();
-    let (rnd, sh) = if prep {
-        (64, 7)
-    } else {
-        (1 << (6 + ib), 7 + ib)
-    };
+    let (rnd, sh) = warp_rnd(prep, bd);
     for y in 0..8 {
         let mut k = warp_filters::<V>(my + y as i32 * abcd[3] as i32, abcd[2] as i32);
         V::transpose8(&mut k);
@@ -1028,9 +1354,9 @@ mod x86 {
 
     use super::Vx;
 
-    /// Eight lanes on SSE4.1.
+    /// Eight lanes on SSE4.1; with `R2` two rows of four.
     #[derive(Clone, Copy)]
-    pub struct S(__m128i);
+    pub struct S<const R2: bool = false>(__m128i);
 
     #[inline(always)]
     fn pair(a: i8, b: i8) -> i16 {
@@ -1104,6 +1430,17 @@ mod x86 {
         unsafe { _mm_maddubs_epi16(_mm_shuffle_epi8(v, _mm_loadu_si128(s.as_ptr().cast())), k) }
     }
 
+    /// `tap` on two rows in `load15`'s layout, one a lane.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn tap15(v: __m256i, k: i8, a: i8, b: i8) -> __m256i {
+        let s = sh15(k);
+        unsafe {
+            let s = _mm256_loadu2_m128i(s.as_ptr().cast(), s.as_ptr().cast());
+            _mm256_maddubs_epi16(_mm256_shuffle_epi8(v, s), _mm256_set1_epi16(pair(a, b)))
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn tap2(v: __m256i, k: i8, a: i8, b: i8) -> __m256i {
@@ -1114,10 +1451,43 @@ mod x86 {
         }
     }
 
+    #[inline(always)]
+    unsafe fn ld64(s: &[u8]) -> __m128i {
+        unsafe { _mm_loadl_epi64(s[..8].as_ptr().cast()) }
+    }
+
+    #[inline(always)]
+    unsafe fn ld32(s: &[u8]) -> __m128i {
+        unsafe { _mm_cvtsi32_si128(i32::from_le_bytes(s[..4].try_into().unwrap())) }
+    }
+
+    /// Tap pairs `(f[k], f[k + 1])` for the pixel pairs `(i + k, i + k + 1)` of 4 pixels in each
+    /// 8-byte half of `v` (from pixel 2), summed.
+    #[inline(always)]
+    unsafe fn tap4(v: __m128i, k: i8, f: &[i8; 8]) -> __m128i {
+        let mut s = [0i8; 16];
+        let mut i = 0;
+        while i < 8 {
+            let j = (i & 4) as i8 * 2 + (i & 3) as i8 + k - 2;
+            s[2 * i] = j;
+            s[2 * i + 1] = j + 1;
+            i += 1;
+        }
+        let k = k as usize;
+        unsafe {
+            _mm_maddubs_epi16(
+                _mm_shuffle_epi8(v, _mm_loadu_si128(s.as_ptr().cast())),
+                _mm_set1_epi16(pair(f[k], f[k + 1])),
+            )
+        }
+    }
+
     // SAFETY (every `unsafe` here): SSE4.1 holds where these are compiled in, and loads and
     // stores go through bounds-checked slices.
-    impl Vx for S {
+    impl<const R2: bool> Vx for S<R2> {
         const N: usize = 8;
+        const ROWS: usize = 1 + R2 as usize;
+        const BYTE_PAIRS: bool = true;
 
         #[inline(always)]
         fn splat(v: i16) -> Self {
@@ -1225,6 +1595,93 @@ mod x86 {
             Self(unsafe { _mm_mulhrs_epi16(self.0, _mm_set1_epi16(1 << (15 - SH))) })
         }
         #[inline(always)]
+        fn load2_u8(a: &[u8], b: &[u8]) -> Self {
+            Self(unsafe { _mm_cvtepu8_epi16(_mm_unpacklo_epi32(ld32(a), ld32(b))) })
+        }
+        #[inline(always)]
+        fn load2_u16(a: &[u16], b: &[u16]) -> Self {
+            unsafe {
+                let a = _mm_loadl_epi64(a[..4].as_ptr().cast());
+                Self(_mm_unpacklo_epi64(
+                    a,
+                    _mm_loadl_epi64(b[..4].as_ptr().cast()),
+                ))
+            }
+        }
+        #[inline(always)]
+        fn h8x2<const T6: bool>(a: &[u8], b: &[u8], f: &[i8; 8]) -> Self {
+            // Four pixels a row take the 4-tap filters (taps 2 to 5).
+            if T6 && f[1] == 0 && f[6] == 0 {
+                unsafe {
+                    let v = _mm_unpacklo_epi64(ld64(&a[2..]), ld64(&b[2..]));
+                    return Self(_mm_add_epi16(tap4(v, 2, f), tap4(v, 4, f)));
+                }
+            }
+            let (mut ta, mut tb) = ([0; 16], [0; 16]);
+            ta[..11].copy_from_slice(&a[..11]);
+            tb[..11].copy_from_slice(&b[..11]);
+            let (ra, rb) = (S::<false>::h8::<T6>(&ta, f), S::<false>::h8::<T6>(&tb, f));
+            Self(unsafe { _mm_unpacklo_epi64(ra.0, rb.0) })
+        }
+        #[inline(always)]
+        fn mid(a: Self, b: Self) -> Self {
+            Self(unsafe { _mm_alignr_epi8::<8>(b.0, a.0) })
+        }
+        #[inline(always)]
+        fn store_row_u8<const I: usize>(self, d: &mut [u8]) {
+            if !R2 {
+                return self.store_u8(d);
+            }
+            unsafe {
+                let p = _mm_packus_epi16(self.0, self.0);
+                let p = if I == 0 { p } else { _mm_srli_si128::<4>(p) };
+                d[..4].copy_from_slice(&_mm_cvtsi128_si32(p).to_le_bytes());
+            }
+        }
+        #[inline(always)]
+        fn store_row_u16<const I: usize>(self, d: &mut [u16]) {
+            if !R2 {
+                return self.store_u16(d);
+            }
+            unsafe {
+                let v = if I == 0 {
+                    self.0
+                } else {
+                    _mm_unpackhi_epi64(self.0, self.0)
+                };
+                _mm_storel_epi64(d[..4].as_mut_ptr().cast(), v)
+            }
+        }
+        #[inline(always)]
+        fn store_row<const I: usize>(self, d: &mut [i16]) {
+            if !R2 {
+                return self.store(d);
+            }
+            unsafe {
+                let v = if I == 0 {
+                    self.0
+                } else {
+                    _mm_unpackhi_epi64(self.0, self.0)
+                };
+                _mm_storel_epi64(d[..4].as_mut_ptr().cast(), v)
+            }
+        }
+        #[inline(always)]
+        fn pairb(a: Self, b: Self) -> Self {
+            Self(unsafe { _mm_or_si128(a.0, _mm_slli_epi16::<8>(b.0)) })
+        }
+        #[inline(always)]
+        fn maddb(p: &[Self], k: &[i16; 8]) -> Self {
+            unsafe {
+                let mut s = _mm_maddubs_epi16(p[0].0, _mm_set1_epi16(pair(k[0] as i8, k[1] as i8)));
+                for (i, p) in p.iter().enumerate().skip(1) {
+                    let k = _mm_set1_epi16(pair(k[2 * i] as i8, k[2 * i + 1] as i8));
+                    s = _mm_add_epi16(s, _mm_maddubs_epi16(p.0, k));
+                }
+                Self(s)
+            }
+        }
+        #[inline(always)]
         fn wmask(self, o: Self, rnd: i16, sh: u32) -> Self {
             unsafe {
                 let d = _mm_sub_epi16(_mm_max_epi16(self.0, o.0), _mm_min_epi16(self.0, o.0));
@@ -1235,6 +1692,10 @@ mod x86 {
                     _mm_set1_epi16(38),
                 ))
             }
+        }
+        #[inline(always)]
+        fn hadd(a: Self, b: Self) -> Self {
+            Self(unsafe { _mm_hadd_epi16(a.0, b.0) })
         }
     }
 
@@ -1369,16 +1830,73 @@ mod x86 {
         }
     }
 
-    /// Sixteen lanes on AVX2.
+    /// The 8 bpc vertical warp pass's row pairs `(j, j + 2)`, word-interleaved, columns 0 to 3
+    /// in the low lane, as the tap pairs of `WARP_FILTER_PAIRED` take them.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub fn warp_pairs8(mid: &[S; 15]) -> [__m256i; 13] {
+        let mut r = [_mm256_setzero_si256(); 13];
+        for j in 0..13 {
+            let (a, b) = (mid[j].0, mid[j + 2].0);
+            let lo = _mm256_castsi128_si256(_mm_unpacklo_epi16(a, b));
+            r[j] = _mm256_inserti128_si256::<1>(lo, _mm_unpackhi_epi16(a, b));
+        }
+        r
+    }
+
+    /// Filters `a` and `b`, one a lane.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn q2(a: &[i8; 8], b: &[i8; 8]) -> __m256i {
+        // SAFETY: Both are 8 bytes.
+        unsafe {
+            let lo = _mm256_castsi128_si256(_mm_loadl_epi64(a.as_ptr().cast()));
+            _mm256_inserti128_si256::<1>(lo, _mm_loadl_epi64(b.as_ptr().cast()))
+        }
+    }
+
+    /// One row of the 8 bpc vertical warp pass, `(sum(rows * taps) + rnd) >> sh`, from the
+    /// row pairs `r[0], r[1], r[4], r[5]` and the columns' filters `f` in `WARP_FILTER_PAIRED`'s
+    /// order. The filters' tap pairs are transposed as bytes, then widened into the high bytes
+    /// of words (no sign extension): the sums are 256 times the dot products.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub fn warp_v8(r: &[__m256i], f: [&[i8; 8]; 8], rnd: i32, sh: u32) -> S {
+        let ab = _mm256_unpacklo_epi16(q2(f[0], f[4]), q2(f[1], f[5]));
+        let cd = _mm256_unpacklo_epi16(q2(f[2], f[6]), q2(f[3], f[7]));
+        let (x, y) = (_mm256_unpacklo_epi32(ab, cd), _mm256_unpackhi_epi32(ab, cd));
+        let z = _mm256_setzero_si256();
+        let s = _mm256_add_epi32(
+            _mm256_madd_epi16(r[0], _mm256_unpacklo_epi8(z, x)),
+            _mm256_madd_epi16(r[1], _mm256_unpackhi_epi8(z, x)),
+        );
+        let t = _mm256_add_epi32(
+            _mm256_madd_epi16(r[4], _mm256_unpacklo_epi8(z, y)),
+            _mm256_madd_epi16(r[5], _mm256_unpackhi_epi8(z, y)),
+        );
+        let s = _mm256_add_epi32(_mm256_add_epi32(s, t), _mm256_set1_epi32(rnd << 8));
+        let s = _mm256_sra_epi32(s, _mm_cvtsi32_si128(sh as i32 + 8));
+        S(_mm_packs_epi32(
+            _mm256_castsi256_si128(s),
+            _mm256_extracti128_si256::<1>(s),
+        ))
+    }
+
+    /// Sixteen lanes on AVX2; with `R2` two rows of eight.
     #[cfg(target_arch = "x86_64")]
     #[derive(Clone, Copy)]
-    pub struct A(__m256i);
+    pub struct A<const R2: bool = false>(__m256i);
 
     // SAFETY (every `unsafe` here): AVX2 holds where these are compiled in, and loads and
     // stores go through bounds-checked slices.
     #[cfg(target_arch = "x86_64")]
-    impl Vx for A {
+    impl<const R2: bool> Vx for A<R2> {
         const N: usize = 16;
+        const ROWS: usize = 1 + R2 as usize;
+        const BYTE_PAIRS: bool = true;
 
         #[inline(always)]
         fn splat(v: i16) -> Self {
@@ -1503,6 +2021,87 @@ mod x86 {
             Self(unsafe { _mm256_mulhrs_epi16(self.0, _mm256_set1_epi16(1 << (15 - SH))) })
         }
         #[inline(always)]
+        fn load2_u8(a: &[u8], b: &[u8]) -> Self {
+            Self(unsafe { _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(ld64(a), ld64(b))) })
+        }
+        #[inline(always)]
+        fn load2_u16(a: &[u16], b: &[u16]) -> Self {
+            Self(unsafe { _mm256_loadu2_m128i(b[..8].as_ptr().cast(), a[..8].as_ptr().cast()) })
+        }
+        #[inline(always)]
+        fn h8x2<const T6: bool>(a: &[u8], b: &[u8], f: &[i8; 8]) -> Self {
+            unsafe {
+                let v = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(load15(a)), load15(b));
+                if T6 {
+                    let s = _mm256_add_epi16(tap15(v, 1, f[1], f[2]), tap15(v, 3, f[3], f[4]));
+                    return Self(_mm256_add_epi16(s, tap15(v, 5, f[5], f[6])));
+                }
+                let s = _mm256_add_epi16(tap15(v, 0, f[0], f[1]), tap15(v, 2, f[2], f[3]));
+                let t = _mm256_add_epi16(tap15(v, 4, f[4], f[5]), tap15(v, 6, f[6], f[7]));
+                Self(_mm256_add_epi16(s, t))
+            }
+        }
+        #[inline(always)]
+        fn mid(a: Self, b: Self) -> Self {
+            Self(unsafe { _mm256_permute2x128_si256::<0x21>(a.0, b.0) })
+        }
+        #[inline(always)]
+        fn store_row_u8<const I: usize>(self, d: &mut [u8]) {
+            if !R2 {
+                return self.store_u8(d);
+            }
+            unsafe {
+                let lo = _mm256_castsi256_si128(self.0);
+                let p = _mm_packus_epi16(lo, _mm256_extracti128_si256::<1>(self.0));
+                let p = if I == 0 { p } else { _mm_unpackhi_epi64(p, p) };
+                _mm_storel_epi64(d[..8].as_mut_ptr().cast(), p)
+            }
+        }
+        #[inline(always)]
+        fn store_row_u16<const I: usize>(self, d: &mut [u16]) {
+            if !R2 {
+                return self.store_u16(d);
+            }
+            unsafe {
+                let v = if I == 0 {
+                    _mm256_castsi256_si128(self.0)
+                } else {
+                    _mm256_extracti128_si256::<1>(self.0)
+                };
+                _mm_storeu_si128(d[..8].as_mut_ptr().cast(), v)
+            }
+        }
+        #[inline(always)]
+        fn store_row<const I: usize>(self, d: &mut [i16]) {
+            if !R2 {
+                return self.store(d);
+            }
+            unsafe {
+                let v = if I == 0 {
+                    _mm256_castsi256_si128(self.0)
+                } else {
+                    _mm256_extracti128_si256::<1>(self.0)
+                };
+                _mm_storeu_si128(d[..8].as_mut_ptr().cast(), v)
+            }
+        }
+        #[inline(always)]
+        fn pairb(a: Self, b: Self) -> Self {
+            Self(unsafe { _mm256_or_si256(a.0, _mm256_slli_epi16::<8>(b.0)) })
+        }
+        #[inline(always)]
+        fn maddb(p: &[Self], k: &[i16; 8]) -> Self {
+            unsafe {
+                let k0 = _mm256_set1_epi16(pair(k[0] as i8, k[1] as i8));
+                let mut s = _mm256_maddubs_epi16(p[0].0, k0);
+                for (i, p) in p.iter().enumerate().skip(1) {
+                    let k = _mm256_set1_epi16(pair(k[2 * i] as i8, k[2 * i + 1] as i8));
+                    s = _mm256_add_epi16(s, _mm256_maddubs_epi16(p.0, k));
+                }
+                Self(s)
+            }
+        }
+        #[inline(always)]
         fn wmask(self, o: Self, rnd: i16, sh: u32) -> Self {
             unsafe {
                 let d =
@@ -1515,6 +2114,10 @@ mod x86 {
                 ))
             }
         }
+        #[inline(always)]
+        fn hadd(a: Self, b: Self) -> Self {
+            Self(unsafe { _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_hadd_epi16(a.0, b.0)) })
+        }
     }
 }
 
@@ -1525,9 +2128,17 @@ mod neon {
     use super::Vx;
 
     /// Eight lanes on NEON; with `D` the 8 bpc first pass in `sdot`s (dotprod), where the
-    /// compiler has them (`rav1d_sdot`).
+    /// compiler has them (`rav1d_sdot`); with `R2` two rows of four.
     #[derive(Clone, Copy)]
-    pub struct S<const D: bool>(int16x8_t);
+    pub struct S<const D: bool, const R2: bool = false>(int16x8_t);
+
+    /// The 4-tap windows of `vqtbl1_u8` over two rows' bytes 2 to 9.
+    const WIN4: [[u8; 8]; 4] = [
+        [0, 1, 2, 3, 8, 9, 10, 11],
+        [1, 2, 3, 4, 9, 10, 11, 12],
+        [2, 3, 4, 5, 10, 11, 12, 13],
+        [3, 4, 5, 6, 11, 12, 13, 14],
+    ];
 
     /// The 4-byte windows of output pixels 0..4, 4..8 and 8..12 for `sdot`, over bytes
     /// `j >= 8` loaded at `j + 1`.
@@ -1542,8 +2153,9 @@ mod neon {
 
     // SAFETY (every `unsafe` here): NEON is the aarch64 baseline, and loads and stores go
     // through bounds-checked slices.
-    impl<const D: bool> Vx for S<D> {
+    impl<const D: bool, const R2: bool> Vx for S<D, R2> {
         const N: usize = 8;
+        const ROWS: usize = 1 + R2 as usize;
 
         #[inline(always)]
         fn splat(v: i16) -> Self {
@@ -1699,6 +2311,92 @@ mod neon {
             Self(unsafe { vrshrq_n_s16::<SH>(self.0) })
         }
         #[inline(always)]
+        fn load2_u8(a: &[u8], b: &[u8]) -> Self {
+            let a = u32::from_le_bytes(a[..4].try_into().unwrap());
+            let b = u32::from_le_bytes(b[..4].try_into().unwrap());
+            unsafe {
+                let v = vset_lane_u32::<1>(b, vdup_n_u32(a));
+                Self(vreinterpretq_s16_u16(vmovl_u8(vreinterpret_u8_u32(v))))
+            }
+        }
+        #[inline(always)]
+        fn load2_u16(a: &[u16], b: &[u16]) -> Self {
+            unsafe {
+                let v = vcombine_u16(vld1_u16(a[..4].as_ptr()), vld1_u16(b[..4].as_ptr()));
+                Self(vreinterpretq_s16_u16(v))
+            }
+        }
+        #[inline(always)]
+        fn h8x2<const T6: bool>(a: &[u8], b: &[u8], f: &[i8; 8]) -> Self {
+            // Four pixels a row take the 4-tap filters (taps 2 to 5).
+            if T6 && f[1] == 0 && f[6] == 0 {
+                unsafe {
+                    let q = vcombine_u8(vld1_u8(a[2..10].as_ptr()), vld1_u8(b[2..10].as_ptr()));
+                    let w0 = vmovl_u8(vqtbl1_u8(q, vld1_u8(WIN4[0].as_ptr())));
+                    let w1 = vmovl_u8(vqtbl1_u8(q, vld1_u8(WIN4[1].as_ptr())));
+                    let w2 = vmovl_u8(vqtbl1_u8(q, vld1_u8(WIN4[2].as_ptr())));
+                    let w3 = vmovl_u8(vqtbl1_u8(q, vld1_u8(WIN4[3].as_ptr())));
+                    let mut acc = vmulq_n_s16(vreinterpretq_s16_u16(w0), f[2] as i16);
+                    acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(w1), f[3] as i16);
+                    acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(w2), f[4] as i16);
+                    return Self(vmlaq_n_s16(acc, vreinterpretq_s16_u16(w3), f[5] as i16));
+                }
+            }
+            let (mut ta, mut tb) = ([0; 16], [0; 16]);
+            ta[..11].copy_from_slice(&a[..11]);
+            tb[..11].copy_from_slice(&b[..11]);
+            let (ra, rb) = (S::<false>::h8::<T6>(&ta, f), S::<false>::h8::<T6>(&tb, f));
+            Self(unsafe { vcombine_s16(vget_low_s16(ra.0), vget_low_s16(rb.0)) })
+        }
+        #[inline(always)]
+        fn mid(a: Self, b: Self) -> Self {
+            Self(unsafe { vextq_s16::<4>(a.0, b.0) })
+        }
+        #[inline(always)]
+        fn store_row_u8<const I: usize>(self, d: &mut [u8]) {
+            if !R2 {
+                return self.store_u8(d);
+            }
+            let v = unsafe { vreinterpret_u32_u8(vqmovun_s16(self.0)) };
+            let v = unsafe {
+                if I == 0 {
+                    vget_lane_u32::<0>(v)
+                } else {
+                    vget_lane_u32::<1>(v)
+                }
+            };
+            d[..4].copy_from_slice(&v.to_le_bytes());
+        }
+        #[inline(always)]
+        fn store_row_u16<const I: usize>(self, d: &mut [u16]) {
+            if !R2 {
+                return self.store_u16(d);
+            }
+            unsafe {
+                let v = vreinterpretq_u16_s16(self.0);
+                let v = if I == 0 {
+                    vget_low_u16(v)
+                } else {
+                    vget_high_u16(v)
+                };
+                vst1_u16(d[..4].as_mut_ptr(), v)
+            }
+        }
+        #[inline(always)]
+        fn store_row<const I: usize>(self, d: &mut [i16]) {
+            if !R2 {
+                return self.store(d);
+            }
+            unsafe {
+                let v = if I == 0 {
+                    vget_low_s16(self.0)
+                } else {
+                    vget_high_s16(self.0)
+                };
+                vst1_s16(d[..4].as_mut_ptr(), v)
+            }
+        }
+        #[inline(always)]
         fn wmask(self, o: Self, rnd: i16, sh: u32) -> Self {
             unsafe {
                 let d = vreinterpretq_u16_s16(vabdq_s16(self.0, o.0));
@@ -1707,6 +2405,10 @@ mod neon {
                 let d = vminq_u16(d, vdupq_n_u16(26));
                 Self(vreinterpretq_s16_u16(vaddq_u16(d, vdupq_n_u16(38))))
             }
+        }
+        #[inline(always)]
+        fn hadd(a: Self, b: Self) -> Self {
+            Self(unsafe { vpaddq_s16(a.0, b.0) })
         }
     }
     // SAFETY (every `unsafe` here): as for `Vx`.
@@ -2011,8 +2713,17 @@ pub fn blend<BD: BitDepth, V: Vx, const PW: usize>(
     }
 }
 
+/// `v`'s lanes `from..from + d.len()` saturated to `u8` into `d`.
+#[inline(always)]
+fn store_u8_lanes<V: Vx>(v: V, from: usize, d: &mut [u8]) {
+    let mut t = [0u8; 32];
+    v.store_u8(&mut t);
+    let n = d.len();
+    d.copy_from_slice(&t[from..from + n]);
+}
+
 /// `w_mask`: the blend weight from the two predictions' difference, its mask stored at the
-/// chroma's subsampling (by lane in scalar code, from the strip's weights).
+/// chroma's subsampling. Two rows a step, whose weights the subsampled masks sum.
 #[inline(always)]
 pub fn w_mask<BD: BitDepth, V: Vx, const PW: usize>(
     dst: Rav1dPictureDataComponentOffset,
@@ -2034,34 +2745,30 @@ pub fn w_mask<BD: BitDepth, V: Vx, const PW: usize>(
     let n = if PW == 0 { V::N } else { PW };
     let mw = w >> ss_hor as usize;
     let stride = dst.pixel_stride::<BD>();
-    for y in 0..h {
-        let mut row = (dst + y as isize * stride).slice_mut::<BD>(w);
-        let mrow = if ss_ver { (y >> 1) * mw } else { y * mw };
+    let sign = sign as i16;
+    for y in (0..h).step_by(2) {
         for x in (0..w).step_by(n) {
-            let i = y * w + x;
-            let a = ld_i16::<V, PW>(&t1[i..]);
-            let b = ld_i16::<V, PW>(&t2[i..]);
-            let m = a.wmask(b, mask_rnd, mask_sh);
-            let v = V::madd2(a, b, m, V::splat(64).sub(m), rnd, ib + 6);
-            store_px::<BD, V, PW>(v, &mut row[x..], max);
-            let mut t = [0i16; 16];
-            m.store(&mut t);
-            if !ss_hor {
-                for i in 0..n {
-                    mask[mrow + x + i] = t[i] as u8;
-                }
-                continue;
+            let mut m = [V::splat(0); 2];
+            for r in 0..2 {
+                let i = (y + r) * w + x;
+                let a = ld_i16::<V, PW>(&t1[i..]);
+                let b = ld_i16::<V, PW>(&t2[i..]);
+                m[r] = a.wmask(b, mask_rnd, mask_sh);
+                let v = V::madd2(a, b, m[r], V::splat(64).sub(m[r]), rnd, ib + 6);
+                let d = dst + ((y + r) as isize * stride + x as isize);
+                store_px::<BD, V, PW>(v, &mut d.slice_mut::<BD>(n), max);
             }
-            for i in (0..n).step_by(2) {
-                let s = (t[i] + t[i + 1]) as u8;
-                let j = mrow + (x + i >> 1);
-                mask[j] = if !ss_ver {
-                    (s + 1 - sign) >> 1
-                } else if y & 1 == 0 {
-                    s
-                } else {
-                    ((s as u16 + 2 - sign as u16 + mask[j] as u16) >> 2) as u8
-                };
+            if !ss_hor {
+                store_u8_lanes(m[0], 0, &mut mask[y * mw + x..][..n]);
+                store_u8_lanes(m[1], 0, &mut mask[(y + 1) * mw + x..][..n]);
+            } else if !ss_ver {
+                let s = V::hadd(m[0], m[1]).add(V::splat(1 - sign)).sra(1);
+                store_u8_lanes(s, 0, &mut mask[y * mw + x / 2..][..n / 2]);
+                store_u8_lanes(s, V::N / 2, &mut mask[(y + 1) * mw + x / 2..][..n / 2]);
+            } else {
+                let s = m[0].add(m[1]);
+                let s = V::hadd(s, s).add(V::splat(2 - sign)).sra(2);
+                store_u8_lanes(s, 0, &mut mask[(y >> 1) * mw + x / 2..][..n / 2]);
             }
         }
     }
@@ -2103,6 +2810,50 @@ macro_rules! tiers {
 
 tiers!(mc8, mc_8tap, (out: Out, src: Rav1dPictureDataComponentOffset, w: usize, h: usize,
     fh: Option<&[i8; 8]>, fv: Option<&[i8; 8]>, bd: BD));
+/// `mod $m` with the kernel `$k` two rows a vector: 4-pixel strips on SSE4.1 (`n`) and in
+/// AVX2's VEX encoding (`nw`), 8-pixel ones on AVX2 (`w`); 4-pixel strips on NEON (`n`, and
+/// `nw` with dotprod).
+macro_rules! tiers2 {
+    ($m:ident, $k:ident, ($($a:ident: $t:ty),*)) => {
+        mod $m {
+            use super::*;
+
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[target_feature(enable = "sse4.1")]
+            pub fn n<BD: BitDepth>($($a: $t),*) {
+                $k::<BD, x86::S<true>, 0>($($a),*)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(enable = "avx2")]
+            pub fn nw<BD: BitDepth>($($a: $t),*) {
+                $k::<BD, x86::S<true>, 0>($($a),*)
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            #[target_feature(enable = "avx2")]
+            pub fn w<BD: BitDepth>($($a: $t),*) {
+                $k::<BD, A<true>, 0>($($a),*)
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            pub fn n<BD: BitDepth>($($a: $t),*) {
+                $k::<BD, neon::S<false, true>, 0>($($a),*)
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            #[target_feature(enable = "dotprod")]
+            pub fn nw<BD: BitDepth>($($a: $t),*) {
+                $k::<BD, neon::S<true, true>, 0>($($a),*)
+            }
+        }
+    };
+}
+
+tiers2!(mc8x2, mc_8tap, (out: Out, src: Rav1dPictureDataComponentOffset, w: usize, h: usize,
+    fh: Option<&[i8; 8]>, fv: Option<&[i8; 8]>, bd: BD));
+tiers2!(cmpx2, comp, (dst: Rav1dPictureDataComponentOffset, t1: &[i16], t2: &[i16], w: usize,
+    h: usize, kind: Comp, bd: BD));
 tiers!(cmp, comp, (dst: Rav1dPictureDataComponentOffset, t1: &[i16], t2: &[i16], w: usize,
     h: usize, kind: Comp, bd: BD));
 
@@ -2122,11 +2873,11 @@ fn warp_128<BD: BitDepth>(
     warp::<BD, S>(out, w, src, abcd, mx, my, bd)
 }
 
-/// `warp_128` on an AVX2 CPU, in VEX encoding.
+/// `warp_128` on an AVX2 CPU, in VEX encoding; the 8 bpc vertical pass in ymm.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 fn warp_vex<BD: BitDepth>(
-    out: Out,
+    mut out: Out,
     w: usize,
     src: Rav1dPictureDataComponentOffset,
     abcd: &[i16; 4],
@@ -2134,7 +2885,18 @@ fn warp_vex<BD: BitDepth>(
     my: i32,
     bd: BD,
 ) {
-    warp::<BD, S>(out, w, src, abcd, mx, my, bd)
+    let mid = warp_h::<BD, S>(src, abcd, mx, bd);
+    if BD::BITDEPTH != 8 {
+        return warp_v::<BD, S>(out, w, &mid, abcd, my, bd);
+    }
+    let prep = out.is_prep();
+    let (rnd, sh) = warp_rnd(prep, bd);
+    let r = x86::warp_pairs8(&mid);
+    for y in 0..8 {
+        let f = warp_filter_refs::<S>(my + y as i32 * abcd[3] as i32, abcd[2] as i32);
+        let v = x86::warp_v8(&r[y..], f, rnd, sh);
+        out.emit::<BD, S, 0>(v, 0, y, w, 0);
+    }
 }
 
 /// # Safety
@@ -2182,7 +2944,7 @@ macro_rules! call_tier {
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             if $wide {
                 return match $w {
-                    w if w >= A::N => $m::w::<BD>($($a),*),
+                    w if w >= <A>::N => $m::w::<BD>($($a),*),
                     2 => $m::nw::<BD, 2>($($a),*),
                     4 => $m::nw::<BD, 4>($($a),*),
                     _ => $m::nw::<BD, 0>($($a),*),
@@ -2195,6 +2957,30 @@ macro_rules! call_tier {
                 _ => $m::n::<BD, 0>($($a),*),
             }
         }
+    }};
+}
+
+/// `call_tier`, with `$m2`'s two-row tiers for 4-pixel blocks and on AVX2 8-pixel ones.
+macro_rules! call_tier2 {
+    ($m2:ident, $m:ident, $wide:expr, $w:expr, ($($a:expr),*)) => {{
+        // SAFETY: As in `call_tier`.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        #[allow(unused_unsafe)]
+        unsafe {
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            if $wide {
+                match $w {
+                    #[cfg(target_arch = "x86_64")]
+                    8 => return $m2::w::<BD>($($a),*),
+                    4 => return $m2::nw::<BD>($($a),*),
+                    _ => {}
+                }
+            }
+            if $w == 4 {
+                return $m2::n::<BD>($($a),*);
+            }
+        }
+        call_tier!($m, $wide, $w, ($($a),*))
     }};
 }
 
@@ -2221,7 +3007,7 @@ fn put_8tap<BD: BitDepth, const FILTER: usize, const WIDE: bool>(
     if fh.is_none() && fv.is_none() {
         return put_rust::<BD>(dst, src, w, h);
     }
-    call_tier!(mc8, WIDE, w, (Out::Put(dst), src, w, h, fh, fv, bd))
+    call_tier2!(mc8x2, mc8, WIDE, w, (Out::Put(dst), src, w, h, fh, fv, bd))
 }
 
 #[inline(always)]
@@ -2247,7 +3033,7 @@ fn prep_8tap<BD: BitDepth, const FILTER: usize, const WIDE: bool>(
     if fh.is_none() && fv.is_none() {
         return call_tier!(pc, WIDE, w, (tmp, src, w, h, bd));
     }
-    call_tier!(mc8, WIDE, w, (Out::Prep(tmp), src, w, h, fh, fv, bd))
+    call_tier2!(mc8x2, mc8, WIDE, w, (Out::Prep(tmp), src, w, h, fh, fv, bd))
 }
 
 /// # Safety
@@ -2312,7 +3098,7 @@ fn comp_any<BD: BitDepth, const WIDE: bool>(
     kind: Comp,
     bd: BD,
 ) {
-    call_tier!(cmp, WIDE, w, (dst, t1, t2, w, h, kind, bd))
+    call_tier2!(cmpx2, cmp, WIDE, w, (dst, t1, t2, w, h, kind, bd))
 }
 
 /// # Safety
@@ -2845,9 +3631,13 @@ mod tests {
         let sm = &mut sm.0;
         let tp = aligned(&pixels::<BD>(&mut rng, SCRATCH_INTER_INTRA_BUF_LEN, max));
         let abcd = [300i16, -200, 150, 250];
-        let f = Filter2d::Regular8Tap;
-        for k in 0..13 {
-            for &w in &[8, 16, 32] {
+        let only = std::env::var("TIME_MC").unwrap_or_default();
+        for k in 0..19 {
+            let (k, f) = match k {
+                0..13 => (k, Filter2d::Regular8Tap),
+                _ => (k - 13, Filter2d::Sharp8Tap),
+            };
+            for &w in &[4, 8, 16, 32] {
                 let (name, wi) = (
                     [
                         "put_hv",
@@ -2866,7 +3656,12 @@ mod tests {
                     ][k],
                     w as i32,
                 );
-                if k >= 11 && w != 8 {
+                let name = if f == Filter2d::Sharp8Tap {
+                    format!("{name}#")
+                } else {
+                    name.to_string()
+                };
+                if (k >= 11 && w != 8) || (w == 4 && k >= 6 && k != 9) || !name.contains(&*only) {
                     continue;
                 }
                 let mut line = format!("{max:4} {name:10} {w:3}x{w:<3}");
