@@ -631,9 +631,11 @@ mod rust_simd {
 
     /// [`filter`] at 8 bpc as dav1d's asm: masks and the narrow filter on bytes, the latter
     /// signed after `^ 0x80` with saturating adds, which clip as `iclip_diff` and the pixel clip
-    /// do; only the flat filters' sums widen to 16 bits.
+    /// do; only the flat filters' sums widen to 16 bits. Returns how many pixels on each side
+    /// of the edge it may have changed, so that, as in the asm, only those are stored: 0, 2
+    /// (narrow and flat6), 3 (flat8) or 6 (flat16).
     #[inline(always)]
-    fn filter8<const MAX: usize>(px: &mut [U8x16; 14], p: Params8) {
+    fn filter8<const MAX: usize>(px: &mut [U8x16; 14], p: Params8) -> usize {
         let orig = *px;
         let [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6] = orig;
         let one = U8x16::splat(1);
@@ -653,7 +655,7 @@ mod rust_simd {
             .and(d.add_sat(d).add_sat(p1.abd(q1).shr_u::<1>()).le(p.e))
             .and(p.active);
         if !fm.any() {
-            return;
+            return 0;
         }
 
         // A sum of the same sign saturated step by step clips as the sum would: once past a
@@ -673,7 +675,7 @@ mod rust_simd {
         px[8] = U8x16::select(fm, sq1.sub_sat_i(f3).xor(x80), q1);
 
         if MAX < 6 {
-            return;
+            return 2;
         }
         let mut flat = p2.abd(p0).max(dp1).max(dq1).max(q2.abd(q0));
         if MAX > 6 {
@@ -681,7 +683,7 @@ mod rust_simd {
         }
         let mut m8 = flat.le(one).and(fm).and(p.gt4);
         if !m8.any() {
-            return;
+            return 2;
         }
         let (mut lo, mut hi) = ([I16x8::splat(0); 14], [I16x8::splat(0); 14]);
         for k in 0..14 {
@@ -695,8 +697,9 @@ mod rust_simd {
                 let v = U8x16::narrow_rshr::<3>(out_lo[k], out_hi[k]);
                 px[k] = U8x16::select(m8, v, px[k]);
             }
-            return;
+            return 2;
         }
+        let mut changed = 3;
         if MAX == 16 && m8.and(p.wd16).any() {
             let flat_out = p6
                 .abd(p0)
@@ -714,9 +717,10 @@ mod rust_simd {
                     let v = U8x16::narrow_rshr::<4>(out_lo[k], out_hi[k]);
                     px[k] = U8x16::select(m16, v, px[k]);
                 }
+                changed = 6;
             }
             if !m8.any() {
-                return;
+                return changed;
             }
         }
         flat8(&lo, &mut out_lo);
@@ -725,6 +729,7 @@ mod rust_simd {
             let v = U8x16::narrow_rshr::<3>(out_lo[k], out_hi[k]);
             px[k] = U8x16::select(m8, v, px[k]);
         }
+        changed
     }
 
     /// The pixels on each side of the edge the filter of length `max` reads.
@@ -882,10 +887,16 @@ mod rust_simd {
         let (mut rows, stride, start) = rows_mut::<BD>(dst - r as isize * stride, 2 * r, 16);
         let mut px = [U8x16::splat(0); 14];
         U8x16::load_rows(&mut px[7 - r..7 + r], rows.as_bytes(), start, stride);
-        filter8::<MAX>(&mut px, p);
-        let w = if MAX == 16 { 6 } else { r.min(3) };
-        let start = start.wrapping_add_signed((r - w) as isize * stride);
-        U8x16::store_rows(&px[7 - w..7 + w], rows.as_bytes_mut(), start, stride);
+        let w = filter8::<MAX>(&mut px, p);
+        let rows = rows.as_bytes_mut();
+        let start = |w: usize| start.wrapping_add_signed((r - w) as isize * stride);
+        match w {
+            0 => {}
+            2 => U8x16::store_rows(&px[5..9], rows, start(2), stride),
+            3 => U8x16::store_rows(&px[4..10], rows, start(3), stride),
+            _ if MAX == 16 => U8x16::store_rows(&px[1..13], rows, start(6), stride),
+            _ => {}
+        }
     }
 
     /// [`group_h`] at 8 bpc: sixteen rows of 4, 8 or 16 bytes turned into columns.
@@ -898,9 +909,11 @@ mod rust_simd {
             U8x16::load_rows_s(&mut v, rows.as_bytes(), start, stride);
             let mut px = [U8x16::splat(0); 14];
             px[5..9].copy_from_slice(&transpose16x4(&v));
-            filter8::<MAX>(&mut px, p);
-            let v = transpose4x16(&[px[5], px[6], px[7], px[8]]);
-            return U8x16::store_rows_quarters(&v, rows.as_bytes_mut(), start, stride);
+            if filter8::<MAX>(&mut px, p) != 0 {
+                let v = transpose4x16(&[px[5], px[6], px[7], px[8]]);
+                U8x16::store_rows_quarters(&v, rows.as_bytes_mut(), start, stride);
+            }
+            return;
         }
         let (n, x0) = if MAX == 16 { (2, -8) } else { (1, -4) };
         let (mut rows, stride, start) = rows_mut::<BD>(dst + x0, 16, 8 * n);
@@ -917,16 +930,31 @@ mod rust_simd {
                 px[(7 + k) as usize] = win[c / 8][c % 8];
             }
         }
-        filter8::<MAX>(&mut px, p);
-        for k in -7..7isize {
-            let c = (k - x0) as usize;
-            if c < 8 * n {
-                win[c / 8][c % 8] = px[(7 + k) as usize];
+        let changed = filter8::<MAX>(&mut px, p);
+        // The columns from `x` on, as offsets into `rows`.
+        let at = |x: isize| start + (x - x0) as usize;
+        let rows = rows.as_bytes_mut();
+        match changed {
+            0 => {}
+            2 => {
+                let v = transpose4x16(&[px[5], px[6], px[7], px[8]]);
+                U8x16::store_rows_quarters(&v, rows, at(-2), stride);
             }
-        }
-        for (w, win) in win.iter().enumerate().take(n) {
-            let v = transpose8x16(win);
-            U8x16::store_rows_halves(&v, rows.as_bytes_mut(), start + 8 * w, stride);
+            3 => {
+                let c = [px[3], px[4], px[5], px[6], px[7], px[8], px[9], px[10]];
+                U8x16::store_rows_halves(&transpose8x16(&c), rows, at(-4), stride);
+            }
+            _ if MAX == 16 => {
+                for k in -7..7isize {
+                    let c = (k - x0) as usize;
+                    win[c / 8][c % 8] = px[(7 + k) as usize];
+                }
+                for (w, win) in win.iter().enumerate() {
+                    let v = transpose8x16(win);
+                    U8x16::store_rows_halves(&v, rows, start + 8 * w, stride);
+                }
+            }
+            _ => {}
         }
     }
 

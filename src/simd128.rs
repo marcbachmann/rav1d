@@ -235,11 +235,10 @@ pub fn transpose8x8<V: Lanes>(v: &mut [V; 8]) {
 /// rows lie between the first and the last, so those two are all it checks.
 #[inline(always)]
 fn rows_fit(len: usize, start: usize, stride: isize, n: usize, w: usize) {
-    let last = (n as isize - 1)
-        .checked_mul(stride)
-        .and_then(|o| o.checked_add(start as isize));
-    let fits = |s: usize| s.checked_add(w).is_some_and(|e| e <= len);
-    assert!(n > 0 && fits(start) && last.is_some_and(|l| l >= 0 && fits(l as usize)));
+    // In 128 bits, where nothing here overflows.
+    let fits = |s: i128| s >= 0 && s + w as i128 <= len as i128;
+    let start = start as i128;
+    assert!(n > 0 && fits(start) && fits(start + (n as i128 - 1) * stride as i128));
 }
 
 /// Rows of a picture as lanes, the block bounds-checked once instead of row by row.
