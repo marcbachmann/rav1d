@@ -744,7 +744,7 @@ fn decode_coefs<BD: BitDepth>(
     let mut cf = Cf::<BD>(cf);
 
     // base tokens
-    let mut rc;
+    let rc;
     let mut dc_tok;
 
     #[inline]
@@ -786,7 +786,8 @@ fn decode_coefs<BD: BitDepth>(
             TxClass::TwoD => {
                 let is_rect = tx.is_rect() as usize;
                 lo_ctx_offsets = Some(&DAV1D_LO_CTX_OFFSETS[is_rect + (tx as usize & is_rect)]);
-                scan = DAV1D_SCANS[tx as usize];
+                // Up to `eob`, so the loop over it needs no bounds checks.
+                scan = &DAV1D_SCANS[tx as usize][..=eob as usize];
                 stride = 4 << slh;
             }
             TxClass::H | TxClass::V => {
@@ -1247,7 +1248,7 @@ fn decode_coefs<BD: BitDepth>(
                 dc_dq = cmp::min(dc_dq, cf_max + dc_sign);
             } else {
                 dc_dq = ((dc_dq as c_uint).wrapping_mul(dc_tok as c_uint) >> dq_shift) as c_int;
-                assert!(dc_dq <= cf_max);
+                debug_assert!(dc_dq <= cf_max);
             }
             cul_level = dc_tok;
             cf.set(0, if dc_sign != 0 { -dc_dq } else { dc_dq });
@@ -1258,12 +1259,13 @@ fn decode_coefs<BD: BitDepth>(
     match ac {
         Some(Ac::Qm(qm_tbl)) => {
             let ac_dq: c_uint = dq_tbl[1].get() as c_uint;
+            let mut rc = rc as u32;
             loop {
                 let sign = msac.bool_equi();
                 if dbg {
                     println!("Post-sign[{}={}]: r={}", rc, sign, msac.rng());
                 }
-                let rc_tok = cf.get(rc) as u32;
+                let rc_tok = cf.get(rc as u16) as u32;
                 let mut tok;
                 let mut dq: c_uint = ac_dq
                     .wrapping_mul(qm_tbl[rc as usize] as c_uint)
@@ -1293,9 +1295,9 @@ fn decode_coefs<BD: BitDepth>(
                 cul_level = cul_level.wrapping_add(tok);
                 dq >>= dq_shift;
                 dq_sat = cmp::min(dq as c_int, cf_max + sign as i32);
-                cf.set(rc, if sign { -dq_sat } else { dq_sat });
+                cf.set(rc as u16, if sign { -dq_sat } else { dq_sat });
 
-                rc = (rc_tok & 0x3ff) as u16;
+                rc = rc_tok & 0x3ff;
                 if !(rc != 0) {
                     break;
                 }
@@ -1303,12 +1305,13 @@ fn decode_coefs<BD: BitDepth>(
         }
         Some(Ac::NoQm) => {
             let ac_dq: c_uint = dq_tbl[1].get() as c_uint;
+            let mut rc = rc as u32;
             loop {
                 let sign = msac.bool_equi() as c_int;
                 if dbg {
                     println!("Post-sign[{}={}]: r={}", rc, sign, msac.rng());
                 }
-                let rc_tok = cf.get(rc) as u32;
+                let rc_tok = cf.get(rc as u16) as u32;
                 let mut tok: c_uint;
                 let mut dq;
 
@@ -1335,12 +1338,12 @@ fn decode_coefs<BD: BitDepth>(
                     // cannot exceed `cf_max`, so we can avoid the clipping
                     tok = rc_tok >> 11;
                     dq = (ac_dq.wrapping_mul(tok) >> dq_shift) as c_int;
-                    assert!(dq <= cf_max);
+                    debug_assert!(dq <= cf_max);
                 }
                 cul_level = cul_level.wrapping_add(tok);
-                cf.set(rc, if sign != 0 { -dq } else { dq });
+                cf.set(rc as u16, if sign != 0 { -dq } else { dq });
 
-                rc = (rc_tok & 0x3ff) as u16; // next non-zero `rc`, zero if `eob`
+                rc = rc_tok & 0x3ff; // next non-zero `rc`, zero if `eob`
                 if !(rc != 0) {
                     break;
                 }
