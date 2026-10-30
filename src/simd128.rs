@@ -201,6 +201,212 @@ forward_lanes!(I16x8);
 #[cfg(target_arch = "x86_64")]
 forward_lanes!(I16x16);
 
+/// The byte-lane operations of the 8 bpc loop filter, for [`U8x16`] on every target and, on
+/// x86_64 with AVX2, [`U8x32`]: one kernel source for both widths. The `_i` ones read the lanes as
+/// `i8`; the interleaves stay within each 128-bit half.
+pub trait Bytes: Copy {
+    /// Lanes per vector.
+    const N: usize;
+    /// Sixteen-bit lanes, two of which [`Bytes::widen`] the bytes into.
+    type Wide: Lanes;
+    fn splat(v: u8) -> Self;
+    fn abd(self, o: Self) -> Self;
+    fn max(self, o: Self) -> Self;
+    fn add(self, o: Self) -> Self;
+    fn add_sat(self, o: Self) -> Self;
+    fn add_sat_i(self, o: Self) -> Self;
+    fn sub_sat_i(self, o: Self) -> Self;
+    fn shr_u<const S: i32>(self) -> Self;
+    fn shr_i<const S: i32>(self) -> Self;
+    fn le(self, o: Self) -> Self;
+    fn eq(self, o: Self) -> Self;
+    fn and(self, o: Self) -> Self;
+    fn andnot(self, o: Self) -> Self;
+    fn xor(self, o: Self) -> Self;
+    fn select(m: Self, a: Self, b: Self) -> Self;
+    /// Whether any lane is nonzero.
+    fn any(self) -> bool;
+    /// `t[lane]` for lanes below 64, 0 for the others.
+    fn lookup64(self, t: &[u8; 64]) -> Self;
+    fn widen(self) -> [Self::Wide; 2];
+    /// [`Bytes::widen`] back, each lane rounded `>> S` and saturated.
+    fn narrow_rshr<const S: i32>(lo: Self::Wide, hi: Self::Wide) -> Self;
+    fn zip_lo8(self, o: Self) -> Self;
+    fn zip_hi8(self, o: Self) -> Self;
+    fn zip_lo16(self, o: Self) -> Self;
+    fn zip_hi16(self, o: Self) -> Self;
+    fn zip_lo32(self, o: Self) -> Self;
+    fn zip_hi32(self, o: Self) -> Self;
+    fn zip_lo64(self, o: Self) -> Self;
+    fn zip_hi64(self, o: Self) -> Self;
+    /// Byte `j` of `x` in lanes `4 * j..4 * j + 4`, for each of the `N / 4` low bytes.
+    fn spread4(x: u64) -> Self;
+    /// [`Bytes::spread4`] of the bytes `b[start + j * stride]`.
+    fn gather4(b: &[u8], start: usize, stride: usize) -> Self;
+    /// `v[r]` from the `N` bytes at `b[start + r * stride..]`.
+    fn load_rows(v: &mut [Self], b: &[u8], start: usize, stride: isize);
+    fn store_rows(v: &[Self], b: &mut [u8], start: usize, stride: isize);
+    /// `N` rows of eight bytes from `b[start + r * stride..]` as eight columns of `N`.
+    fn load_cols8(b: &[u8], start: usize, stride: isize) -> [Self; 8];
+    fn store_cols8(c: &[Self; 8], b: &mut [u8], start: usize, stride: isize);
+    /// [`Bytes::load_cols8`] of four bytes per row.
+    fn load_cols4(b: &[u8], start: usize, stride: isize) -> [Self; 4];
+    fn store_cols4(c: &[Self; 4], b: &mut [u8], start: usize, stride: isize);
+}
+
+macro_rules! forward_bytes {
+    ($t:ty, $n:literal, $wide:ty) => {
+        impl Bytes for $t {
+            const N: usize = $n;
+            type Wide = $wide;
+            #[inline(always)]
+            fn splat(v: u8) -> Self {
+                <$t>::splat(v)
+            }
+            #[inline(always)]
+            fn abd(self, o: Self) -> Self {
+                <$t>::abd(self, o)
+            }
+            #[inline(always)]
+            fn max(self, o: Self) -> Self {
+                <$t>::max(self, o)
+            }
+            #[inline(always)]
+            fn add(self, o: Self) -> Self {
+                <$t>::add(self, o)
+            }
+            #[inline(always)]
+            fn add_sat(self, o: Self) -> Self {
+                <$t>::add_sat(self, o)
+            }
+            #[inline(always)]
+            fn add_sat_i(self, o: Self) -> Self {
+                <$t>::add_sat_i(self, o)
+            }
+            #[inline(always)]
+            fn sub_sat_i(self, o: Self) -> Self {
+                <$t>::sub_sat_i(self, o)
+            }
+            #[inline(always)]
+            fn shr_u<const S: i32>(self) -> Self {
+                <$t>::shr_u::<S>(self)
+            }
+            #[inline(always)]
+            fn shr_i<const S: i32>(self) -> Self {
+                <$t>::shr_i::<S>(self)
+            }
+            #[inline(always)]
+            fn le(self, o: Self) -> Self {
+                <$t>::le(self, o)
+            }
+            #[inline(always)]
+            fn eq(self, o: Self) -> Self {
+                <$t>::eq(self, o)
+            }
+            #[inline(always)]
+            fn and(self, o: Self) -> Self {
+                <$t>::and(self, o)
+            }
+            #[inline(always)]
+            fn andnot(self, o: Self) -> Self {
+                <$t>::andnot(self, o)
+            }
+            #[inline(always)]
+            fn xor(self, o: Self) -> Self {
+                <$t>::xor(self, o)
+            }
+            #[inline(always)]
+            fn select(m: Self, a: Self, b: Self) -> Self {
+                <$t>::select(m, a, b)
+            }
+            #[inline(always)]
+            fn any(self) -> bool {
+                <$t>::any(self)
+            }
+            #[inline(always)]
+            fn lookup64(self, t: &[u8; 64]) -> Self {
+                <$t>::lookup64(self, t)
+            }
+            #[inline(always)]
+            fn widen(self) -> [$wide; 2] {
+                <$t>::widen(self)
+            }
+            #[inline(always)]
+            fn narrow_rshr<const S: i32>(lo: $wide, hi: $wide) -> Self {
+                <$t>::narrow_rshr::<S>(lo, hi)
+            }
+            #[inline(always)]
+            fn zip_lo8(self, o: Self) -> Self {
+                <$t>::zip_lo8(self, o)
+            }
+            #[inline(always)]
+            fn zip_hi8(self, o: Self) -> Self {
+                <$t>::zip_hi8(self, o)
+            }
+            #[inline(always)]
+            fn zip_lo16(self, o: Self) -> Self {
+                <$t>::zip_lo16(self, o)
+            }
+            #[inline(always)]
+            fn zip_hi16(self, o: Self) -> Self {
+                <$t>::zip_hi16(self, o)
+            }
+            #[inline(always)]
+            fn zip_lo32(self, o: Self) -> Self {
+                <$t>::zip_lo32(self, o)
+            }
+            #[inline(always)]
+            fn zip_hi32(self, o: Self) -> Self {
+                <$t>::zip_hi32(self, o)
+            }
+            #[inline(always)]
+            fn zip_lo64(self, o: Self) -> Self {
+                <$t>::zip_lo64(self, o)
+            }
+            #[inline(always)]
+            fn zip_hi64(self, o: Self) -> Self {
+                <$t>::zip_hi64(self, o)
+            }
+            #[inline(always)]
+            fn spread4(x: u64) -> Self {
+                <$t>::spread4(x as _)
+            }
+            #[inline(always)]
+            fn gather4(b: &[u8], start: usize, stride: usize) -> Self {
+                <$t>::gather4(b, start, stride)
+            }
+            #[inline(always)]
+            fn load_rows(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
+                <$t>::load_rows(v, b, start, stride)
+            }
+            #[inline(always)]
+            fn store_rows(v: &[Self], b: &mut [u8], start: usize, stride: isize) {
+                <$t>::store_rows(v, b, start, stride)
+            }
+            #[inline(always)]
+            fn load_cols8(b: &[u8], start: usize, stride: isize) -> [Self; 8] {
+                <$t>::load_cols8(b, start, stride)
+            }
+            #[inline(always)]
+            fn store_cols8(c: &[Self; 8], b: &mut [u8], start: usize, stride: isize) {
+                <$t>::store_cols8(c, b, start, stride)
+            }
+            #[inline(always)]
+            fn load_cols4(b: &[u8], start: usize, stride: isize) -> [Self; 4] {
+                <$t>::load_cols4(b, start, stride)
+            }
+            #[inline(always)]
+            fn store_cols4(c: &[Self; 4], b: &mut [u8], start: usize, stride: isize) {
+                <$t>::store_cols4(c, b, start, stride)
+            }
+        }
+    };
+}
+
+forward_bytes!(U8x16, 16, I16x8);
+#[cfg(target_arch = "x86_64")]
+forward_bytes!(U8x32, 32, I16x16);
+
 /// `v[i]` lane `j` becomes `v[j]` lane `i` within each 128-bit half: three rounds of interleaves,
 /// 24 shuffles; [`I16x16`] turns two 8x8 blocks at once.
 #[inline(always)]
@@ -420,7 +626,7 @@ impl U8x16 {
 /// pairs of rows interleaved into 16-bit elements, then [`transpose8x8`]'s rounds on those.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
-pub fn transpose16x8(r: &[U8x16; 16]) -> [U8x16; 8] {
+pub fn transpose16x8<T: Bytes>(r: &[T; 16]) -> [T; 8] {
     let mut a = [r[0]; 8];
     for (j, a) in a.iter_mut().enumerate() {
         *a = r[2 * j].zip_lo8(r[2 * j + 1]);
@@ -458,7 +664,7 @@ pub fn transpose16x8(r: &[U8x16; 16]) -> [U8x16; 8] {
 /// [`transpose16x8`] of sixteen rows of four bytes, each in the low quarter of `r[i]`.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
-pub fn transpose16x4(r: &[U8x16; 16]) -> [U8x16; 4] {
+pub fn transpose16x4<T: Bytes>(r: &[T; 16]) -> [T; 4] {
     let mut a = [r[0]; 8];
     for (j, a) in a.iter_mut().enumerate() {
         *a = r[2 * j].zip_lo8(r[2 * j + 1]);
@@ -488,7 +694,7 @@ pub fn transpose16x4(r: &[U8x16; 16]) -> [U8x16; 4] {
 /// [`transpose16x4`] back: rows `4 * i..4 * i + 4` in the quarters of `out[i]`.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
-pub fn transpose4x16(c: &[U8x16; 4]) -> [U8x16; 4] {
+pub fn transpose4x16<T: Bytes>(c: &[T; 4]) -> [T; 4] {
     // Rows 0-7 then 8-15, two columns each.
     let a = [
         c[0].zip_lo8(c[1]),
@@ -508,7 +714,7 @@ pub fn transpose4x16(c: &[U8x16; 4]) -> [U8x16; 4] {
 /// and `2 * i + 1` in the halves of `out[i]`. Three rounds, as halves need no fourth.
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
-pub fn transpose8x16(c: &[U8x16; 8]) -> [U8x16; 8] {
+pub fn transpose8x16<T: Bytes>(c: &[T; 8]) -> [T; 8] {
     // Rows 0-7 then 8-15, two columns each.
     let a = [
         c[0].zip_lo8(c[1]),
@@ -539,7 +745,7 @@ pub fn transpose8x16(c: &[U8x16; 8]) -> [U8x16; 8] {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use wide::I16x16;
+pub use wide::{I16x16, U8x32};
 
 /// Sixteen `i16` lanes in one AVX2 register, entered only through a
 /// `#[target_feature(enable = "avx2")]` kernel chosen once the CPU flags hold AVX2.
@@ -548,7 +754,7 @@ pub use wide::I16x16;
 mod wide {
     use std::arch::x86_64::*;
 
-    use super::I16x8;
+    use super::{rows_fit, transpose16x4, transpose16x8, transpose4x16, transpose8x16, I16x8};
 
     #[derive(Clone, Copy)]
     pub struct I16x16(__m256i);
@@ -748,6 +954,317 @@ mod wide {
         #[inline(always)]
         pub fn zip_hi64(self, o: Self) -> Self {
             Self(unsafe { _mm256_unpackhi_epi64(self.0, o.0) })
+        }
+    }
+
+    /// Thirty-two bytes in one AVX2 register: [`super::U8x16`]'s operations on both 128-bit
+    /// halves, the rows of a picture block in lanes as dav1d's AVX2 loop filter holds them.
+    #[derive(Clone, Copy)]
+    pub struct U8x32(__m256i);
+
+    impl U8x32 {
+        /// `lo` in the low half, `hi` in the high one.
+        #[inline(always)]
+        fn halves(lo: __m128i, hi: __m128i) -> Self {
+            Self(unsafe { _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi) })
+        }
+
+        #[inline(always)]
+        pub fn splat(v: u8) -> Self {
+            Self(unsafe { _mm256_set1_epi8(v as i8) })
+        }
+
+        #[inline(always)]
+        pub fn abd(self, o: Self) -> Self {
+            Self(unsafe {
+                _mm256_or_si256(_mm256_subs_epu8(self.0, o.0), _mm256_subs_epu8(o.0, self.0))
+            })
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(unsafe { _mm256_max_epu8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(unsafe { _mm256_add_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn add_sat(self, o: Self) -> Self {
+            Self(unsafe { _mm256_adds_epu8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn add_sat_i(self, o: Self) -> Self {
+            Self(unsafe { _mm256_adds_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub_sat_i(self, o: Self) -> Self {
+            Self(unsafe { _mm256_subs_epi8(self.0, o.0) })
+        }
+
+        /// There is no byte shift: a 16-bit one, with the bits from the next byte masked off.
+        #[inline(always)]
+        pub fn shr_u<const N: i32>(self) -> Self {
+            Self(unsafe {
+                _mm256_and_si256(
+                    _mm256_srli_epi16::<N>(self.0),
+                    _mm256_set1_epi8((0xff_u8 >> N) as i8),
+                )
+            })
+        }
+
+        /// The unsigned shift, its sign bit extended by `(v ^ m) - m`.
+        #[inline(always)]
+        pub fn shr_i<const N: i32>(self) -> Self {
+            let m = Self::splat(0x80 >> N);
+            Self(unsafe { _mm256_sub_epi8(self.shr_u::<N>().xor(m).0, m.0) })
+        }
+
+        #[inline(always)]
+        pub fn le(self, o: Self) -> Self {
+            Self(unsafe { _mm256_cmpeq_epi8(_mm256_max_epu8(self.0, o.0), o.0) })
+        }
+
+        #[inline(always)]
+        pub fn eq(self, o: Self) -> Self {
+            Self(unsafe { _mm256_cmpeq_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn and(self, o: Self) -> Self {
+            Self(unsafe { _mm256_and_si256(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn andnot(self, o: Self) -> Self {
+            Self(unsafe { _mm256_andnot_si256(o.0, self.0) })
+        }
+
+        #[inline(always)]
+        pub fn xor(self, o: Self) -> Self {
+            Self(unsafe { _mm256_xor_si256(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn select(m: Self, a: Self, b: Self) -> Self {
+            Self(unsafe { _mm256_blendv_epi8(b.0, a.0, m.0) })
+        }
+
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { _mm256_testz_si256(self.0, self.0) == 0 }
+        }
+
+        /// `t[lane]` for lanes below 64, 0 for the others.
+        #[inline(always)]
+        pub fn lookup64(self, t: &[u8; 64]) -> Self {
+            unsafe {
+                let mut r = _mm256_setzero_si256();
+                for k in 0..4 {
+                    let t = _mm256_broadcastsi128_si256(_mm_loadu_si128(t[16 * k..].as_ptr().cast()));
+                    // Indices outside this 16 saturate to the top bit, which zeroes them.
+                    let ik = _mm256_adds_epu8(
+                        _mm256_sub_epi8(self.0, _mm256_set1_epi8(16 * k as i8)),
+                        _mm256_set1_epi8(0x70),
+                    );
+                    r = _mm256_or_si256(r, _mm256_shuffle_epi8(t, ik));
+                }
+                Self(r)
+            }
+        }
+
+        /// The low and high eight bytes of each half, zero-extended: lane order within the
+        /// halves, which [`Self::narrow_rshr`] restores.
+        #[inline(always)]
+        pub fn widen(self) -> [I16x16; 2] {
+            unsafe {
+                let z = _mm256_setzero_si256();
+                [
+                    I16x16(_mm256_unpacklo_epi8(self.0, z)),
+                    I16x16(_mm256_unpackhi_epi8(self.0, z)),
+                ]
+            }
+        }
+
+        #[inline(always)]
+        pub fn narrow_rshr<const N: i32>(lo: I16x16, hi: I16x16) -> Self {
+            unsafe {
+                let r = _mm256_set1_epi16(1 << (N - 1));
+                Self(_mm256_packus_epi16(
+                    _mm256_srai_epi16::<N>(_mm256_add_epi16(lo.0, r)),
+                    _mm256_srai_epi16::<N>(_mm256_add_epi16(hi.0, r)),
+                ))
+            }
+        }
+
+        #[inline(always)]
+        pub fn zip_lo8(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpacklo_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi8(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpackhi_epi8(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo16(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpacklo_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi16(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpackhi_epi16(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo32(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpacklo_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi32(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpackhi_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_lo64(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpacklo_epi64(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn zip_hi64(self, o: Self) -> Self {
+            Self(unsafe { _mm256_unpackhi_epi64(self.0, o.0) })
+        }
+
+        /// Byte `j` of `x` in lanes `4 * j..4 * j + 4`.
+        #[inline(always)]
+        pub fn spread4(x: u64) -> Self {
+            unsafe {
+                let v = _mm_cvtsi64_si128(x as i64);
+                let v = _mm_unpacklo_epi8(v, v);
+                Self::halves(_mm_unpacklo_epi16(v, v), _mm_unpackhi_epi16(v, v))
+            }
+        }
+
+        /// [`Self::spread4`] of the bytes `b[start + j * stride]`.
+        #[inline(always)]
+        pub fn gather4(b: &[u8], start: usize, stride: usize) -> Self {
+            let b = &b[start..][..7 * stride + 1];
+            let mut l = [0; 8];
+            for (j, l) in l.iter_mut().enumerate() {
+                *l = b[j * stride];
+            }
+            Self::spread4(u64::from_le_bytes(l))
+        }
+
+        /// `v[r]` from the 32 bytes at `b[start + r * stride..]`.
+        #[inline(always)]
+        pub fn load_rows(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
+            rows_fit(b.len(), start, stride, v.len(), 32);
+            let p = b.as_ptr().wrapping_add(start);
+            for (r, v) in v.iter_mut().enumerate() {
+                // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
+                *v = Self(unsafe { _mm256_loadu_si256(p.offset(r as isize * stride).cast()) });
+            }
+        }
+
+        /// [`Self::load_rows`] back.
+        #[inline(always)]
+        pub fn store_rows(v: &[Self], b: &mut [u8], start: usize, stride: isize) {
+            rows_fit(b.len(), start, stride, v.len(), 32);
+            let p = b.as_mut_ptr().wrapping_add(start);
+            for (r, v) in v.iter().enumerate() {
+                // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
+                unsafe { _mm256_storeu_si256(p.offset(r as isize * stride).cast(), v.0) };
+            }
+        }
+
+        /// Thirty-two rows of eight bytes as eight columns: rows `r` and `r + 16` in the low
+        /// halves of the two 128-bit halves, then [`transpose16x8`] on both at once.
+        #[inline(always)]
+        pub fn load_cols8(b: &[u8], start: usize, stride: isize) -> [Self; 8] {
+            rows_fit(b.len(), start, stride, 32, 8);
+            let p = b.as_ptr().wrapping_add(start);
+            let mut r = [Self::splat(0); 16];
+            for (i, r) in r.iter_mut().enumerate() {
+                let i = i as isize;
+                // SAFETY: Rows `i` and `i + 16` lie in `b`, checked by `rows_fit`.
+                *r = unsafe {
+                    Self::halves(
+                        _mm_loadl_epi64(p.offset(i * stride).cast()),
+                        _mm_loadl_epi64(p.offset((i + 16) * stride).cast()),
+                    )
+                };
+            }
+            transpose16x8(&r)
+        }
+
+        /// [`Self::load_cols8`] back.
+        #[inline(always)]
+        pub fn store_cols8(c: &[Self; 8], b: &mut [u8], start: usize, stride: isize) {
+            rows_fit(b.len(), start, stride, 32, 8);
+            let p = b.as_mut_ptr().wrapping_add(start);
+            for (i, v) in transpose8x16(c).into_iter().enumerate() {
+                let r = 2 * i as isize;
+                // SAFETY: Rows `r`, `r + 1`, `r + 16` and `r + 17` lie in `b`, checked by
+                // `rows_fit`.
+                unsafe {
+                    let (lo, hi) = (_mm256_castsi256_si128(v.0), _mm256_extracti128_si256::<1>(v.0));
+                    _mm_storel_epi64(p.offset(r * stride).cast(), lo);
+                    _mm_storeh_pd(p.offset((r + 1) * stride).cast(), _mm_castsi128_pd(lo));
+                    _mm_storel_epi64(p.offset((r + 16) * stride).cast(), hi);
+                    _mm_storeh_pd(p.offset((r + 17) * stride).cast(), _mm_castsi128_pd(hi));
+                }
+            }
+        }
+
+        /// [`Self::load_cols8`] of four bytes per row.
+        #[inline(always)]
+        pub fn load_cols4(b: &[u8], start: usize, stride: isize) -> [Self; 4] {
+            rows_fit(b.len(), start, stride, 32, 4);
+            let p = b.as_ptr().wrapping_add(start);
+            let mut r = [Self::splat(0); 16];
+            for (i, r) in r.iter_mut().enumerate() {
+                let i = i as isize;
+                // SAFETY: Rows `i` and `i + 16` lie in `b`, checked by `rows_fit`.
+                *r = unsafe {
+                    let lo = p.offset(i * stride).cast::<i32>().read_unaligned();
+                    let hi = p.offset((i + 16) * stride).cast::<i32>().read_unaligned();
+                    Self::halves(_mm_cvtsi32_si128(lo), _mm_cvtsi32_si128(hi))
+                };
+            }
+            transpose16x4(&r)
+        }
+
+        /// [`Self::load_cols4`] back.
+        #[inline(always)]
+        pub fn store_cols4(c: &[Self; 4], b: &mut [u8], start: usize, stride: isize) {
+            rows_fit(b.len(), start, stride, 32, 4);
+            let p = b.as_mut_ptr().wrapping_add(start);
+            for (i, v) in transpose4x16(c).into_iter().enumerate() {
+                let x = unsafe {
+                    [
+                        _mm256_extract_epi32::<0>(v.0),
+                        _mm256_extract_epi32::<1>(v.0),
+                        _mm256_extract_epi32::<2>(v.0),
+                        _mm256_extract_epi32::<3>(v.0),
+                        _mm256_extract_epi32::<4>(v.0),
+                        _mm256_extract_epi32::<5>(v.0),
+                        _mm256_extract_epi32::<6>(v.0),
+                        _mm256_extract_epi32::<7>(v.0),
+                    ]
+                };
+                for (k, x) in x.into_iter().enumerate() {
+                    let r = (4 * i + k % 4 + 16 * (k / 4)) as isize;
+                    // SAFETY: Row `r` lies in `b`, checked by `rows_fit`.
+                    unsafe { p.offset(r * stride).cast::<i32>().write_unaligned(x) };
+                }
+            }
         }
     }
 }

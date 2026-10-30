@@ -283,8 +283,8 @@ mod rust_simd {
 
     use super::*;
     #[cfg(target_arch = "x86_64")]
-    use crate::simd128::I16x16;
-    use crate::simd128::{transpose8x8, I16x8, Lanes, U8x16};
+    use crate::simd128::{I16x16, U8x32};
+    use crate::simd128::{transpose8x8, Bytes, I16x8, Lanes, U8x16};
 
     /// A lane type with its pixel loads and stores.
     pub trait Px: Lanes {
@@ -444,11 +444,11 @@ mod rust_simd {
         }
     }
 
-    /// [`U8x16::widen`]ed lanes.
+    /// [`Bytes::widen`]ed lanes.
     #[derive(Clone, Copy)]
-    struct Wide([I16x8; 2]);
+    struct Wide<H>([H; 2]);
 
-    impl Sum for Wide {
+    impl<H: Lanes> Sum for Wide<H> {
         #[inline(always)]
         fn plus(self, o: Self) -> Self {
             Self([self.0[0].add(o.0[0]), self.0[1].add(o.0[1])])
@@ -478,11 +478,17 @@ mod rust_simd {
         }
     }
 
-    impl<const N: i32> Sink<Wide> for Select<'_, U8x16, N> {
+    /// [`Select`] of byte lanes from their [`Wide`] sums.
+    struct SelectBytes<'a, B, const N: i32> {
+        px: &'a mut [B; 14],
+        m: B,
+    }
+
+    impl<B: Bytes, const N: i32> Sink<Wide<B::Wide>> for SelectBytes<'_, B, N> {
         #[inline(always)]
-        fn put(&mut self, k: usize, s: Wide) {
-            let v = U8x16::narrow_rshr::<N>(s.0[0], s.0[1]);
-            self.px[k] = U8x16::select(self.m, v, self.px[k]);
+        fn put(&mut self, k: usize, s: Wide<B::Wide>) {
+            let v = B::narrow_rshr::<N>(s.0[0], s.0[1]);
+            self.px[k] = B::select(self.m, v, self.px[k]);
         }
     }
 
@@ -659,15 +665,15 @@ mod rust_simd {
 
     /// [`Params`] at 8 bpc, on byte lanes.
     #[derive(Clone, Copy)]
-    struct Params8 {
-        e: U8x16,
-        i: U8x16,
-        h: U8x16,
-        active: U8x16,
+    struct Params8<B> {
+        e: B,
+        i: B,
+        h: B,
+        active: B,
         /// Filter length above 4, and 16. A group whose longest filter is 8 or 16 is luma, where
         /// no length is 6, so above 4 is also above 6.
-        gt4: U8x16,
-        wd16: U8x16,
+        gt4: B,
+        wd16: B,
     }
 
     /// [`filter`] at 8 bpc as dav1d's asm: masks and the narrow filter on bytes, the latter
@@ -676,10 +682,10 @@ mod rust_simd {
     /// of the edge it may have changed, so that, as in the asm, only those are stored: 0, 2
     /// (narrow and flat6), 3 (flat8) or 6 (flat16).
     #[inline(always)]
-    fn filter8<const MAX: usize>(px: &mut [U8x16; 14], p: Params8) -> usize {
+    fn filter8<B: Bytes, const MAX: usize>(px: &mut [B; 14], p: Params8<B>) -> usize {
         let orig = *px;
         let [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6] = orig;
-        let one = U8x16::splat(1);
+        let one = B::splat(1);
         let (dp1, dq1) = (p1.abd(p0), q1.abd(q0));
         let inner = dp1.max(dq1);
         let mut m = inner;
@@ -702,18 +708,18 @@ mod rust_simd {
         // A sum of the same sign saturated step by step clips as the sum would: once past a
         // bound, every further step stays past it.
         let nhev = inner.le(p.h);
-        let x80 = U8x16::splat(0x80);
+        let x80 = B::splat(0x80);
         let (sp1, sp0, sq0, sq1) = (p1.xor(x80), p0.xor(x80), q0.xor(x80), q1.xor(x80));
         let f = sp1.sub_sat_i(sq1).andnot(nhev);
         let d = sq0.sub_sat_i(sp0);
         let f = f.add_sat_i(d).add_sat_i(d).add_sat_i(d);
-        let f1 = f.add_sat_i(U8x16::splat(4)).shr_i::<3>();
-        let f2 = f.add_sat_i(U8x16::splat(3)).shr_i::<3>();
+        let f1 = f.add_sat_i(B::splat(4)).shr_i::<3>();
+        let f2 = f.add_sat_i(B::splat(3)).shr_i::<3>();
         let f3 = f1.add(one).shr_i::<1>().and(nhev);
-        px[5] = U8x16::select(fm, sp1.add_sat_i(f3).xor(x80), p1);
-        px[6] = U8x16::select(fm, sp0.add_sat_i(f2).xor(x80), p0);
-        px[7] = U8x16::select(fm, sq0.sub_sat_i(f1).xor(x80), q0);
-        px[8] = U8x16::select(fm, sq1.sub_sat_i(f3).xor(x80), q1);
+        px[5] = B::select(fm, sp1.add_sat_i(f3).xor(x80), p1);
+        px[6] = B::select(fm, sp0.add_sat_i(f2).xor(x80), p0);
+        px[7] = B::select(fm, sq0.sub_sat_i(f1).xor(x80), q0);
+        px[8] = B::select(fm, sq1.sub_sat_i(f3).xor(x80), q1);
 
         if MAX < 6 {
             return 2;
@@ -726,12 +732,12 @@ mod rust_simd {
         if !m8.any() {
             return 2;
         }
-        let mut wide = [Wide([I16x8::splat(0); 2]); 14];
+        let mut wide = [Wide([B::Wide::splat(0); 2]); 14];
         for (w, v) in wide.iter_mut().zip(orig) {
             *w = Wide(v.widen());
         }
         if MAX == 6 {
-            flat6(&wide, &mut Select::<_, 3> { px, m: m8 });
+            flat6(&wide, &mut SelectBytes::<_, 3> { px, m: m8 });
             return 2;
         }
         let mut changed = 3;
@@ -746,14 +752,14 @@ mod rust_simd {
             let m16 = flat_out.le(one).and(m8).and(p.wd16);
             m8 = m8.andnot(m16);
             if m16.any() {
-                flat16(&wide, &mut Select::<_, 4> { px, m: m16 });
+                flat16(&wide, &mut SelectBytes::<_, 4> { px, m: m16 });
                 changed = 6;
             }
             if !m8.any() {
                 return changed;
             }
         }
-        flat8(&wide, &mut Select::<_, 3> { px, m: m8 });
+        flat8(&wide, &mut SelectBytes::<_, 3> { px, m: m8 });
         changed
     }
 
@@ -907,50 +913,60 @@ mod rust_simd {
     /// Where a group's block starts, as pixels before its first one: along a horizontal edge
     /// `reach` rows above, along a vertical one the first column the filter reads. Its rows and
     /// pixels per row.
-    const fn block(h: bool, max: usize) -> (usize, usize, usize) {
+    const fn block(h: bool, max: usize, n: usize) -> (usize, usize, usize) {
         match (h, max) {
-            (false, _) => (reach(max), 2 * reach(max), 16),
-            (true, 4) => (2, 16, 4),
-            (true, 16) => (8, 16, 16),
-            _ => (4, 16, 8),
+            (false, _) => (reach(max), 2 * reach(max), n),
+            (true, 4) => (2, n, 4),
+            (true, 16) => (8, n, 16),
+            _ => (4, n, 8),
         }
     }
 
-    /// [`group_v`] at 8 bpc: sixteen columns as bytes, the block's rows `stride` apart in `rows`
+    /// [`group_v`] at 8 bpc: `B::N` columns as bytes, the block's rows `stride` apart in `rows`
     /// from `start`.
     #[inline(always)]
-    fn group_v8<const MAX: usize>(rows: &mut [u8], start: usize, stride: isize, p: Params8) {
+    fn group_v8<B: Bytes, const MAX: usize>(
+        rows: &mut [u8],
+        start: usize,
+        stride: isize,
+        p: Params8<B>,
+    ) {
         let r = reach(MAX);
-        let mut px = [U8x16::splat(0); 14];
-        U8x16::load_rows(&mut px[7 - r..7 + r], rows, start, stride);
-        let w = filter8::<MAX>(&mut px, p);
+        let mut px = [B::splat(0); 14];
+        B::load_rows(&mut px[7 - r..7 + r], rows, start, stride);
+        let w = filter8::<B, MAX>(&mut px, p);
         let start = |w: usize| start.wrapping_add_signed((r - w) as isize * stride);
         match w {
             0 => {}
-            2 => U8x16::store_rows(&px[5..9], rows, start(2), stride),
-            3 => U8x16::store_rows(&px[4..10], rows, start(3), stride),
-            _ if MAX == 16 => U8x16::store_rows(&px[1..13], rows, start(6), stride),
+            2 => B::store_rows(&px[5..9], rows, start(2), stride),
+            3 => B::store_rows(&px[4..10], rows, start(3), stride),
+            _ if MAX == 16 => B::store_rows(&px[1..13], rows, start(6), stride),
             _ => {}
         }
     }
 
-    /// [`group_h`] at 8 bpc: sixteen rows of 4, 8 or 16 bytes turned into columns.
+    /// [`group_h`] at 8 bpc: `B::N` rows of 4, 8 or 16 bytes turned into columns.
     #[inline(always)]
-    fn group_h8<const MAX: usize>(rows: &mut [u8], start: usize, stride: isize, p: Params8) {
-        let mut px = [U8x16::splat(0); 14];
+    fn group_h8<B: Bytes, const MAX: usize>(
+        rows: &mut [u8],
+        start: usize,
+        stride: isize,
+        p: Params8<B>,
+    ) {
+        let mut px = [B::splat(0); 14];
         if MAX == 4 {
             // As the asm, only the four columns the filter reads.
-            px[5..9].copy_from_slice(&U8x16::load_cols4(rows, start, stride));
-            if filter8::<MAX>(&mut px, p) != 0 {
+            px[5..9].copy_from_slice(&B::load_cols4(rows, start, stride));
+            if filter8::<B, MAX>(&mut px, p) != 0 {
                 let c = [px[5], px[6], px[7], px[8]];
-                U8x16::store_cols4(&c, rows, start, stride);
+                B::store_cols4(&c, rows, start, stride);
             }
             return;
         }
         let (n, x0) = if MAX == 16 { (2, -8) } else { (1, -4) };
-        let mut win = [[U8x16::splat(0); 8]; 2];
+        let mut win = [[B::splat(0); 8]; 2];
         for (w, win) in win.iter_mut().enumerate().take(n) {
-            *win = U8x16::load_cols8(rows, start + 8 * w, stride);
+            *win = B::load_cols8(rows, start + 8 * w, stride);
         }
         for k in -7..7isize {
             let c = (k - x0) as usize;
@@ -958,17 +974,17 @@ mod rust_simd {
                 px[(7 + k) as usize] = win[c / 8][c % 8];
             }
         }
-        let changed = filter8::<MAX>(&mut px, p);
+        let changed = filter8::<B, MAX>(&mut px, p);
         // The columns from `x` on, as offsets into `rows`.
         let at = |x: isize| start + (x - x0) as usize;
         match changed {
             0 => {}
             2 => {
-                U8x16::store_cols4(&[px[5], px[6], px[7], px[8]], rows, at(-2), stride);
+                B::store_cols4(&[px[5], px[6], px[7], px[8]], rows, at(-2), stride);
             }
             3 => {
                 let c = [px[3], px[4], px[5], px[6], px[7], px[8], px[9], px[10]];
-                U8x16::store_cols8(&c, rows, at(-4), stride);
+                B::store_cols8(&c, rows, at(-4), stride);
             }
             _ if MAX == 16 => {
                 for k in -7..7isize {
@@ -976,7 +992,7 @@ mod rust_simd {
                     win[c / 8][c % 8] = px[(7 + k) as usize];
                 }
                 for (w, win) in win.iter().enumerate() {
-                    U8x16::store_cols8(win, rows, start + 8 * w, stride);
+                    B::store_cols8(win, rows, start + 8 * w, stride);
                 }
             }
             _ => {}
@@ -987,57 +1003,64 @@ mod rust_simd {
     /// one guard, fewer through a copy of those segments' part of the block, so that no lane
     /// reads past the picture.
     #[inline(always)]
-    fn group8<BD: BitDepth, const MAX: usize>(
+    fn group8<BD: BitDepth, B: Bytes, const MAX: usize>(
         dst: Rav1dPictureDataComponentOffset,
         hv: super::HV,
         n: usize,
-        p: Params8,
+        p: Params8<B>,
     ) {
         let h = matches!(hv, super::HV::H);
         let stride = dst.pixel_stride::<BD>();
-        let (before, rows, w) = block(h, MAX);
+        let (before, rows, w) = block(h, MAX, B::N);
         let first = if h {
             dst - before
         } else {
             dst - before as isize * stride
         };
-        if n == 4 {
+        if n == B::N / 4 {
             let (mut b, stride, start) = rows_mut::<BD>(first, rows, w);
-            return run8::<MAX>(h, b.as_bytes_mut(), start, stride, p);
+            return run8::<B, MAX>(h, b.as_bytes_mut(), start, stride, p);
         }
-        // Along a vertical edge the segments are rows, along a horizontal one columns.
-        let (lines, len) = if h { (4 * n, w) } else { (rows, 4 * n) };
-        let mut copy = [0; 16 * 16];
+        // Along a vertical edge the segments are rows of at most 16 bytes, along a horizontal
+        // one columns, of rows `B::N` apart.
+        let (lines, len, s) = if h { (4 * n, w, 16) } else { (rows, 4 * n, B::N) };
+        let mut copy = [0; 16 * 32];
         for r in 0..lines {
             let src = (first + r as isize * stride).slice::<BD>(len);
-            copy[16 * r..][..len].copy_from_slice(src.as_bytes());
+            copy[s * r..][..len].copy_from_slice(src.as_bytes());
         }
-        run8::<MAX>(h, &mut copy, 0, 16, p);
+        run8::<B, MAX>(h, &mut copy, 0, s as isize, p);
         for r in 0..lines {
             let mut d = (first + r as isize * stride).slice_mut::<BD>(len);
-            d.as_bytes_mut().copy_from_slice(&copy[16 * r..][..len]);
+            d.as_bytes_mut().copy_from_slice(&copy[s * r..][..len]);
         }
     }
 
     #[inline(always)]
-    fn run8<const MAX: usize>(h: bool, b: &mut [u8], start: usize, stride: isize, p: Params8) {
+    fn run8<B: Bytes, const MAX: usize>(
+        h: bool,
+        b: &mut [u8],
+        start: usize,
+        stride: isize,
+        p: Params8<B>,
+    ) {
         match h {
-            true => group_h8::<MAX>(b, start, stride, p),
-            false => group_v8::<MAX>(b, start, stride, p),
+            true => group_h8::<B, MAX>(b, start, stride, p),
+            false => group_v8::<B, MAX>(b, start, stride, p),
         }
     }
 
-    /// [`U8x16::gather4`] of the first `n` levels, the others 0.
+    /// [`Bytes::gather4`] of the first `n` levels, the others 0.
     #[inline(always)]
-    fn levels8(b: &[u8], start: usize, stride: usize, n: usize) -> U8x16 {
-        if n == 4 {
-            return U8x16::gather4(b, start, stride);
+    fn levels8<B: Bytes>(b: &[u8], start: usize, stride: usize, n: usize) -> B {
+        if n == B::N / 4 {
+            return B::gather4(b, start, stride);
         }
-        let mut l = [0; 4];
+        let mut l = [0; 8];
         for (j, l) in l.iter_mut().enumerate().take(n) {
             *l = b[start + j * stride];
         }
-        U8x16::spread4(u32::from_le_bytes(l))
+        B::spread4(u64::from_le_bytes(l))
     }
 
     /// A segment's thresholds and filter length.
@@ -1201,33 +1224,41 @@ mod rust_simd {
         }
     }
 
-    /// The low four bits of `m` as masks, each over four lanes.
+    /// The low `B::N / 4` bits of `m` as masks, each over four lanes.
     #[inline(always)]
-    fn seg_masks(m: u32) -> U8x16 {
-        let bits = U8x16::spread4(0x0804_0201);
-        U8x16::splat(m as u8).and(bits).eq(bits)
+    fn seg_masks<B: Bytes>(m: u32) -> B {
+        let bits = B::spread4(0x8040_2010_0804_0201);
+        B::splat(m as u8).and(bits).eq(bits)
     }
 
     /// 8 bpc only. The thresholds as the asm takes them: all four segments' levels at once, a
     /// level of 0 replaced by the one across the edge, and E and I looked up per lane. A segment
     /// whose level is 0 stays inactive, but the longest filter is the longest any segment's
     /// bits ask for.
-    impl Groups for U8x16 {
-        const N: usize = 16;
-        #[inline(always)]
-        fn group<BD: BitDepth>(at: At, lut: &Align16<Av1FilterLUT>, _: BD) {
-            group8_levels::<BD>(at, 4, lut)
-        }
+    macro_rules! groups_bytes {
+        ($t:ty) => {
+            impl Groups for $t {
+                const N: usize = <$t as Bytes>::N;
+                #[inline(always)]
+                fn group<BD: BitDepth>(at: At, lut: &Align16<Av1FilterLUT>, _: BD) {
+                    group8_levels::<BD, $t>(at, <$t as Bytes>::N / 4, lut)
+                }
 
-        #[inline(always)]
-        fn partial<BD: BitDepth>(at: At, n: usize, lut: &Align16<Av1FilterLUT>, _: BD) {
-            group8_levels::<BD>(at, n, lut)
-        }
+                #[inline(always)]
+                fn partial<BD: BitDepth>(at: At, n: usize, lut: &Align16<Av1FilterLUT>, _: BD) {
+                    group8_levels::<BD, $t>(at, n, lut)
+                }
+            }
+        };
     }
+
+    groups_bytes!(U8x16);
+    #[cfg(target_arch = "x86_64")]
+    groups_bytes!(U8x32);
 
     /// [`Groups::group`] at 8 bpc for the first `n` segments.
     #[inline(always)]
-    fn group8_levels<BD: BitDepth>(at: At, n: usize, lut: &Align16<Av1FilterLUT>) {
+    fn group8_levels<BD: BitDepth, B: Bytes>(at: At, n: usize, lut: &Align16<Av1FilterLUT>) {
         debug_assert_eq!(BD::BITDEPTH, 8);
         let [vm, gt4, wd16] = at.masks().map(|m| m & ((1 << n) - 1));
         if vm == 0 {
@@ -1238,14 +1269,14 @@ mod rust_simd {
             .lvl
             .data
             .index(at.lvl.offset - sb..at.lvl.offset + (n - 1) * sa + 1);
-        let zero = U8x16::splat(0);
-        let l = levels8(&levels, sb, sa, n);
-        let l = U8x16::select(l.le(zero), levels8(&levels, 0, sa, n), l);
+        let zero = B::splat(0);
+        let l = levels8::<B>(&levels, sb, sa, n);
+        let l = B::select(l.le(zero), levels8(&levels, 0, sa, n), l);
         let p = Params8 {
             e: l.lookup64(&lut.0.e),
             i: l.lookup64(&lut.0.i),
             h: l.shr_u::<4>(),
-            active: seg_masks(vm).andnot(l.le(zero)),
+            active: seg_masks::<B>(vm).andnot(l.le(zero)),
             gt4: seg_masks(gt4),
             wd16: seg_masks(wd16),
         };
@@ -1257,10 +1288,10 @@ mod rust_simd {
             _ => 4,
         };
         match max {
-            4 => group8::<BD, 4>(dst, at.hv, n, p),
-            6 => group8::<BD, 6>(dst, at.hv, n, p),
-            8 => group8::<BD, 8>(dst, at.hv, n, p),
-            _ => group8::<BD, 16>(dst, at.hv, n, p),
+            4 => group8::<BD, B, 4>(dst, at.hv, n, p),
+            6 => group8::<BD, B, 6>(dst, at.hv, n, p),
+            8 => group8::<BD, B, 8>(dst, at.hv, n, p),
+            _ => group8::<BD, B, 16>(dst, at.hv, n, p),
         }
     }
 
@@ -1349,7 +1380,7 @@ mod rust_simd {
         bd: BD,
     ) {
         if BD::BITDEPTH == 8 {
-            return filter_sb::<BD, U8x16, { HV }, { YUV }>(
+            return filter_sb::<BD, U8x32, { HV }, { YUV }>(
                 dst, vmask, lvl, b4_stride, lut, wh, bd,
             );
         }
