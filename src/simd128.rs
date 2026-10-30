@@ -434,7 +434,7 @@ pub fn transpose8x8<V: Lanes>(v: &mut [V; 8]) {
 /// Asserts that `n` rows of `w` bytes, row `r` at `start + r * stride`, lie in `len` bytes: the
 /// rows lie between the first and the last, so those two are all it checks.
 #[inline(always)]
-fn rows_fit(len: usize, start: usize, stride: isize, n: usize, w: usize) {
+pub(crate) fn rows_fit(len: usize, start: usize, stride: isize, n: usize, w: usize) {
     // In 128 bits, where nothing here overflows.
     let fits = |s: i128| s >= 0 && s + w as i128 <= len as i128;
     let start = start as i128;
@@ -1052,7 +1052,8 @@ mod wide {
             unsafe {
                 let mut r = _mm256_setzero_si256();
                 for k in 0..4 {
-                    let t = _mm256_broadcastsi128_si256(_mm_loadu_si128(t[16 * k..].as_ptr().cast()));
+                    let t =
+                        _mm256_broadcastsi128_si256(_mm_loadu_si128(t[16 * k..].as_ptr().cast()));
                     // Indices outside this 16 saturate to the top bit, which zeroes them.
                     let ik = _mm256_adds_epu8(
                         _mm256_sub_epi8(self.0, _mm256_set1_epi8(16 * k as i8)),
@@ -1138,7 +1139,6 @@ mod wide {
             }
         }
 
-
         /// `v[r]` from the 32 bytes at `b[start + r * stride..]`.
         #[inline(always)]
         pub fn load_rows(v: &mut [Self], b: &[u8], start: usize, stride: isize) {
@@ -1191,7 +1191,10 @@ mod wide {
                 // SAFETY: Rows `r`, `r + 1`, `r + 16` and `r + 17` lie in `b`, checked by
                 // `rows_fit`.
                 unsafe {
-                    let (lo, hi) = (_mm256_castsi256_si128(v.0), _mm256_extracti128_si256::<1>(v.0));
+                    let (lo, hi) = (
+                        _mm256_castsi256_si128(v.0),
+                        _mm256_extracti128_si256::<1>(v.0),
+                    );
                     _mm_storel_epi64(p.offset(r * stride).cast(), lo);
                     _mm_storeh_pd(p.offset((r + 1) * stride).cast(), _mm_castsi128_pd(lo));
                     _mm_storel_epi64(p.offset((r + 16) * stride).cast(), hi);
