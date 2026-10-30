@@ -103,28 +103,105 @@ butterfly_i16!(I16x8);
 #[cfg(target_arch = "x86_64")]
 butterfly_i16!(crate::simd128::I16x16);
 
-/// Four rows of the 10-bit row pass in 32 bits, clipped to the C's 18-bit row range.
-#[derive(Clone, Copy)]
-struct Row10(I32x4);
+/// The `i32` lanes of the 10-bit row pass: four, or eight on AVX2.
+trait Dwords: Copy {
+    fn splat(v: i32) -> Self;
+    fn load(s: &[i32]) -> Self;
+    fn store(self, d: &mut [i32]);
+    fn add(self, o: Self) -> Self;
+    fn sub(self, o: Self) -> Self;
+    fn mul(self, o: Self) -> Self;
+    fn max(self, o: Self) -> Self;
+    fn min(self, o: Self) -> Self;
+    fn or(self, o: Self) -> Self;
+    fn any(self) -> bool;
+    fn shl2(self) -> Self;
+    fn round_shr12(self) -> Self;
+    fn mul_q12(self, k: i32) -> Self;
+}
 
-impl Row10 {
+macro_rules! dwords {
+    ($t:ty) => {
+        impl Dwords for $t {
+            #[inline(always)]
+            fn splat(v: i32) -> Self {
+                <$t>::splat(v)
+            }
+            #[inline(always)]
+            fn load(s: &[i32]) -> Self {
+                <$t>::load(s)
+            }
+            #[inline(always)]
+            fn store(self, d: &mut [i32]) {
+                <$t>::store(self, d)
+            }
+            #[inline(always)]
+            fn add(self, o: Self) -> Self {
+                <$t>::add(self, o)
+            }
+            #[inline(always)]
+            fn sub(self, o: Self) -> Self {
+                <$t>::sub(self, o)
+            }
+            #[inline(always)]
+            fn mul(self, o: Self) -> Self {
+                <$t>::mul(self, o)
+            }
+            #[inline(always)]
+            fn max(self, o: Self) -> Self {
+                <$t>::max(self, o)
+            }
+            #[inline(always)]
+            fn min(self, o: Self) -> Self {
+                <$t>::min(self, o)
+            }
+            #[inline(always)]
+            fn or(self, o: Self) -> Self {
+                <$t>::or(self, o)
+            }
+            #[inline(always)]
+            fn any(self) -> bool {
+                <$t>::any(self)
+            }
+            #[inline(always)]
+            fn shl2(self) -> Self {
+                <$t>::shl::<2>(self)
+            }
+            #[inline(always)]
+            fn round_shr12(self) -> Self {
+                <$t>::round_shr::<12>(self)
+            }
+            #[inline(always)]
+            fn mul_q12(self, k: i32) -> Self {
+                <$t>::mul_q12(self, k)
+            }
+        }
+    };
+}
+
+dwords!(I32x4);
+#[cfg(target_arch = "x86_64")]
+dwords!(crate::simd128::I32x8);
+
+/// Rows of the 10-bit row pass in 32 bits, clipped to the C's 18-bit row range.
+#[derive(Clone, Copy)]
+struct Row10<D>(D);
+
+impl<D: Dwords> Row10<D> {
     #[inline(always)]
-    fn clip(v: I32x4) -> Self {
-        Self(
-            v.max(I32x4::splat(-(1 << 17)))
-                .min(I32x4::splat((1 << 17) - 1)),
-        )
+    fn clip(v: D) -> Self {
+        Self(v.max(D::splat(-(1 << 17))).min(D::splat((1 << 17) - 1)))
     }
 }
 
 #[inline(always)]
-fn madd(a: I32x4, b: I32x4, k: [i16; 2]) -> I32x4 {
-    a.mul(I32x4::splat(k[0] as i32))
-        .add(b.mul(I32x4::splat(k[1] as i32)))
-        .round_shr::<12>()
+fn madd<D: Dwords>(a: D, b: D, k: [i16; 2]) -> D {
+    a.mul(D::splat(k[0] as i32))
+        .add(b.mul(D::splat(k[1] as i32)))
+        .round_shr12()
 }
 
-impl Butterfly for Row10 {
+impl<D: Dwords> Butterfly for Row10<D> {
     #[inline(always)]
     fn add_sat(self, o: Self) -> Self {
         Self::clip(self.0.add(o.0))
@@ -143,14 +220,14 @@ impl Butterfly for Row10 {
     #[inline(always)]
     fn madd4(self, b: Self, c: Self, d: Self, k: [i16; 4]) -> Self {
         let [k0, k1, k2, k3] = [k[0], k[1], k[2], k[3]];
-        let sp = I32x4::splat;
+        let sp = D::splat;
         Self(
             self.0
                 .mul(sp(k0 as i32))
                 .add(b.0.mul(sp(k1 as i32)))
                 .add(c.0.mul(sp(k2 as i32)))
                 .add(d.0.mul(sp(k3 as i32)))
-                .round_shr::<12>(),
+                .round_shr12(),
         )
     }
 
@@ -1080,7 +1157,7 @@ fn add_block<
     #[cfg(target_arch = "x86_64")]
     if WIDE && W >= 16 {
         while g + 1 < G {
-            wide::cols::<BD, H>(dst, g * 8, &groups[g], &groups[g + 1], cols, half);
+            wide::cols::<BD, H>(dst, g * 8, &groups[g], &groups[g + 1], cols, half, 255);
             g += 2;
         }
     }
@@ -1089,7 +1166,7 @@ fn add_block<
 
 /// The 10-bit row transform of `t` over `N` points, the identity's scale left to [`rows10`].
 #[inline(always)]
-fn tx10<const N: usize>(v: &mut [Row10; N], t: Tx1d, half: bool) {
+fn tx10<D: Dwords, const N: usize>(v: &mut [Row10<D>; N], t: Tx1d, half: bool) {
     match (N, t) {
         (_, Identity) => {}
         (4, _) => {
@@ -1115,7 +1192,7 @@ fn tx10<const N: usize>(v: &mut [Row10; N], t: Tx1d, half: bool) {
 /// Rows `y0..y0 + 4` of the 10-bit row pass into `out`, one column per vector, before the
 /// pass's rounding shift: false, with `out` untouched, where all their coefficients are zero.
 #[inline(always)]
-fn rows10<const W: usize>(
+fn rows10<D: Dwords, const W: usize>(
     coeff: &mut [i32],
     ch: usize,
     y0: usize,
@@ -1123,14 +1200,14 @@ fn rows10<const W: usize>(
     rect: bool,
     t: Tx1d,
     half: bool,
-    out: &mut [I32x4; W],
+    out: &mut [D; W],
 ) -> bool {
-    let zero = I32x4::splat(0);
+    let zero = D::splat(0);
     let mut v = [Row10(zero); W];
     let mut set = zero;
     for x in 0..w {
         let c = &mut coeff[x * ch + y0..];
-        v[x] = Row10(I32x4::load(c));
+        v[x] = Row10(D::load(c));
         zero.store(c);
         set = set.or(v[x].0);
     }
@@ -1151,7 +1228,7 @@ fn rows10<const W: usize>(
                 4 => a.add(a.mul_q12(1697)),
                 8 => a.add(a),
                 16 => a.add(a).add(a.mul_q12(3394)),
-                _ => a.shl::<2>(),
+                _ => a.shl2(),
             };
         }
         if x < 32 && neg >> x & 1 != 0 {
@@ -1162,9 +1239,9 @@ fn rows10<const W: usize>(
     true
 }
 
-/// [`add_block`] at 10 bits: the row pass in 32 bits ([`Row10`]), four rows at a time, its
-/// rounding shift saturating into `i16`, where the C's column clip is; from there the 8 bpc
-/// column pass, whose saturation is that clip.
+/// [`add_block`] at 10 bits: the row pass in 32 bits ([`Row10`]), four rows at a time (eight
+/// with `WIDE`), its rounding shift saturating into `i16`, where the C's column clip is; from
+/// there the 8 bpc column pass, whose saturation is that clip.
 #[inline(always)]
 fn add_block10<
     BD: BitDepth,
@@ -1172,6 +1249,7 @@ fn add_block10<
     const H: usize,
     const TYPE: TxfmType,
     const G: usize,
+    const WIDE: bool,
 >(
     dst: Rav1dPictureDataComponentOffset,
     coeff: &mut [i32],
@@ -1193,6 +1271,24 @@ fn add_block10<
     let mut groups = [[I16x8::splat(0); H]; G];
     let mut y0 = 0;
     while y0 < h {
+        #[cfg(target_arch = "x86_64")]
+        if WIDE && H >= 8 {
+            use crate::simd128::I32x8;
+            let mut o = [I32x8::splat(0); W];
+            if rows10(coeff, ch, y0, w, rect, rows, half, &mut o) {
+                let mut v = [I16x8::splat(0); W];
+                for x in 0..W {
+                    v[x] = match shift {
+                        0 => o[x].pack(),
+                        1 => o[x].round_shr::<1>().pack(),
+                        _ => o[x].round_shr::<2>().pack(),
+                    };
+                }
+                scatter(&v, y0, &mut groups);
+            }
+            y0 += 8;
+            continue;
+        }
         let zero = I32x4::splat(0);
         let (mut lo, mut hi) = ([zero; W], [zero; W]);
         let set_lo = rows10(coeff, ch, y0, w, rect, rows, half, &mut lo);
@@ -1210,7 +1306,16 @@ fn add_block10<
         }
         y0 += 8;
     }
-    cols_128::<BD, W, H, G>(dst, &mut groups, 0, cols, half, px_max);
+    #[allow(unused_mut)]
+    let mut g = 0;
+    #[cfg(target_arch = "x86_64")]
+    if WIDE && W >= 16 {
+        while g + 1 < G {
+            wide::cols::<BD, H>(dst, g * 8, &groups[g], &groups[g + 1], cols, half, px_max);
+            g += 2;
+        }
+    }
+    cols_128::<BD, W, H, G>(dst, &mut groups, g, cols, half, px_max);
 }
 
 /// The passes sixteen lanes at a time: rows where a column holds 16 coefficients, columns where
@@ -1272,6 +1377,7 @@ mod wide {
         b: &[I16x8; H],
         cols: Tx1d,
         half: bool,
+        px_max: i16,
     ) {
         let mut v = [I16x16::splat(0); H];
         for y in 0..H {
@@ -1282,9 +1388,17 @@ mod wide {
         for y in 0..H {
             let row = dst + (y as isize * dst.pixel_stride::<BD>());
             let px = &mut *row.slice_mut::<BD>(x0 + 16);
-            let px = &mut px.as_bytes_mut()[x0..];
-            let out = I16x16::from_u8x16(px).add(v[y]);
-            px.copy_from_slice(&out.pack_u8());
+            if BD::BITDEPTH == 8 {
+                let px = &mut px.as_bytes_mut()[x0..];
+                let out = I16x16::from_u8x16(px).add(v[y]);
+                px.copy_from_slice(&out.pack_u8());
+            } else {
+                let px = &mut px16(px.as_bytes_mut())[x0..];
+                let out = I16x16::load_u16(px).add_sat(v[y]);
+                out.max(I16x16::splat(0))
+                    .min(I16x16::splat(px_max))
+                    .store_u16(px);
+            }
         }
     }
 }
@@ -1327,5 +1441,22 @@ pub fn add10<BD: BitDepth, const W: usize, const H: usize, const TYPE: TxfmType,
     eob: i32,
     px_max: i16,
 ) {
-    add_block10::<BD, W, H, TYPE, G>(dst, coeff, eob, px_max)
+    add_block10::<BD, W, H, TYPE, G, false>(dst, coeff, eob, px_max)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+pub fn add10_avx2<
+    BD: BitDepth,
+    const W: usize,
+    const H: usize,
+    const TYPE: TxfmType,
+    const G: usize,
+>(
+    dst: Rav1dPictureDataComponentOffset,
+    coeff: &mut [i32],
+    eob: i32,
+    px_max: i16,
+) {
+    add_block10::<BD, W, H, TYPE, G, true>(dst, coeff, eob, px_max)
 }

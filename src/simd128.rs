@@ -772,7 +772,7 @@ pub fn transpose8x16<T: Bytes>(c: &[T; 8]) -> [T; 8] {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub use wide::{I16x16, U8x32};
+pub use wide::{I16x16, I32x8, U8x32};
 
 /// Sixteen `i16` lanes in one AVX2 register, entered only through a
 /// `#[target_feature(enable = "avx2")]` kernel chosen once the CPU flags hold AVX2.
@@ -1073,6 +1073,97 @@ mod wide {
         #[inline(always)]
         pub fn zip_hi64(self, o: Self) -> Self {
             Self(unsafe { _mm256_unpackhi_epi64(self.0, o.0) })
+        }
+    }
+
+    /// Eight `i32` lanes in one AVX2 register.
+    #[derive(Clone, Copy)]
+    pub struct I32x8(__m256i);
+
+    impl I32x8 {
+        #[inline(always)]
+        pub fn load(s: &[i32]) -> Self {
+            Self(unsafe { _mm256_loadu_si256(s[..8].as_ptr().cast()) })
+        }
+
+        #[inline(always)]
+        pub fn store(self, d: &mut [i32]) {
+            unsafe { _mm256_storeu_si256(d[..8].as_mut_ptr().cast(), self.0) }
+        }
+
+        #[inline(always)]
+        pub fn splat(v: i32) -> Self {
+            Self(unsafe { _mm256_set1_epi32(v) })
+        }
+
+        #[inline(always)]
+        pub fn add(self, o: Self) -> Self {
+            Self(unsafe { _mm256_add_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn sub(self, o: Self) -> Self {
+            Self(unsafe { _mm256_sub_epi32(self.0, o.0) })
+        }
+
+        /// The low 32 bits of the products.
+        #[inline(always)]
+        pub fn mul(self, o: Self) -> Self {
+            Self(unsafe { _mm256_mullo_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn max(self, o: Self) -> Self {
+            Self(unsafe { _mm256_max_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn min(self, o: Self) -> Self {
+            Self(unsafe { _mm256_min_epi32(self.0, o.0) })
+        }
+
+        #[inline(always)]
+        pub fn shl<const N: i32>(self) -> Self {
+            Self(unsafe { _mm256_slli_epi32::<N>(self.0) })
+        }
+
+        #[inline(always)]
+        pub fn or(self, o: Self) -> Self {
+            Self(unsafe { _mm256_or_si256(self.0, o.0) })
+        }
+
+        /// Whether any lane is nonzero.
+        #[inline(always)]
+        pub fn any(self) -> bool {
+            unsafe { _mm256_testz_si256(self.0, self.0) == 0 }
+        }
+
+        /// `(x + (1 << N >> 1)) >> N`.
+        #[inline(always)]
+        pub fn round_shr<const N: i32>(self) -> Self {
+            unsafe {
+                Self(_mm256_srai_epi32::<N>(_mm256_add_epi32(
+                    self.0,
+                    _mm256_set1_epi32(1 << N >> 1),
+                )))
+            }
+        }
+
+        /// `(x * k + 2048) >> 12`, for products within 32 bits.
+        #[inline(always)]
+        pub fn mul_q12(self, k: i32) -> Self {
+            Self(unsafe { _mm256_mullo_epi32(self.0, _mm256_set1_epi32(k)) }).round_shr::<12>()
+        }
+
+        /// The lanes in order, saturated to `i16`.
+        #[inline(always)]
+        pub fn pack(self) -> I16x8 {
+            unsafe {
+                I16x8(_mm_packs_epi32(
+                    _mm256_castsi256_si128(self.0),
+                    _mm256_extracti128_si256::<1>(self.0),
+                ))
+            }
         }
     }
 

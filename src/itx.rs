@@ -296,8 +296,18 @@ unsafe extern "C" fn inv_txfm_add_simd_erased<
         // SAFETY: `fn itxfm::Fn::call` passes `coeff.len()` as `coeff_len`, and `BD::Coef` is
         // `i32` at 16 bpc.
         let coeff = unsafe { slice::from_raw_parts_mut(coeff.cast::<i32>(), coeff_len.into()) };
-        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86; elsewhere it is safe.
+        // SAFETY: SSE4.1 is checked before this `fn` is chosen on x86, and AVX2 before `WIDE` is;
+        // elsewhere it is safe.
         return unsafe {
+            #[cfg(target_arch = "x86_64")]
+            if WIDE {
+                return itx_simd::add10_avx2::<BD, W, H, TYPE, G>(
+                    dst,
+                    coeff,
+                    eob,
+                    _bitdepth_max as i16,
+                );
+            }
             itx_simd::add10::<BD, W, H, TYPE, G>(dst, coeff, eob, _bitdepth_max as i16)
         };
     }
@@ -498,11 +508,11 @@ impl Rav1dInvTxfmDSPContext {
             return self;
         }
 
-        // Sixteen lanes on AVX2 where a side reaches 16.
+        // Sixteen lanes on AVX2 where a side reaches 16; at 10 bits also eight-row row passes.
         macro_rules! assign {
             ($w:literal, $h:literal, $($type:ident),*) => {{
                 let tx = TxfmSize::from_wh($w, $h) as usize;
-                let wide = avx2 && BD::BITDEPTH == 8 && ($w >= 16 || $h >= 16);
+                let wide = avx2 && ($w >= 16 || $h >= if BD::BITDEPTH == 8 { 16 } else { 8 });
                 $(
                     self.itxfm_add[tx][$type as usize] = if wide {
                         itxfm::Fn::new(inv_txfm_add_simd_erased::<$w, $h, $type, BD, { ($w + 7) / 8 }, true>)
@@ -780,7 +790,7 @@ mod tests {
         #[allow(unused_mut)]
         let mut out = vec![("rust simd", ctx(flags))];
         #[cfg(target_arch = "x86_64")]
-        if flags.contains(CpuFlags::AVX2) && BD::BITDEPTH == 8 {
+        if flags.contains(CpuFlags::AVX2) {
             out.push((
                 "rust 128",
                 ctx(flags.difference(CpuFlags::AVX2 | CpuFlags::AVX512ICL)),
@@ -1040,6 +1050,7 @@ mod tests {
                 (DCT_DCT, cw * ch - 1),
                 (ADST_ADST, cw * ch - 1),
                 (DCT_DCT, 100),
+                (DCT_DCT, 10),
             ] {
                 let unassigned = *dsps[0].1.itxfm_add[tx as usize][t as usize].get() as usize
                     == *itxfm::Fn::DEFAULT.get() as usize;
@@ -1048,7 +1059,8 @@ mod tests {
                 }
                 let coeff: Vec<BD::Coef> = (0..cw * ch)
                     .map(|i| {
-                        if eob < 136 && (i / ch >= 16 || i % ch >= 16) {
+                        let k = if eob == 10 { 4 } else { 16 };
+                        if eob < 136 && (i / ch >= k || i % ch >= k) {
                             0
                         } else {
                             (rng.next() % 1024) as i32 - 512
