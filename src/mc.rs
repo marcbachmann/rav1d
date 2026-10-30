@@ -39,8 +39,13 @@ fn put_rust<BD: BitDepth>(
     w: usize,
     h: usize,
 ) {
-    let src = src.block::<BD>(0..h as isize, 0..w as isize);
-    let dst = dst.block::<BD>(0..h as isize, 0..w as isize);
+    // SAFETY: The copy reads and writes the block's `h` rows of `w` pixels.
+    let (src, dst) = unsafe {
+        (
+            src.block_unchecked::<BD>(0..h as isize, 0..w as isize),
+            dst.block_unchecked::<BD>(0..h as isize, 0..w as isize),
+        )
+    };
     for y in 0..h as isize {
         BD::pixel_copy(&mut dst.row_mut(y, 0, w), &src.row(y, 0, w), w);
     }

@@ -9,7 +9,7 @@ use std::mem::size_of;
 use std::slice;
 
 use super::*;
-use crate::include::dav1d::picture::PicBlock;
+use crate::include::dav1d::picture::PicRows;
 
 /// The lane operations the kernels take; one implementation per tier.
 pub trait Vx: Copy {
@@ -436,7 +436,7 @@ fn store_px_row<BD: BitDepth, V: Vx, const PW: usize, const I: usize>(
 
 /// Where a kernel's rows go: the picture (`put`), or the compound buffer (`prep`).
 pub enum Out<'a, 'b, BD: BitDepth> {
-    Put(PicBlock<'a, BD>),
+    Put(PicRows<'a, BD>),
     Prep(&'b mut [i16]),
 }
 
@@ -465,7 +465,7 @@ trait Sink<BD: BitDepth> {
 }
 
 struct PutRows<'a, BD: BitDepth> {
-    d: PicBlock<'a, BD>,
+    d: PicRows<'a, BD>,
 }
 
 struct PrepRows<'b> {
@@ -505,7 +505,7 @@ impl<BD: BitDepth> Sink<BD> for PrepRows<'_> {
 /// Source row `y` (from the block's top) of the strip at `x`.
 #[inline(always)]
 fn vrow<BD: BitDepth, V: Vx, const PW: usize>(
-    src: &PicBlock<BD>,
+    src: &PicRows<BD>,
     y: isize,
     x: usize,
     n: usize,
@@ -521,7 +521,7 @@ fn vrow<BD: BitDepth, V: Vx, const PW: usize>(
 /// The first pass of source row `y` (from the block's top) of the strip at `x`, rounded.
 #[inline(always)]
 fn hrow<BD: BitDepth, V: Vx, const PW: usize, const T6: bool>(
-    src: &PicBlock<BD>,
+    src: &PicRows<BD>,
     y: isize,
     x: usize,
     n: usize,
@@ -540,7 +540,7 @@ fn hrow<BD: BitDepth, V: Vx, const PW: usize, const T6: bool>(
 
 /// Source rows `a` and `b` of the strip at `x`, in a two-row tier.
 #[inline(always)]
-fn vrow2<BD: BitDepth, V: Vx>(src: &PicBlock<BD>, a: isize, b: isize, x: usize, n: usize) -> V {
+fn vrow2<BD: BitDepth, V: Vx>(src: &PicRows<BD>, a: isize, b: isize, x: usize, n: usize) -> V {
     let sa = src.row(a, x as isize, n);
     let sb = src.row(b, x as isize, n);
     if BD::BITDEPTH == 8 {
@@ -553,7 +553,7 @@ fn vrow2<BD: BitDepth, V: Vx>(src: &PicBlock<BD>, a: isize, b: isize, x: usize, 
 /// The first pass of source rows `a` and `b` of the strip at `x`, in a two-row tier.
 #[inline(always)]
 fn hrow2<BD: BitDepth, V: Vx, const T6: bool>(
-    src: &PicBlock<BD>,
+    src: &PicRows<BD>,
     a: isize,
     b: isize,
     x: usize,
@@ -575,7 +575,7 @@ fn hrow2<BD: BitDepth, V: Vx, const T6: bool>(
 /// The source rows of a strip's vertical pass: as they are, or through the first pass (`H`).
 /// A closure would not inherit the tier's target features where it is not inlined.
 struct Rows<'a, BD: BitDepth, const PW: usize, const H: bool, const T6: bool> {
-    src: PicBlock<'a, BD>,
+    src: PicRows<'a, BD>,
     y0: isize,
     x: usize,
     n: usize,
@@ -641,7 +641,11 @@ fn mc_8tap_to<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>>(
     bd: BD,
 ) {
     let (mx, my) = (fh.is_some() as isize, fv.is_some() as isize);
-    let src = src.block::<BD>(-3 * my..h as isize + 4 * my, -3 * mx..w as isize + 4 * mx);
+    // SAFETY: The 8-tap passes read rows -3..h + 3 and columns -3..w + 4 around the block, the
+    // 6-tap ones less, each only along a filter it has.
+    let src = unsafe {
+        src.block_unchecked::<BD>(-3 * my..h as isize + 4 * my, -3 * mx..w as isize + 4 * mx)
+    };
     match (fh, fv) {
         (Some(fh), None) if six(fh) => h_pass::<BD, V, PW, S, true>(s, src, w, h, fh, bd),
         (Some(fh), None) => h_pass::<BD, V, PW, S, false>(s, src, w, h, fh, bd),
@@ -660,7 +664,7 @@ fn mc_8tap_to<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>>(
 #[inline(always)]
 fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const T6: bool>(
     s: &mut S,
-    src: PicBlock<BD>,
+    src: PicRows<BD>,
     w: usize,
     h: usize,
     fh: &[i8; 8],
@@ -714,7 +718,7 @@ fn h_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const T6: bool>(
 #[inline(always)]
 fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const T6: bool>(
     s: &mut S,
-    src: PicBlock<BD>,
+    src: PicRows<BD>,
     w: usize,
     h: usize,
     fv: &[i8; 8],
@@ -752,7 +756,7 @@ fn v_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const T6: bool>(
 #[inline(always)]
 fn hv_pass<BD: BitDepth, V: Vx, const PW: usize, S: Sink<BD>, const H6: bool, const V6: bool>(
     s: &mut S,
-    src: PicBlock<BD>,
+    src: PicRows<BD>,
     w: usize,
     h: usize,
     fh: &[i8; 8],
@@ -1083,7 +1087,8 @@ fn comp_k<BD: BitDepth, V: Vx, const PW: usize, const K: u8>(
     let max = bd.bitdepth_max().as_::<i32>() as i16;
     let bias = BD::PREP_BIAS as i32;
     let n = if PW == 0 { V::N } else { PW };
-    let dst = dst.block::<BD>(0..h as isize, 0..w as isize);
+    // SAFETY: The strips write the block's `h` rows of `w` pixels.
+    let dst = unsafe { dst.block_unchecked::<BD>(0..h as isize, 0..w as isize) };
     let (rnd, sh) = match K {
         0 => ((1 << ib) + 2 * bias, ib + 1),
         1 => ((8 << ib) + 16 * bias, ib + 4),
@@ -1238,7 +1243,8 @@ fn warp_h<BD: BitDepth, V: Vw>(
     bd: BD,
 ) -> [V; 15] {
     let ib = bd.get_intermediate_bits() as u32;
-    let src = src.block::<BD>(-3..12, -3..12);
+    // SAFETY: The first pass reads 15 rows of 15 pixels from (-3, -3).
+    let src = unsafe { src.block_unchecked::<BD>(-3..12, -3..12) };
     let mut mid = [V::splat(0); 15];
     for y in 0..15 {
         let s = src.row(y as isize - 3, -3, 15);
@@ -2517,7 +2523,7 @@ fn bl2<BD: BitDepth, V: Vx>(a: V, b: V, f: i16, rnd: i32, sh: u32) -> V {
 
 #[inline(always)]
 fn bl_row<BD: BitDepth, V: Vx, const PW: usize>(
-    src: &PicBlock<BD>,
+    src: &PicRows<BD>,
     y: usize,
     x: usize,
     n: usize,
@@ -2555,7 +2561,8 @@ pub fn bilin<BD: BitDepth, V: Vx, const PW: usize>(
     let hsh = 4 - ib;
     let hrnd = (1 << hsh) >> 1;
     let (dx, dy) = ((mx != 0) as isize, (my != 0) as isize);
-    let src = src.block::<BD>(0..h as isize + dy, 0..w as isize + dx);
+    // SAFETY: Bilinear reads `h` rows of `w` pixels, one more of each along a filter it has.
+    let src = unsafe { src.block_unchecked::<BD>(0..h as isize + dy, 0..w as isize + dx) };
     for x in (0..w).step_by(n) {
         if my == 0 {
             for y in 0..h {
@@ -2607,7 +2614,8 @@ pub fn prep_copy<BD: BitDepth, V: Vx, const PW: usize>(
     let ib = bd.get_intermediate_bits() as u32;
     let n = if PW == 0 { V::N } else { PW };
     let (k, bias) = (V::splat(1 << ib), V::splat(BD::PREP_BIAS));
-    let src = src.block::<BD>(0..h as isize, 0..w as isize);
+    // SAFETY: The copy reads the block's `h` rows of `w` pixels.
+    let src = unsafe { src.block_unchecked::<BD>(0..h as isize, 0..w as isize) };
     for y in 0..h {
         let s = src.row(y as isize, 0, w);
         for x in (0..w).step_by(n) {
@@ -2643,7 +2651,8 @@ pub fn blend<BD: BitDepth, V: Vx, const PW: usize>(
         vm[..w * 3 >> 2].copy_from_slice(&obmc[w..][..w * 3 >> 2]);
     }
     let oh = if let Blend::H = kind { h * 3 >> 2 } else { h };
-    let dst = dst.block::<BD>(0..oh as isize, 0..w as isize);
+    // SAFETY: The blend writes `oh` rows of `w` pixels.
+    let dst = unsafe { dst.block_unchecked::<BD>(0..oh as isize, 0..w as isize) };
     for y in 0..oh {
         let row = &mut *dst.row_mut(y as isize, 0, w);
         for x in (0..w).step_by(n) {
@@ -2696,7 +2705,8 @@ pub fn w_mask<BD: BitDepth, V: Vx, const PW: usize>(
     let mask_rnd = 1 << (mask_sh - 5);
     let n = if PW == 0 { V::N } else { PW };
     let mw = w >> ss_hor as usize;
-    let dst = dst.block::<BD>(0..h as isize, 0..w as isize);
+    // SAFETY: The strips write the block's `h` rows of `w` pixels.
+    let dst = unsafe { dst.block_unchecked::<BD>(0..h as isize, 0..w as isize) };
     let sign = sign as i16;
     for y in (0..h).step_by(2) {
         for x in (0..w).step_by(n) {
@@ -2947,7 +2957,8 @@ fn put_8tap<BD: BitDepth, const FILTER: usize, const WIDE: bool>(
     bd: BD,
 ) {
     let filter = Filter2d::from_repr(FILTER).unwrap();
-    let put = || Out::Put(dst.block::<BD>(0..h as isize, 0..w as isize));
+    // SAFETY: The passes write the block's `h` rows of `w` pixels.
+    let put = || Out::Put(unsafe { dst.block_unchecked::<BD>(0..h as isize, 0..w as isize) });
     if filter == Filter2d::Bilinear {
         if mx == 0 && my == 0 {
             return put_rust::<BD>(dst, src, w, h);
@@ -3146,10 +3157,11 @@ pub unsafe extern "C" fn warp8x8_erased<BD: BitDepth, const WIDE: bool>(
     // SAFETY: Was passed as `WithOffset::into_ffi_safe(_)` in `warp_8x8::Fn::call`.
     let src = unsafe { FFISafe::from_with_offset(src) };
     let bd = BD::from_c(bitdepth_max);
-    // SAFETY: The CPU flags are checked before this `fn` is chosen.
+    // SAFETY: The CPU flags are checked before this `fn` is chosen; warp writes 8 rows of 8
+    // pixels.
     unsafe {
         warp_any::<BD, WIDE>(
-            Out::Put(dst.block::<BD>(0..8, 0..8)),
+            Out::Put(dst.block_unchecked::<BD>(0..8, 0..8)),
             8,
             src,
             abcd,

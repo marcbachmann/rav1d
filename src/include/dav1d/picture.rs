@@ -406,6 +406,32 @@ impl<'a> Rav1dPictureDataComponentOffset<'a> {
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn block<BD: BitDepth>(self, rows: Range<isize>, cols: Range<isize>) -> PicBlock<'a, BD> {
+        self.block_of(rows, cols)
+    }
+
+    /// [`Self::block`] whose rows skip their release check against the footprint's pixels.
+    ///
+    /// # Safety
+    ///
+    /// Every row borrowed from the block lies in its footprint: `y` in `rows`, `x..x + n` in
+    /// `cols`. Debug builds check this on every row.
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    pub unsafe fn block_unchecked<BD: BitDepth>(
+        self,
+        rows: Range<isize>,
+        cols: Range<isize>,
+    ) -> PicRows<'a, BD> {
+        self.block_of(rows, cols)
+    }
+
+    #[inline]
+    #[cfg_attr(debug_assertions, track_caller)]
+    fn block_of<BD: BitDepth, const CHECKED: bool>(
+        self,
+        rows: Range<isize>,
+        cols: Range<isize>,
+    ) -> PicBlock<'a, BD, CHECKED> {
         #[inline(never)]
         #[cfg_attr(debug_assertions, track_caller)]
         fn out_of_bounds(rows: Range<isize>, cols: Range<isize>, at: usize, len: usize) -> ! {
@@ -465,8 +491,10 @@ impl<'a> Rav1dPictureDataComponentOffset<'a> {
 /// [`Rav1dPictureDataComponentOffset::block`] to lie in the component's allocation.
 ///
 /// Release builds then check a row with one compare, against the pixels from the footprint's
-/// first row to its last, so a row never leaves the allocation. Like [`DisjointMut::index_mut`]
-/// in release, the rest relies on correct use, which only debug builds check:
+/// first row to its last, so a row never leaves the allocation; without `CHECKED`
+/// ([`Rav1dPictureDataComponentOffset::block_unchecked`]) not even that. Like
+/// [`DisjointMut::index_mut`] in release, the rest relies on correct use, which only debug
+/// builds check:
 /// - the `n` pixels at `(x, y)` lie in the footprint: `y` in its rows, `x..x + n` in its
 ///   columns. Kernels declare the footprint from the block size they loop over.
 /// - a borrowed row overlaps no mutable borrow of the same pixels while held.
@@ -474,7 +502,7 @@ impl<'a> Rav1dPictureDataComponentOffset<'a> {
 /// With `debug_assertions` each row is checked against the footprint and borrowed on its own
 /// through the [`DisjointMut`], so its tracker sees one row at a time, never the whole block.
 #[derive(Clone, Copy)]
-pub struct PicBlock<'a, BD: BitDepth> {
+pub struct PicBlock<'a, BD: BitDepth, const CHECKED: bool = true> {
     #[cfg(debug_assertions)]
     at: Rav1dPictureDataComponentOffset<'a>,
     #[cfg(not(debug_assertions))]
@@ -490,6 +518,9 @@ pub struct PicBlock<'a, BD: BitDepth> {
     cols: (isize, isize),
     phantom: PhantomData<(&'a Rav1dPictureDataComponent, BD)>,
 }
+
+/// A [`PicBlock`] whose rows the kernel keeps in the footprint (checked in debug builds only).
+pub type PicRows<'a, BD> = PicBlock<'a, BD, false>;
 
 #[cfg(not(debug_assertions))]
 #[inline(never)]
@@ -510,7 +541,7 @@ pub type PicRowMut<'a, BD> =
 #[cfg(not(debug_assertions))]
 pub type PicRowMut<'a, BD> = &'a mut [<BD as BitDepth>::Pixel];
 
-impl<'a, BD: BitDepth> PicBlock<'a, BD> {
+impl<'a, BD: BitDepth, const CHECKED: bool> PicBlock<'a, BD, CHECKED> {
     /// The offset of `n` pixels at `(x, y)` from pixel `(0, 0)`.
     #[inline(always)]
     #[cfg_attr(debug_assertions, track_caller)]
@@ -523,7 +554,9 @@ impl<'a, BD: BitDepth> PicBlock<'a, BD> {
         );
         let i = y.wrapping_mul(self.stride).wrapping_add(x);
         #[cfg(not(debug_assertions))]
-        if i.wrapping_sub(self.lo) as usize > self.span.wrapping_sub(n) || n > self.span {
+        if CHECKED
+            && (i.wrapping_sub(self.lo) as usize > self.span.wrapping_sub(n) || n > self.span)
+        {
             row_out_of_bounds();
         }
         i
@@ -537,7 +570,8 @@ impl<'a, BD: BitDepth> PicBlock<'a, BD> {
         #[cfg(debug_assertions)]
         return (self.at + i).slice::<BD>(n);
         // SAFETY: `block` checked that the footprint's pixels lie in the allocation, and `at`
-        // that `i`'s `n` pixels lie in the footprint's.
+        // that `i`'s `n` pixels lie in the footprint's, or `block_unchecked`'s caller that
+        // they lie in the footprint.
         #[cfg(not(debug_assertions))]
         unsafe {
             std::slice::from_raw_parts(self.origin.wrapping_offset(i), n)
