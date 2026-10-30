@@ -1741,10 +1741,23 @@ fn splat_mv_rust<'a>(rr: impl Iterator<Item = &'a mut [RefMvsBlock]>, rmv: &Alig
     }
 }
 
-/// [`splat_mv_rust`] storing four 12-byte blocks as three 16-byte stores.
+/// [`splat_mv_rust`] with the width chosen once per call: four 12-byte blocks as three 16-byte
+/// stores, eight as three 32-byte ones with AVX2.
 mod rust_simd {
     use super::*;
     use crate::simd128::U8x16;
+
+    /// Runs `$e` with `$d`, the first byte of each row's blocks.
+    macro_rules! rows {
+        ($rr:expr, $bx4:expr, |$d:ident| $e:expr) => {
+            for &r in $rr {
+                // SAFETY: `r` is from `rf.r.index_mut((ri + bx4.., ..bw4)).as_mut_ptr().sub(bx4)`
+                // in `splat_mv::Fn::call`, and `$e` writes the first `bw4` blocks.
+                let $d = unsafe { r.add($bx4).cast::<u8>() };
+                $e
+            }
+        };
+    }
 
     /// # Safety
     ///
@@ -1762,31 +1775,88 @@ mod rust_simd {
         let p = [rmv.0; 4];
         // SAFETY: `RefMvsBlock` has no padding: its 48 bytes are initialized.
         let v = [0, 16, 32].map(|o| unsafe { U8x16::load_at(p.as_ptr().cast::<u8>().add(o)) });
-        for &r in rr {
-            // SAFETY: `r` is from `rf.r.index_mut((ri + bx4.., ..bw4)).as_mut_ptr().sub(bx4)` in `splat_mv::Fn::call`.
-            let r = unsafe { slice::from_raw_parts_mut(r.add(bx4), bw4) };
-            match bw4 {
-                1 => r[0] = p[0],
-                2 => r.copy_from_slice(&p[..2]),
-                4 => store::<1>(r, &v),
-                8 => store::<2>(r, &v),
-                16 => store::<4>(r, &v),
-                32 => store::<8>(r, &v),
-                _ => r.fill(p[0]),
+        // SAFETY (each store): within the row's first `bw4` blocks.
+        match bw4 {
+            1 => rows!(rr, bx4, |d| unsafe { ptr::write_unaligned(d.cast(), p[0]) }),
+            2 => rows!(rr, bx4, |d| unsafe { ptr::write_unaligned(d.cast(), [p[0], p[1]]) }),
+            4 => rows!(rr, bx4, |d| store::<1>(d, &v)),
+            8 => rows!(rr, bx4, |d| store::<2>(d, &v)),
+            16 => rows!(rr, bx4, |d| store::<4>(d, &v)),
+            32 => rows!(rr, bx4, |d| store::<8>(d, &v)),
+            _ => rows!(rr, bx4, |d| {
+                for i in 0..bw4 {
+                    // SAFETY: Block `i < bw4`.
+                    unsafe { ptr::write_unaligned(d.cast::<RefMvsBlock>().add(i), p[0]) }
+                }
+            }),
+        }
+    }
+
+    /// `N` times the four blocks in `v` at `d`.
+    #[inline(always)]
+    fn store<const N: usize>(d: *mut u8, v: &[U8x16; 3]) {
+        for k in 0..N {
+            for (j, v) in v.iter().enumerate() {
+                // SAFETY: Within the `4 * N` blocks at `d`, as the callers' widths are.
+                unsafe { v.store_at(d.add(48 * k + 16 * j)) };
             }
         }
     }
 
-    /// `N` times the four blocks in `v` at the start of `r`.
-    #[inline(always)]
-    fn store<const N: usize>(r: &mut [RefMvsBlock], v: &[U8x16; 3]) {
-        assert!(r.len() >= 4 * N);
-        let d = r.as_mut_ptr().cast::<u8>();
-        for k in 0..N {
-            for (j, v) in v.iter().enumerate() {
-                // SAFETY: Within the first `4 * N` blocks of `r`.
-                unsafe { v.store_at(d.add(48 * k + 16 * j)) };
-            }
+    /// [`splat_mv_simd`] in 32-byte stores.
+    ///
+    /// # Safety
+    ///
+    /// Must be called by [`splat_mv::Fn::call`] once the CPU has AVX2.
+    #[cfg(target_arch = "x86_64")]
+    pub unsafe extern "C" fn splat_mv_avx2(
+        rr: *mut *mut RefMvsBlock,
+        rmv: &Align16<RefMvsBlock>,
+        bx4: i32,
+        bw4: i32,
+        bh4: i32,
+    ) {
+        // SAFETY: Length sliced in `splat_mv::Fn::call`; AVX2 checked by the caller.
+        unsafe { splat_avx2(slice::from_raw_parts(rr, bh4 as usize), rmv, bx4 as usize, bw4 as usize) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn splat_avx2(rr: &[*mut RefMvsBlock], rmv: &Align16<RefMvsBlock>, bx4: usize, bw4: usize) {
+        use std::arch::x86_64::*;
+        let p = [rmv.0; 8];
+        let b = p.as_ptr().cast::<u8>();
+        // SAFETY: `p` is 96 initialized bytes.
+        let [v0, v1, v2] = unsafe { [_mm256_loadu_si256(b.cast()), _mm256_loadu_si256(b.add(32).cast()), _mm256_loadu_si256(b.add(64).cast())] };
+        // SAFETY (each store): within the row's first `bw4` blocks, as in `splat_mv_simd`.
+        macro_rules! eights {
+            ($n:literal) => {
+                rows!(rr, bx4, |d| {
+                    for k in 0..$n {
+                        unsafe {
+                            _mm256_storeu_si256(d.add(96 * k).cast(), v0);
+                            _mm256_storeu_si256(d.add(96 * k + 32).cast(), v1);
+                            _mm256_storeu_si256(d.add(96 * k + 64).cast(), v2);
+                        }
+                    }
+                })
+            };
+        }
+        match bw4 {
+            1 => rows!(rr, bx4, |d| unsafe { ptr::write_unaligned(d.cast(), p[0]) }),
+            2 => rows!(rr, bx4, |d| unsafe { ptr::write_unaligned(d.cast(), [p[0], p[1]]) }),
+            4 => rows!(rr, bx4, |d| unsafe {
+                _mm256_storeu_si256(d.cast(), v0);
+                _mm_storeu_si128(d.add(32).cast(), _mm256_castsi256_si128(v1));
+            }),
+            8 => eights!(1),
+            16 => eights!(2),
+            32 => eights!(4),
+            _ => rows!(rr, bx4, |d| {
+                for i in 0..bw4 {
+                    unsafe { ptr::write_unaligned(d.cast::<RefMvsBlock>().add(i), p[0]) }
+                }
+            }),
         }
     }
 }
@@ -1800,17 +1870,21 @@ impl Rav1dRefmvsDSPContext {
         }
     }
 
-    /// The Rust kernel for `splat_mv`. `save_tmvs` and `load_tmvs` stay as they are: a run
-    /// stored as one fixed-length array, and the candidates picked without branches, were no
-    /// faster than the scalar `save_tmvs`.
+    /// The Rust kernel for `splat_mv`. `save_tmvs` and `load_tmvs` stay scalar: the candidate
+    /// picked without branches and runs stored as 20-byte groups were no faster (413 vs 401 ns).
     #[inline(always)]
-    const fn init(mut self) -> Self {
+    const fn init(mut self, flags: CpuFlags) -> Self {
         self.splat_mv = splat_mv::Fn::new(rust_simd::splat_mv_simd);
+        #[cfg(target_arch = "x86_64")]
+        if flags.contains(CpuFlags::AVX2) {
+            self.splat_mv = splat_mv::Fn::new(rust_simd::splat_mv_avx2);
+        }
+        let _ = flags;
         self
     }
 
-    pub const fn new(_flags: CpuFlags) -> Self {
-        Self::default().init()
+    pub const fn new(flags: CpuFlags) -> Self {
+        Self::default().init(flags)
     }
 }
 
@@ -1841,9 +1915,10 @@ mod tests {
     }
 
     fn contexts() -> Vec<(&'static str, Rav1dRefmvsDSPContext)> {
+        crate::cpu::rav1d_init_cpu();
         vec![
             ("scalar", Rav1dRefmvsDSPContext::default()),
-            ("rust simd", Rav1dRefmvsDSPContext::default().init()),
+            ("rust simd", Rav1dRefmvsDSPContext::new(crate::cpu::rav1d_get_cpu_flags())),
         ]
     }
 

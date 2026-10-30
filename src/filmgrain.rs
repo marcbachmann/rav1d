@@ -1149,41 +1149,55 @@ mod rust_simd {
         )
     }
 
-    /// Row `y`'s `NV` grain vectors, blended as the overlaps ask.
+    /// The LUT positions of a block's grain and of the grain it blends with: its own, the
+    /// left block's, the top's and the top left's, as `(row, column)`. The columns are clamped
+    /// to where `NV` vectors fit in a row, which they already are, so that loads need no checks.
     #[inline(always)]
-    fn grain_row<P: Px, const NV: usize>(
+    fn lut_pos<const NV: usize>(offsets: &[[c_int; 2]; 2], sx: bool, sy: bool) -> [(usize, usize); 4] {
+        [(0, 0), (1, 0), (0, 1), (1, 1)].map(|(bx, by)| {
+            let (oy, ox) = lut_at(offsets, sx, sy, bx, by);
+            // The left blocks give one vector.
+            (oy, ox.min(GRAIN_WIDTH - 8 * if bx == 0 { NV } else { 1 }))
+        })
+    }
+
+    #[inline(always)]
+    fn grain_at<P: Px, const NV: usize>(row: &[P::E; GRAIN_WIDTH], ox: usize) -> [I16x8; NV] {
+        let row = &row[..ox + 8 * NV];
+        let mut g = [I16x8::splat(0); NV];
+        for c in 0..NV {
+            g[c] = P::grain8(&row[ox + 8 * c..]);
+        }
+        g
+    }
+
+    /// Row `y`'s `NV` grain vectors, blended as the overlaps ask: with the left block for
+    /// `XOVER`, with the top for `TOP` by the weights `vw`.
+    #[inline(always)]
+    fn grain_row<P: Px, const NV: usize, const XOVER: bool, const TOP: bool>(
         lut: &GrainLut<P::E>,
-        offsets: &[[c_int; 2]; 2],
-        (sx, sy): (bool, bool),
+        pos: &[(usize, usize); 4],
         y: usize,
-        xover: bool,
-        top: Option<(I16x8, I16x8)>,
+        vw: (I16x8, I16x8),
         hw: (I16x8, I16x8),
         lim: (I16x8, I16x8),
     ) -> [I16x8; NV] {
-        let at = |bx, by| {
-            let (oy, ox) = lut_at(offsets, sx, sy, bx, by);
-            &lut[oy + y][ox..]
-        };
-        let row = at(0, 0);
-        let mut g = [I16x8::splat(0); NV];
-        for c in 0..NV {
-            g[c] = P::grain8(&row[8 * c..]);
+        let at = |k: usize| (&lut[pos[k].0 + y], pos[k].1);
+        let (row, ox) = at(0);
+        let mut g = grain_at::<P, NV>(row, ox);
+        if XOVER {
+            let (row, ox) = at(1);
+            g[0] = blend(grain_at::<P, 1>(row, ox)[0], g[0], hw.0, hw.1, lim);
         }
-        if xover {
-            g[0] = blend(P::grain8(at(1, 0)), g[0], hw.0, hw.1, lim);
-        }
-        if let Some((wo, wc)) = top {
-            let row = at(0, 1);
-            let mut t = [I16x8::splat(0); NV];
-            for c in 0..NV {
-                t[c] = P::grain8(&row[8 * c..]);
-            }
-            if xover {
-                t[0] = blend(P::grain8(at(1, 1)), t[0], hw.0, hw.1, lim);
+        if TOP {
+            let (row, ox) = at(2);
+            let mut t = grain_at::<P, NV>(row, ox);
+            if XOVER {
+                let (row, ox) = at(3);
+                t[0] = blend(grain_at::<P, 1>(row, ox)[0], t[0], hw.0, hw.1, lim);
             }
             for c in 0..NV {
-                g[c] = blend(t[c], g[c], wo, wc, lim);
+                g[c] = blend(t[c], g[c], vw.0, vw.1, lim);
             }
         }
         g
@@ -1321,26 +1335,62 @@ mod rust_simd {
             for i in 0..rows {
                 offsets[0][i] = get_random_number(8, &mut seed[i]);
             }
-            let ystart = if data.overlap_flag && row_num != 0 {
-                cmp::min(2, bh)
-            } else {
-                0
-            };
+            let ystart = if data.overlap_flag && row_num != 0 { cmp::min(2, bh) } else { 0 };
             let xover = data.overlap_flag && bx != 0;
-            for y in 0..bh {
+            let pos = lut_pos::<4>(&offsets, false, false);
+            let k = Fgy { src_row, dst_row, bx, bw, lut, pos, hw, lim, lookup, a };
+            for y in 0..ystart {
                 const W: [[i16; 2]; 2] = [[27, 17], [17, 27]];
-                let top = if y < ystart { Some((I16x8::splat(W[y][0]), I16x8::splat(W[y][1]))) } else { None };
-                let g = grain_row::<P, 4>(lut, &offsets, (false, false), y, xover, top, hw, lim);
-                let off = y as isize;
-                let src = (src_row + off * src_row.pixel_stride::<BD>() + bx).slice::<BD>(bw);
-                let mut dst =
-                    (dst_row + off * dst_row.pixel_stride::<BD>() + bx).slice_mut::<BD>(bw);
-                let (src, dst) = (px::<P>(src.as_bytes()), px_mut::<P>(dst.as_bytes_mut()));
-                with_row!(src, &[][..], dst, (bw, 0, FG_BLOCK_SIZE), |s, _l, d| {
-                    apply_y(s, d, &g, lookup, a)
-                });
+                let vw = (I16x8::splat(W[y][0]), I16x8::splat(W[y][1]));
+                if xover {
+                    fgy_row::<BD, P, L, true, true>(&k, y, vw);
+                } else {
+                    fgy_row::<BD, P, L, false, true>(&k, y, vw);
+                }
+            }
+            let vw = hw;
+            if xover {
+                for y in ystart..bh {
+                    fgy_row::<BD, P, L, true, false>(&k, y, vw);
+                }
+            } else {
+                for y in ystart..bh {
+                    fgy_row::<BD, P, L, false, false>(&k, y, vw);
+                }
             }
         }
+    }
+
+    /// What every row of a luma block takes.
+    struct Fgy<'a, P: Px, L> {
+        src_row: Rav1dPictureDataComponentOffset<'a>,
+        dst_row: Rav1dPictureDataComponentOffset<'a>,
+        bx: usize,
+        bw: usize,
+        lut: &'a GrainLut<P::E>,
+        pos: [(usize, usize); 4],
+        hw: (I16x8, I16x8),
+        lim: (I16x8, I16x8),
+        lookup: &'a L,
+        a: Apply,
+    }
+
+    #[inline(always)]
+    fn fgy_row<BD: BitDepth, P: Px, L: Lookup, const XOVER: bool, const TOP: bool>(
+        k: &Fgy<P, L>,
+        y: usize,
+        vw: (I16x8, I16x8),
+    ) {
+        let g = grain_row::<P, 4, XOVER, TOP>(k.lut, &k.pos, y, vw, k.hw, k.lim);
+        let (src_row, dst_row, bx, bw) = (k.src_row, k.dst_row, k.bx, k.bw);
+        let off = y as isize;
+        let src = (src_row + off * src_row.pixel_stride::<BD>() + bx).slice::<BD>(bw);
+        let mut dst = (dst_row + off * dst_row.pixel_stride::<BD>() + bx).slice_mut::<BD>(bw);
+        let (src, dst) = (px::<P>(src.as_bytes()), px_mut::<P>(dst.as_bytes_mut()));
+        let (lookup, a) = (k.lookup, k.a);
+        with_row!(src, &[][..], dst, (bw, 0, FG_BLOCK_SIZE), |s, _l, d| {
+            apply_y(s, d, &g, lookup, a)
+        });
     }
 
     /// The chroma constants: `uv_luma_mult`, `uv_mult` and `uv_offset << (bitdepth - 8)`.
@@ -1455,23 +1505,1082 @@ mod rust_simd {
                 0
             };
             let xover = data.overlap_flag && bx != 0;
-            for y in 0..bh {
+            let pos = lut_pos::<NV>(&offsets, SX, SY);
+            let k = Fguv { src_row, dst_row, luma_row, bx, bw, lut, pos, hw, lim, lookup, a, uv };
+            for y in 0..ystart {
                 const W: [[[i16; 2]; 2]; 2] = [[[27, 17], [17, 27]], [[23, 22], [0; 2]]];
-                let top =
-                    if y < ystart { Some((I16x8::splat(W[sy][y][0]), I16x8::splat(W[sy][y][1]))) } else { None };
-                let g = grain_row::<P, NV>(lut, &offsets, (SX, SY), y, xover, top, hw, lim);
-                let off = y as isize;
-                let luma = (luma_row + ((off << sy) * luma_row.pixel_stride::<BD>()) + (bx << sx))
-                    .slice::<BD>(bw << sx);
-                let src = (src_row + off * src_row.pixel_stride::<BD>() + bx).slice::<BD>(bw);
-                let mut dst =
-                    (dst_row + off * dst_row.pixel_stride::<BD>() + bx).slice_mut::<BD>(bw);
-                let (luma, src) = (px::<P>(luma.as_bytes()), px::<P>(src.as_bytes()));
-                let dst = px_mut::<P>(dst.as_bytes_mut());
-                with_row!(src, luma, dst, (bw, bw << sx, bw_full), |s, l, d| {
-                    apply_uv::<P, L, SX, NV>(s, l, d, &g, lookup, a, uv)
-                });
+                let vw = (I16x8::splat(W[sy][y][0]), I16x8::splat(W[sy][y][1]));
+                if xover {
+                    fguv_row::<BD, P, L, SX, SY, NV, true, true>(&k, y, vw);
+                } else {
+                    fguv_row::<BD, P, L, SX, SY, NV, false, true>(&k, y, vw);
+                }
             }
+            if xover {
+                for y in ystart..bh {
+                    fguv_row::<BD, P, L, SX, SY, NV, true, false>(&k, y, hw);
+                }
+            } else {
+                for y in ystart..bh {
+                    fguv_row::<BD, P, L, SX, SY, NV, false, false>(&k, y, hw);
+                }
+            }
+        }
+    }
+
+    /// What every row of a chroma block takes.
+    struct Fguv<'a, P: Px, L> {
+        src_row: Rav1dPictureDataComponentOffset<'a>,
+        dst_row: Rav1dPictureDataComponentOffset<'a>,
+        luma_row: Rav1dPictureDataComponentOffset<'a>,
+        bx: usize,
+        bw: usize,
+        lut: &'a GrainLut<P::E>,
+        pos: [(usize, usize); 4],
+        hw: (I16x8, I16x8),
+        lim: (I16x8, I16x8),
+        lookup: &'a L,
+        a: Apply,
+        uv: Uv,
+    }
+
+    #[inline(always)]
+    fn fguv_row<
+        BD: BitDepth,
+        P: Px,
+        L: Lookup,
+        const SX: bool,
+        const SY: bool,
+        const NV: usize,
+        const XOVER: bool,
+        const TOP: bool,
+    >(
+        k: &Fguv<P, L>,
+        y: usize,
+        vw: (I16x8, I16x8),
+    ) {
+        let (sx, sy) = (SX as usize, SY as usize);
+        let g = grain_row::<P, NV, XOVER, TOP>(k.lut, &k.pos, y, vw, k.hw, k.lim);
+        let (src_row, dst_row, luma_row, bx, bw) = (k.src_row, k.dst_row, k.luma_row, k.bx, k.bw);
+        let off = y as isize;
+        let luma = (luma_row + ((off << sy) * luma_row.pixel_stride::<BD>()) + (bx << sx))
+            .slice::<BD>(bw << sx);
+        let src = (src_row + off * src_row.pixel_stride::<BD>() + bx).slice::<BD>(bw);
+        let mut dst = (dst_row + off * dst_row.pixel_stride::<BD>() + bx).slice_mut::<BD>(bw);
+        let (luma, src) = (px::<P>(luma.as_bytes()), px::<P>(src.as_bytes()));
+        let dst = px_mut::<P>(dst.as_bytes_mut());
+        let (lookup, a, uv) = (k.lookup, k.a, k.uv);
+        with_row!(src, luma, dst, (bw, bw << sx, FG_BLOCK_SIZE >> sx), |s, l, d| {
+            apply_uv::<P, L, SX, NV>(s, l, d, &g, lookup, a, uv)
+        });
+    }
+
+    /// The 8 bpc AVX2 kernels in the asm's layout: 32 pixels in one register (two rows of
+    /// sixteen when chroma is subsampled horizontally), grain blended in bytes, and words
+    /// unpacked within the 128-bit halves only, so that nothing crosses them. The scaling
+    /// bytes come from dword gathers at the even words and two bytes lower at the odd ones,
+    /// and `pmaddubsw` multiplies them by the grain without masking the bytes above them.
+    #[cfg(target_arch = "x86_64")]
+    pub mod avx2_8 {
+        use std::arch::x86_64::*;
+
+        use super::*;
+        use crate::include::common::bitdepth::BitDepth8;
+
+        /// The scaling table with four bytes either side, for the gathers, aligned so that no
+        /// gathered dword spans two cache lines: clipped pixels gather the last entry in
+        /// every lane, which read in place from an aligned table makes eight split loads.
+        pub struct Scaling(crate::align::Align64<[u8; 264]>);
+
+        impl Scaling {
+            pub fn new(t: &[u8]) -> Self {
+                let mut p = [0; 264];
+                p[4..260].copy_from_slice(&t[..256]);
+                Self(crate::align::Align64(p))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        struct K {
+            mul: __m256i,
+            min: __m256i,
+            max: __m256i,
+            round5: __m256i,
+        }
+
+        // SAFETY (every `unsafe` here): these are only inlined into the `avx2` functions below,
+        // and loads and stores go through slices of the length they access.
+        impl K {
+            #[inline(always)]
+            fn new(data: &Rav1dFilmGrainData, max_restricted: u8) -> Self {
+                let (min, max) = if data.clip_to_restricted_range { (16, max_restricted) } else { (0, 255) };
+                unsafe {
+                    Self {
+                        mul: _mm256_set1_epi16(1 << (15 - data.scaling_shift)),
+                        min: _mm256_set1_epi8(min as i8),
+                        max: _mm256_set1_epi8(max as i8),
+                        round5: _mm256_set1_epi16(1 << 10),
+                    }
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn load32<T: AsBytes>(s: &[T]) -> __m256i {
+            unsafe { _mm256_loadu_si256(s.as_bytes()[..32].as_ptr().cast()) }
+        }
+
+        #[inline(always)]
+        fn load16x2<T: AsBytes>(a: &[T], b: &[T]) -> __m256i {
+            let (a, b) = (&a.as_bytes()[..16], &b.as_bytes()[..16]);
+            unsafe {
+                _mm256_inserti128_si256::<1>(
+                    _mm256_castsi128_si256(_mm_loadu_si128(a.as_ptr().cast())),
+                    _mm_loadu_si128(b.as_ptr().cast()),
+                )
+            }
+        }
+
+        #[inline(always)]
+        fn load4x2(a: &[i8], b: &[i8]) -> __m256i {
+            let d = |s: &[i8]| i32::from_le_bytes(s[..4].as_bytes().try_into().unwrap());
+            unsafe { _mm256_setr_epi32(d(a), 0, 0, 0, d(b), 0, 0, 0) }
+        }
+
+        #[inline(always)]
+        fn store32(v: __m256i, d: &mut [u8]) {
+            unsafe { _mm256_storeu_si256(d[..32].as_mut_ptr().cast(), v) }
+        }
+
+        #[inline(always)]
+        fn store16x2(v: __m256i, a: &mut [u8], b: &mut [u8]) {
+            let (a, b) = (&mut a[..16], &mut b[..16]);
+            unsafe {
+                _mm_storeu_si128(a.as_mut_ptr().cast(), _mm256_castsi256_si128(v));
+                _mm_storeu_si128(b.as_mut_ptr().cast(), _mm256_extracti128_si256::<1>(v));
+            }
+        }
+
+        #[inline(always)]
+        fn pairs(lo: u8, hi: u8) -> __m256i {
+            unsafe { _mm256_set1_epi16(i16::from_le_bytes([lo, hi])) }
+        }
+
+        /// Words whose low byte is `t[v]`, for words `v` in `0..=255`.
+        #[inline(always)]
+        fn scaling(t: &Scaling, v: __m256i) -> __m256i {
+            unsafe {
+                let p = t.0 .0.as_ptr().add(4);
+                let even = _mm256_blend_epi16::<0xaa>(v, _mm256_setzero_si256());
+                let a = _mm256_i32gather_epi32::<1>(p.cast(), even);
+                let b = _mm256_i32gather_epi32::<1>(p.sub(2).cast(), _mm256_srli_epi32::<16>(v));
+                _mm256_blend_epi16::<0xaa>(a, b)
+            }
+        }
+
+        /// The pixels with words `lo` and `hi` plus the noise of the grain bytes `g` scaled by
+        /// `sc`, clipped.
+        #[inline(always)]
+        fn add_noise(lo: __m256i, hi: __m256i, sc: [__m256i; 2], g: __m256i, k: K) -> __m256i {
+            unsafe {
+                let z = _mm256_setzero_si256();
+                let n0 = _mm256_mulhrs_epi16(_mm256_maddubs_epi16(sc[0], _mm256_unpacklo_epi8(g, z)), k.mul);
+                let n1 = _mm256_mulhrs_epi16(_mm256_maddubs_epi16(sc[1], _mm256_unpackhi_epi8(g, z)), k.mul);
+                let p = _mm256_packus_epi16(_mm256_add_epi16(lo, n0), _mm256_add_epi16(hi, n1));
+                _mm256_min_epu8(_mm256_max_epu8(p, k.min), k.max)
+            }
+        }
+
+        /// The 32 pixels `s` with the noise of the grain `g` and of the scaling of `idx`.
+        #[inline(always)]
+        fn noise_px(s: __m256i, idx: __m256i, g: __m256i, t: &Scaling, k: K) -> __m256i {
+            unsafe {
+                let z = _mm256_setzero_si256();
+                let sc = [
+                    scaling(t, _mm256_unpacklo_epi8(idx, z)),
+                    scaling(t, _mm256_unpackhi_epi8(idx, z)),
+                ];
+                add_noise(_mm256_unpacklo_epi8(s, z), _mm256_unpackhi_epi8(s, z), sc, g, k)
+            }
+        }
+
+        /// The rounded averages of the byte pairs of `lo` and `hi`.
+        #[inline(always)]
+        fn avg_pairs(lo: __m256i, hi: __m256i) -> __m256i {
+            unsafe {
+                let one = _mm256_set1_epi8(1);
+                let z = _mm256_setzero_si256();
+                _mm256_packus_epi16(
+                    _mm256_avg_epu16(_mm256_maddubs_epi16(lo, one), z),
+                    _mm256_avg_epu16(_mm256_maddubs_epi16(hi, one), z),
+                )
+            }
+        }
+
+        /// `round2(a * w.0 + b * w.1, 5)` of the byte pairs `w`, saturated to the grain range.
+        #[inline(always)]
+        fn blend(a: __m256i, b: __m256i, w: __m256i, k: K) -> __m256i {
+            unsafe {
+                let lo = _mm256_mulhrs_epi16(_mm256_maddubs_epi16(w, _mm256_unpacklo_epi8(a, b)), k.round5);
+                let hi = _mm256_mulhrs_epi16(_mm256_maddubs_epi16(w, _mm256_unpackhi_epi8(a, b)), k.round5);
+                _mm256_packs_epi16(lo, hi)
+            }
+        }
+
+        /// `g` with its first dword (of each half for two rows) blended with the left grain `l`
+        /// by `w`, whose weights past the overlap keep `g`.
+        #[inline(always)]
+        fn hblend(l: __m256i, g: __m256i, w: __m256i, k: K, two: bool) -> __m256i {
+            let x = blend(l, g, w, k);
+            unsafe {
+                if two {
+                    _mm256_blend_epi32::<0x11>(g, x)
+                } else {
+                    _mm256_blend_epi32::<0x01>(g, x)
+                }
+            }
+        }
+
+        /// Blocks per picture row borrow: rows are borrowed once for this many blocks.
+        pub(super) const CHUNK: usize = 16;
+
+        pub(super) const LUT_LEN: usize = GRAIN_WIDTH * (GRAIN_HEIGHT + 1);
+
+        /// Where the grain of a chunk's blocks starts in the flattened LUT (as [`lut_at`]: own,
+        /// left, top, top left), and whether its first block blends with the left; the others
+        /// do when the strip overlaps.
+        pub(super) struct Chunk {
+            pub(super) pos: [[usize; 4]; CHUNK],
+            pub(super) xover0: bool,
+        }
+
+        /// The offsets of the blocks along the strip.
+        pub(super) struct Offsets {
+            seed: [c_uint; 2],
+            rows: usize,
+            cur: [[c_int; 2]; 2],
+            overlap: bool,
+        }
+
+        impl Offsets {
+            #[inline(always)]
+            pub(super) fn new(data: &Rav1dFilmGrainData, row_num: usize) -> Self {
+                let rows = 1 + (data.overlap_flag && row_num > 0) as usize;
+                Self { seed: row_seed(rows, row_num, data), rows, cur: [[0; 2]; 2], overlap: data.overlap_flag }
+            }
+
+            /// The positions of the `n` blocks from block `b0` on.
+            #[inline(always)]
+            pub(super) fn chunk(&mut self, b0: usize, n: usize, sx: bool, sy: bool) -> Chunk {
+                let mut c = Chunk { pos: [[0; 4]; CHUNK], xover0: self.overlap && b0 != 0 };
+                let w = FG_BLOCK_SIZE >> sx as usize;
+                for i in 0..n {
+                    if self.overlap && b0 + i != 0 {
+                        self.cur[1] = self.cur[0];
+                    }
+                    for r in 0..self.rows {
+                        self.cur[0][r] = get_random_number(8, &mut self.seed[r]);
+                    }
+                    for (k, (bx, by)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
+                        let (oy, ox) = lut_at(&self.cur, sx, sy, bx, by);
+                        // Already within the row.
+                        c.pos[i][k] = oy * GRAIN_WIDTH + ox.min(GRAIN_WIDTH - if bx == 0 { w } else { 4 });
+                    }
+                }
+                c
+            }
+        }
+
+        struct Strip<'a> {
+            lut: &'a GrainLut<i8>,
+            wh: __m256i,
+            t: &'a Scaling,
+            k: K,
+            uv: Option<(__m256i, __m256i)>,
+        }
+
+        impl Strip<'_> {
+            /// `W` grain bytes from `i` (and from the next row in the upper half).
+            #[inline(always)]
+            fn lut_get<const W: usize>(&self, i: usize) -> __m256i {
+                // No grain starts later, and the bound spares the loads their checks.
+                let i = i.min(LUT_LEN - GRAIN_WIDTH - 32);
+                let lut = self.lut.as_flattened();
+                if W == 32 {
+                    load32(&lut[i..])
+                } else {
+                    load16x2(&lut[i..], &lut[i + GRAIN_WIDTH..])
+                }
+            }
+
+            #[inline(always)]
+            fn lut_left(&self, i: usize, dy: usize) -> __m256i {
+                let i = i.min(LUT_LEN - GRAIN_WIDTH - 4);
+                let lut = self.lut.as_flattened();
+                load4x2(&lut[i..], &lut[i + dy..])
+            }
+
+            /// The grain of the block at `p` in row `y` (and `y + 1` for sixteen wide blocks),
+            /// blended as the overlaps ask, with the top by `wv` for `TOP`.
+            #[inline(always)]
+            fn grain<const W: usize, const TOP: bool>(
+                &self,
+                p: &[usize; 4],
+                xover: bool,
+                y: usize,
+                wv: __m256i,
+            ) -> __m256i {
+                let (two, dy) = (W == 16, (W == 16) as usize * GRAIN_WIDTH);
+                let y = y * GRAIN_WIDTH;
+                let mut g = self.lut_get::<W>(p[0] + y);
+                if xover {
+                    g = hblend(self.lut_left(p[1] + y, dy), g, self.wh, self.k, two);
+                }
+                if TOP {
+                    let mut t = self.lut_get::<W>(p[2] + y);
+                    if xover {
+                        t = hblend(self.lut_left(p[3] + y, dy), t, self.wh, self.k, two);
+                    }
+                    g = blend(t, g, wv, self.k);
+                }
+                g
+            }
+
+            /// The scaling indices of the chroma `s` over the luma `l`.
+            #[inline(always)]
+            fn uv_idx(&self, l: __m256i, s: __m256i) -> __m256i {
+                let Some((mults, offset)) = self.uv else { return l };
+                unsafe {
+                    let lo = _mm256_maddubs_epi16(_mm256_unpacklo_epi8(l, s), mults);
+                    let hi = _mm256_maddubs_epi16(_mm256_unpackhi_epi8(l, s), mults);
+                    _mm256_packus_epi16(
+                        _mm256_add_epi16(_mm256_srai_epi16::<6>(lo), offset),
+                        _mm256_add_epi16(_mm256_srai_epi16::<6>(hi), offset),
+                    )
+                }
+            }
+
+            #[inline(always)]
+            fn px32<const UV: bool>(&self, s: __m256i, l: __m256i, g: __m256i) -> __m256i {
+                let idx = if UV { self.uv_idx(l, s) } else { s };
+                noise_px(s, idx, g, self.t, self.k)
+            }
+
+            /// Block `i` of a row of 32 wide blocks through copies: the last, narrower one.
+            #[inline(always)]
+            fn part32<const UV: bool, const TOP: bool>(
+                &self,
+                p: &[usize; 4],
+                xover: bool,
+                src: &[u8],
+                luma: &[u8],
+                dst: &mut [u8],
+                y: usize,
+                wv: __m256i,
+            ) {
+                let n = src.len();
+                let (mut sb, mut lb) = ([0; 32], [0; 32]);
+                sb[..n].copy_from_slice(src);
+                if UV {
+                    lb[..n].copy_from_slice(&luma[..n]);
+                }
+                let g = self.grain::<32, TOP>(p, xover, y, wv);
+                let s = load32(&sb);
+                let l = if UV { load32(&lb) } else { s };
+                store32(self.px32::<UV>(s, l, g), &mut sb);
+                dst.copy_from_slice(&sb[..n]);
+            }
+        }
+
+        /// One row of 32 wide blocks: luma (`luma` is `src`) or chroma over unsubsampled luma.
+        #[target_feature(enable = "avx2")]
+        #[inline(never)]
+        fn row32<const UV: bool, const TOP: bool, const XOVER: bool>(
+            s: &Strip,
+            c: &Chunk,
+            src: &[u8],
+            luma: &[u8],
+            dst: &mut [u8],
+            y: usize,
+            wv: __m256i,
+        ) {
+            let (mut sc, mut lc, mut dc) = (src.chunks_exact(32), luma.chunks_exact(32), dst.chunks_exact_mut(32));
+            let mut i = 0;
+            for ((s32, l32), d32) in (&mut sc).zip(&mut lc).zip(&mut dc) {
+                let xover = if i == 0 { c.xover0 } else { XOVER };
+                let g = s.grain::<32, TOP>(&c.pos[i % CHUNK], xover, y, wv);
+                let sv = load32(s32);
+                let lv = if UV { load32(l32) } else { sv };
+                store32(s.px32::<UV>(sv, lv, g), d32);
+                i += 1;
+            }
+            let (sr, lr, dr) = (sc.remainder(), lc.remainder(), dc.into_remainder());
+            if !sr.is_empty() {
+                let xover = if i == 0 { c.xover0 } else { XOVER };
+                s.part32::<UV, TOP>(&c.pos[i % CHUNK], xover, sr, lr, dr, y, wv);
+            }
+        }
+
+        /// Two chroma rows of sixteen wide blocks over luma averaged in pairs.
+        #[target_feature(enable = "avx2")]
+        #[inline(never)]
+        fn pair16<const TOP: bool, const XOVER: bool>(
+            s: &Strip,
+            c: &Chunk,
+            src: [&[u8]; 2],
+            luma: [&[u8]; 2],
+            dst: [&mut [u8]; 2],
+            y: usize,
+            wv: __m256i,
+        ) {
+            let [sa, sb] = src;
+            let [la, lb] = luma;
+            let [da, db] = dst;
+            let n = sa.len();
+            let it = sa.chunks_exact(16).zip(sb.chunks_exact(16)).zip(la.chunks_exact(32).zip(lb.chunks_exact(32)));
+            let mut i = 0;
+            for (((sa, sb), (la, lb)), (da, db)) in it.zip(da.chunks_exact_mut(16).zip(db.chunks_exact_mut(16))) {
+                let xover = if i == 0 { c.xover0 } else { XOVER };
+                let g = s.grain::<16, TOP>(&c.pos[i % CHUNK], xover, y, wv);
+                let l = avg_pairs(load16x2(&la[..16], &lb[..16]), load16x2(&la[16..], &lb[16..]));
+                let sv = load16x2(sa, sb);
+                store16x2(noise_px(sv, s.uv_idx(l, sv), g, s.t, s.k), da, db);
+                i += 1;
+            }
+            let x = 16 * i;
+            if x < n {
+                let w = n - x;
+                let (mut sv, mut l) = ([0; 32], [[0; 32]; 2]);
+                sv[..w].copy_from_slice(&sa[x..]);
+                sv[16..][..w].copy_from_slice(&sb[x..]);
+                l[0][..2 * w].copy_from_slice(&la[2 * x..][..2 * w]);
+                l[1][..2 * w].copy_from_slice(&lb[2 * x..][..2 * w]);
+                let xover = if i == 0 { c.xover0 } else { XOVER };
+                let g = s.grain::<16, TOP>(&c.pos[i % CHUNK], xover, y, wv);
+                let lv = avg_pairs(load16x2(&l[0][..16], &l[1][..16]), load16x2(&l[0][16..], &l[1][16..]));
+                let v = load32(&sv);
+                store32(noise_px(v, s.uv_idx(lv, v), g, s.t, s.k), &mut sv);
+                da[x..].copy_from_slice(&sv[..w]);
+                db[x..].copy_from_slice(&sv[16..][..w]);
+            }
+        }
+
+        type Row<'a> = Rav1dPictureDataComponentOffset<'a>;
+
+        /// Row `y` of `row` from column `x`.
+        #[inline(always)]
+        fn at(row: Row, y: usize, x: usize) -> Row {
+            row + y as isize * row.pixel_stride::<BitDepth8>() + x
+        }
+
+        /// The rows of 32 wide blocks of a strip, luma or (`UV`) unsubsampled chroma.
+        #[inline(always)]
+        fn strip32<const UV: bool, const XOVER: bool>(
+            s: &Strip,
+            dst_row: Row,
+            src_row: Row,
+            luma_row: Row,
+            pw: usize,
+            bh: usize,
+            ystart: usize,
+            wv: [__m256i; 2],
+            o: &mut Offsets,
+        ) {
+            let nb = pw.div_ceil(FG_BLOCK_SIZE);
+            for b0 in (0..nb).step_by(CHUNK) {
+                let c = o.chunk(b0, cmp::min(CHUNK, nb - b0), false, false);
+                let x0 = b0 * FG_BLOCK_SIZE;
+                let w = cmp::min(CHUNK * FG_BLOCK_SIZE, pw - x0);
+                for y in 0..bh {
+                    let src = at(src_row, y, x0).slice::<BitDepth8>(w);
+                    let luma = if UV { Some(at(luma_row, y, x0).slice::<BitDepth8>(w)) } else { None };
+                    let luma = luma.as_deref().unwrap_or(&src);
+                    let mut dst = at(dst_row, y, x0).slice_mut::<BitDepth8>(w);
+                    // SAFETY: AVX2 is checked before the callers are chosen.
+                    unsafe {
+                        if y < ystart {
+                            row32::<UV, true, XOVER>(s, &c, &src, luma, &mut dst, y, wv[y]);
+                        } else {
+                            row32::<UV, false, XOVER>(s, &c, &src, luma, &mut dst, y, s.wh);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub fn fgy(
+            dst_row: Row,
+            src_row: Row,
+            data: &Rav1dFilmGrainData,
+            pw: usize,
+            t: &Scaling,
+            lut: &GrainLut<i8>,
+            bh: usize,
+            row_num: usize,
+        ) {
+            let s = Strip {
+                lut,
+                wh: _mm256_broadcastq_epi64(_mm_setr_epi8(27, 17, 17, 27, 0, 32, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0)),
+                t,
+                k: K::new(data, 235),
+                uv: None,
+            };
+            let wv = [pairs(27, 17), pairs(17, 27)];
+            let ystart = if data.overlap_flag && row_num != 0 { cmp::min(2, bh) } else { 0 };
+            let mut o = Offsets::new(data, row_num);
+            if data.overlap_flag {
+                strip32::<false, true>(&s, dst_row, src_row, src_row, pw, bh, ystart, wv, &mut o);
+            } else {
+                strip32::<false, false>(&s, dst_row, src_row, src_row, pw, bh, ystart, wv, &mut o);
+            }
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub fn fguv<const SX: bool, const SY: bool>(
+            dst_row: Row,
+            src_row: Row,
+            data: &Rav1dFilmGrainData,
+            pw: usize,
+            t: &Scaling,
+            lut: &GrainLut<i8>,
+            bh: usize,
+            row_num: usize,
+            luma_row: Row,
+            is_uv: bool,
+            is_id: bool,
+        ) {
+            let sy = SY as usize;
+            let pl = is_uv as usize;
+            let uv = if data.chroma_scaling_from_luma {
+                None
+            } else {
+                Some((
+                    pairs(data.uv_luma_mult[pl] as u8, data.uv_mult[pl] as u8),
+                    _mm256_set1_epi16(data.uv_offset[pl] as i16),
+                ))
+            };
+            let wh = _mm256_broadcastq_epi64(if SX {
+                _mm_setr_epi8(23, 22, 0, 32, 0, 32, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0)
+            } else {
+                _mm_setr_epi8(27, 17, 17, 27, 0, 32, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0)
+            });
+            let s = Strip { lut, wh, t, k: K::new(data, if is_id { 235 } else { 240 }), uv };
+            let ystart = if data.overlap_flag && row_num != 0 { cmp::min(2 >> sy, bh) } else { 0 };
+            let mut o = Offsets::new(data, row_num);
+            if !SX {
+                let wv = [pairs(27, 17), pairs(17, 27)];
+                if data.overlap_flag {
+                    strip32::<true, true>(&s, dst_row, src_row, luma_row, pw, bh, ystart, wv, &mut o);
+                } else {
+                    strip32::<true, false>(&s, dst_row, src_row, luma_row, pw, bh, ystart, wv, &mut o);
+                }
+                return;
+            }
+            // The top weights of the first two rows, as a pair in one register.
+            let (a, b) = if SY { (pairs(23, 22), pairs(0, 32)) } else { (pairs(27, 17), pairs(17, 27)) };
+            let wv = _mm256_blend_epi32::<0xf0>(a, b);
+            let nb = pw.div_ceil(16);
+            for b0 in (0..nb).step_by(CHUNK) {
+                let c = o.chunk(b0, cmp::min(CHUNK, nb - b0), SX, SY);
+                let x0 = b0 * 16;
+                let w = cmp::min(CHUNK * 16, pw - x0);
+                let mut spare = [0; CHUNK * 16];
+                for y in (0..bh).step_by(2) {
+                    let two = y + 1 < bh;
+                    let y1 = y + two as usize;
+                    let la = at(luma_row, y << sy, x0 << 1).slice::<BitDepth8>(w << 1);
+                    let lb = at(luma_row, y1 << sy, x0 << 1).slice::<BitDepth8>(w << 1);
+                    let sa = at(src_row, y, x0).slice::<BitDepth8>(w);
+                    let sb = at(src_row, y1, x0).slice::<BitDepth8>(w);
+                    let mut da = at(dst_row, y, x0).slice_mut::<BitDepth8>(w);
+                    let mut db;
+                    let db = if two {
+                        db = at(dst_row, y1, x0).slice_mut::<BitDepth8>(w);
+                        &mut *db
+                    } else {
+                        &mut spare[..w]
+                    };
+                    let (src, luma, dst) = ([&*sa, &*sb], [&*la, &*lb], [&mut *da, db]);
+                    match (y == 0 && ystart > 0, data.overlap_flag) {
+                        (true, true) => pair16::<true, true>(&s, &c, src, luma, dst, y, wv),
+                        (true, false) => pair16::<true, false>(&s, &c, src, luma, dst, y, wv),
+                        (false, true) => pair16::<false, true>(&s, &c, src, luma, dst, y, wh),
+                        (false, false) => pair16::<false, false>(&s, &c, src, luma, dst, y, wh),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The 10 and 12 bpc AVX2 kernels: sixteen pixels per register, two for a row of a 32
+    /// wide block or for two rows of a sixteen wide one. The scaling bytes come from dword
+    /// gathers at the even and odd words, and `pmaddubsw` scales them past the byte above.
+    #[cfg(target_arch = "x86_64")]
+    pub mod avx2_16 {
+        use std::arch::x86_64::*;
+
+        use super::avx2_8::{Chunk, Offsets, CHUNK, LUT_LEN};
+        use super::*;
+        use crate::include::common::bitdepth::BitDepth16;
+
+        #[derive(Clone, Copy)]
+        struct K {
+            /// `1 << 14 - scaling_shift` in the low bytes.
+            mul: __m256i,
+            min: __m256i,
+            max: __m256i,
+            gmin: __m256i,
+            gmax: __m256i,
+            /// `bitdepth_max` in the dwords' low words, and in all words.
+            idx_mask: __m256i,
+            pixel_max: __m256i,
+            round5: __m256i,
+        }
+
+        // SAFETY (every `unsafe` here): these are only inlined into the `avx2` functions below,
+        // loads and stores go through slices of the length they access, and gathers read
+        // `t[i..i + 4]` for `i` masked to `bitdepth_max`, which `fgy` and `fguv` check.
+        impl K {
+            #[inline(always)]
+            fn new(data: &Rav1dFilmGrainData, max_restricted: i32, bitdepth_max: i32) -> Self {
+                let b8 = (bitdepth_max + 1).ilog2() - 8;
+                let (min, max) = if data.clip_to_restricted_range {
+                    (16 << b8, max_restricted << b8)
+                } else {
+                    (0, bitdepth_max)
+                };
+                let ctr = 128 << b8;
+                unsafe {
+                    Self {
+                        mul: _mm256_set1_epi16(1 << (14 - data.scaling_shift)),
+                        min: _mm256_set1_epi16(min as i16),
+                        max: _mm256_set1_epi16(max as i16),
+                        gmin: _mm256_set1_epi16(-ctr as i16),
+                        gmax: _mm256_set1_epi16((ctr - 1) as i16),
+                        idx_mask: _mm256_set1_epi32(bitdepth_max),
+                        pixel_max: _mm256_set1_epi16(bitdepth_max as i16),
+                        round5: _mm256_set1_epi32(16),
+                    }
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn load<T: AsBytes>(s: &[T]) -> __m256i {
+            unsafe { _mm256_loadu_si256(s.as_bytes()[..32].as_ptr().cast()) }
+        }
+
+        #[inline(always)]
+        fn store(v: __m256i, d: &mut [u16]) {
+            unsafe { _mm256_storeu_si256(d.as_bytes_mut()[..32].as_mut_ptr().cast(), v) }
+        }
+
+        #[inline(always)]
+        fn dword_pairs(lo: i32, hi: i32) -> __m256i {
+            unsafe { _mm256_set1_epi32((lo & 0xffff) | hi << 16) }
+        }
+
+        /// Words whose low byte is `t[v & bitdepth_max]`.
+        #[inline(always)]
+        fn scaling(t: &[u8], v: __m256i, k: K) -> __m256i {
+            unsafe {
+                let p = t.as_ptr().cast();
+                let even = _mm256_and_si256(v, k.idx_mask);
+                let odd = _mm256_and_si256(_mm256_srli_epi32::<16>(v), k.idx_mask);
+                let a = _mm256_i32gather_epi32::<1>(p, even);
+                let b = _mm256_i32gather_epi32::<1>(p, odd);
+                _mm256_blend_epi16::<0xaa>(a, _mm256_slli_epi32::<16>(b))
+            }
+        }
+
+        /// The pixels `s` plus the noise of the grain `g` scaled by `t` at `idx`, clipped.
+        #[inline(always)]
+        fn noise_px(s: __m256i, idx: __m256i, g: __m256i, t: &[u8], k: K) -> __m256i {
+            unsafe {
+                let m = _mm256_maddubs_epi16(scaling(t, idx, k), k.mul);
+                let n = _mm256_mulhrs_epi16(g, _mm256_add_epi16(m, m));
+                _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(s, n), k.min), k.max)
+            }
+        }
+
+        /// `round2(a * w.0 + b * w.1, 5)` of the word pairs `w`, clipped to the grain range.
+        #[inline(always)]
+        fn blend(a: __m256i, b: __m256i, w: __m256i, k: K) -> __m256i {
+            unsafe {
+                let lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), w);
+                let hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), w);
+                let lo = _mm256_srai_epi32::<5>(_mm256_add_epi32(lo, k.round5));
+                let hi = _mm256_srai_epi32::<5>(_mm256_add_epi32(hi, k.round5));
+                _mm256_min_epi16(_mm256_max_epi16(_mm256_packs_epi32(lo, hi), k.gmin), k.gmax)
+            }
+        }
+
+        /// `g` with its first two words blended with the left grain `l` by `w`, whose weights
+        /// for the second keep `g` when only one overlaps.
+        #[inline(always)]
+        fn hblend(l: i32, g: __m256i, w: __m128i, k: K) -> __m256i {
+            unsafe {
+                let g0 = _mm256_castsi256_si128(g);
+                let x = _mm_madd_epi16(_mm_unpacklo_epi16(_mm_cvtsi32_si128(l), g0), w);
+                let x = _mm_srai_epi32::<5>(_mm_add_epi32(x, _mm256_castsi256_si128(k.round5)));
+                let x = _mm_packs_epi32(x, x);
+                let x = _mm_min_epi16(_mm_max_epi16(x, _mm256_castsi256_si128(k.gmin)), _mm256_castsi256_si128(k.gmax));
+                _mm256_blend_epi32::<0x01>(g, _mm256_castsi128_si256(x))
+            }
+        }
+
+        struct Strip<'a> {
+            lut: &'a GrainLut<i16>,
+            wh: __m128i,
+            t: &'a [u8],
+            k: K,
+            uv: Option<(__m256i, __m256i)>,
+        }
+
+        impl Strip<'_> {
+            #[inline(always)]
+            fn lut_get(&self, i: usize) -> __m256i {
+                // No grain reaches the end, and the bound spares the load its checks.
+                load(&self.lut.as_flattened()[i.min(LUT_LEN - 16)..])
+            }
+
+            #[inline(always)]
+            fn lut_left(&self, i: usize) -> i32 {
+                let l = &self.lut.as_flattened()[i.min(LUT_LEN - 2)..][..2];
+                i32::from_le_bytes(l.as_bytes().try_into().unwrap())
+            }
+
+            /// The grain of the block at `p` in row `y`, as two vectors: its two halves for
+            /// 32 wide blocks (`W`), rows `y` and `y + 1` for sixteen wide ones, blended as the
+            /// overlaps ask, with the top by `wv` (per row) for `TOP`.
+            #[inline(always)]
+            fn grain<const W: usize, const TOP: bool>(
+                &self,
+                p: &[usize; 4],
+                xover: bool,
+                y: usize,
+                wv: [__m256i; 2],
+            ) -> [__m256i; 2] {
+                let rows = W == 16;
+                let y = y * GRAIN_WIDTH;
+                let d = if rows { GRAIN_WIDTH } else { 16 };
+                let mut g = [self.lut_get(p[0] + y), self.lut_get(p[0] + y + d)];
+                let mut t = if TOP { [self.lut_get(p[2] + y), self.lut_get(p[2] + y + d)] } else { g };
+                if xover {
+                    g[0] = hblend(self.lut_left(p[1] + y), g[0], self.wh, self.k);
+                    if TOP {
+                        t[0] = hblend(self.lut_left(p[3] + y), t[0], self.wh, self.k);
+                    }
+                    if rows {
+                        g[1] = hblend(self.lut_left(p[1] + y + d), g[1], self.wh, self.k);
+                        if TOP {
+                            t[1] = hblend(self.lut_left(p[3] + y + d), t[1], self.wh, self.k);
+                        }
+                    }
+                }
+                if TOP {
+                    g[0] = blend(t[0], g[0], wv[0], self.k);
+                    g[1] = blend(t[1], g[1], wv[1], self.k);
+                }
+                g
+            }
+
+            /// The scaling indices of the chroma `s` over the luma `l`.
+            #[inline(always)]
+            fn uv_idx(&self, l: __m256i, s: __m256i) -> __m256i {
+                let Some((mults, offset)) = self.uv else { return l };
+                unsafe {
+                    let lo = _mm256_srai_epi32::<6>(_mm256_madd_epi16(_mm256_unpacklo_epi16(l, s), mults));
+                    let hi = _mm256_srai_epi32::<6>(_mm256_madd_epi16(_mm256_unpackhi_epi16(l, s), mults));
+                    let v = _mm256_add_epi16(_mm256_packs_epi32(lo, hi), offset);
+                    _mm256_min_epi16(_mm256_max_epi16(v, _mm256_setzero_si256()), self.k.pixel_max)
+                }
+            }
+
+            #[inline(always)]
+            fn px<const UV: bool>(&self, s: __m256i, l: __m256i, g: __m256i) -> __m256i {
+                let idx = if UV { self.uv_idx(l, s) } else { s };
+                noise_px(s, idx, g, self.t, self.k)
+            }
+
+            /// One block row of 32 pixels in `s`, `l` and `d`.
+            #[inline(always)]
+            fn block32<const UV: bool>(&self, s: &[u16], l: &[u16], d: &mut [u16], g: [__m256i; 2]) {
+                for h in 0..2 {
+                    let sv = load(&s[16 * h..]);
+                    let lv = if UV { load(&l[16 * h..]) } else { sv };
+                    store(self.px::<UV>(sv, lv, g[h]), &mut d[16 * h..]);
+                }
+            }
+        }
+
+        /// One row of 32 wide blocks: luma (`luma` is `src`) or chroma over unsubsampled luma.
+        #[target_feature(enable = "avx2")]
+        #[inline(never)]
+        fn row32<const UV: bool, const TOP: bool, const XOVER: bool>(
+            s: &Strip,
+            c: &Chunk,
+            src: &[u16],
+            luma: &[u16],
+            dst: &mut [u16],
+            y: usize,
+            wv: __m256i,
+        ) {
+            let (mut sc, mut lc, mut dc) = (src.chunks_exact(32), luma.chunks_exact(32), dst.chunks_exact_mut(32));
+            let mut i = 0;
+            for ((s32, l32), d32) in (&mut sc).zip(&mut lc).zip(&mut dc) {
+                let xover = if i == 0 { c.xover0 } else { XOVER };
+                let g = s.grain::<32, TOP>(&c.pos[i % CHUNK], xover, y, [wv; 2]);
+                s.block32::<UV>(s32, l32, d32, g);
+                i += 1;
+            }
+            let (sr, lr, dr) = (sc.remainder(), lc.remainder(), dc.into_remainder());
+            if !sr.is_empty() {
+                let n = sr.len();
+                let (mut sb, mut lb) = ([0; 32], [0; 32]);
+                sb[..n].copy_from_slice(sr);
+                if UV {
+                    lb[..n].copy_from_slice(&lr[..n]);
+                }
+                let xover = if i == 0 { c.xover0 } else { XOVER };
+                let g = s.grain::<32, TOP>(&c.pos[i % CHUNK], xover, y, [wv; 2]);
+                let mut db = [0; 32];
+                s.block32::<UV>(&sb, &lb, &mut db, g);
+                dr.copy_from_slice(&db[..n]);
+            }
+        }
+
+        /// The rounded averages of the pairs of the 32 luma pixels at `l`.
+        #[inline(always)]
+        fn avg_pairs(l: &[u16]) -> __m256i {
+            unsafe {
+                let one = _mm256_set1_epi16(1);
+                let a = _mm256_madd_epi16(load(l), one);
+                let b = _mm256_madd_epi16(load(&l[16..]), one);
+                let v = _mm256_permute4x64_epi64::<0xd8>(_mm256_packus_epi32(a, b));
+                _mm256_avg_epu16(v, _mm256_setzero_si256())
+            }
+        }
+
+        /// Two chroma rows of sixteen wide blocks over luma averaged in pairs.
+        #[target_feature(enable = "avx2")]
+        #[inline(never)]
+        fn pair16<const TOP: bool, const XOVER: bool>(
+            s: &Strip,
+            c: &Chunk,
+            src: [&[u16]; 2],
+            luma: [&[u16]; 2],
+            dst: [&mut [u16]; 2],
+            y: usize,
+            wv: [__m256i; 2],
+        ) {
+            let [sa, sb] = src;
+            let [la, lb] = luma;
+            let [da, db] = dst;
+            let n = sa.len();
+            let it = sa.chunks_exact(16).zip(sb.chunks_exact(16)).zip(la.chunks_exact(32).zip(lb.chunks_exact(32)));
+            let mut i = 0;
+            for (((sa, sb), (la, lb)), (da, db)) in it.zip(da.chunks_exact_mut(16).zip(db.chunks_exact_mut(16))) {
+                let xover = if i == 0 { c.xover0 } else { XOVER };
+                let g = s.grain::<16, TOP>(&c.pos[i % CHUNK], xover, y, wv);
+                let (va, vb) = (load(sa), load(sb));
+                store(s.px::<true>(va, avg_pairs(la), g[0]), da);
+                store(s.px::<true>(vb, avg_pairs(lb), g[1]), db);
+                i += 1;
+            }
+            let x = 16 * i;
+            if x < n {
+                let w = n - x;
+                let (mut sv, mut l) = ([[0; 16]; 2], [[0; 32]; 2]);
+                sv[0][..w].copy_from_slice(&sa[x..]);
+                sv[1][..w].copy_from_slice(&sb[x..]);
+                l[0][..2 * w].copy_from_slice(&la[2 * x..][..2 * w]);
+                l[1][..2 * w].copy_from_slice(&lb[2 * x..][..2 * w]);
+                let xover = if i == 0 { c.xover0 } else { XOVER };
+                let g = s.grain::<16, TOP>(&c.pos[i % CHUNK], xover, y, wv);
+                for r in 0..2 {
+                    let v = load(&sv[r]);
+                    let out = s.px::<true>(v, avg_pairs(&l[r]), g[r]);
+                    store(out, &mut sv[r]);
+                }
+                da[x..].copy_from_slice(&sv[0][..w]);
+                db[x..].copy_from_slice(&sv[1][..w]);
+            }
+        }
+
+        type Row<'a> = Rav1dPictureDataComponentOffset<'a>;
+
+        #[inline(always)]
+        fn at(row: Row, y: usize, x: usize) -> Row {
+            row + y as isize * row.pixel_stride::<BitDepth16>() + x
+        }
+
+        #[inline(always)]
+        fn strip32<const UV: bool, const XOVER: bool>(
+            s: &Strip,
+            dst_row: Row,
+            src_row: Row,
+            luma_row: Row,
+            pw: usize,
+            bh: usize,
+            ystart: usize,
+            wv: [__m256i; 2],
+            o: &mut Offsets,
+        ) {
+            let nb = pw.div_ceil(FG_BLOCK_SIZE);
+            for b0 in (0..nb).step_by(CHUNK) {
+                let c = o.chunk(b0, cmp::min(CHUNK, nb - b0), false, false);
+                let x0 = b0 * FG_BLOCK_SIZE;
+                let w = cmp::min(CHUNK * FG_BLOCK_SIZE, pw - x0);
+                for y in 0..bh {
+                    let src = at(src_row, y, x0).slice::<BitDepth16>(w);
+                    let luma = if UV { Some(at(luma_row, y, x0).slice::<BitDepth16>(w)) } else { None };
+                    let luma = luma.as_deref().unwrap_or(&src);
+                    let mut dst = at(dst_row, y, x0).slice_mut::<BitDepth16>(w);
+                    // SAFETY: AVX2 is checked before the callers are chosen.
+                    unsafe {
+                        if y < ystart {
+                            row32::<UV, true, XOVER>(s, &c, &src, luma, &mut dst, y, wv[y]);
+                        } else {
+                            row32::<UV, false, XOVER>(s, &c, &src, luma, &mut dst, y, wv[0]);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The entries of `scaling` up to `bitdepth_max` copied four bytes into an aligned
+        /// table with room for the gathers past them, as [`avx2_8::Scaling`].
+        macro_rules! with_table {
+            ($scaling:expr, $bitdepth_max:expr, |$t:ident| $e:expr) => {{
+                let scaling: &[u8] = $scaling;
+                let n = $bitdepth_max as usize + 1;
+                if n <= 1024 {
+                    let mut p = crate::align::Align64([0; 1024 + 8]);
+                    p.0[4..][..n].copy_from_slice(&scaling[..n]);
+                    let $t = &p.0[4..];
+                    $e
+                } else {
+                    let mut p = crate::align::Align64([0; 4096 + 8]);
+                    p.0[4..][..n].copy_from_slice(&scaling[..n]);
+                    let $t = &p.0[4..];
+                    $e
+                }
+            }};
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub fn fgy(
+            dst_row: Row,
+            src_row: Row,
+            data: &Rav1dFilmGrainData,
+            pw: usize,
+            scaling: &[u8],
+            lut: &GrainLut<i16>,
+            bh: usize,
+            row_num: usize,
+            bitdepth_max: c_int,
+        ) {
+            with_table!(scaling, bitdepth_max, |t| {
+                let s = Strip {
+                    lut,
+                    wh: _mm_setr_epi16(27, 17, 17, 27, 0, 32, 0, 32),
+                    t,
+                    k: K::new(data, 235, bitdepth_max),
+                    uv: None,
+                };
+                let wv = [dword_pairs(27, 17), dword_pairs(17, 27)];
+                let ystart = if data.overlap_flag && row_num != 0 { cmp::min(2, bh) } else { 0 };
+                let mut o = Offsets::new(data, row_num);
+                if data.overlap_flag {
+                    strip32::<false, true>(&s, dst_row, src_row, src_row, pw, bh, ystart, wv, &mut o);
+                } else {
+                    strip32::<false, false>(&s, dst_row, src_row, src_row, pw, bh, ystart, wv, &mut o);
+                }
+            })
+        }
+
+        #[target_feature(enable = "avx2")]
+        pub fn fguv<const SX: bool, const SY: bool>(
+            dst_row: Row,
+            src_row: Row,
+            data: &Rav1dFilmGrainData,
+            pw: usize,
+            scaling: &[u8],
+            lut: &GrainLut<i16>,
+            bh: usize,
+            row_num: usize,
+            luma_row: Row,
+            is_uv: bool,
+            is_id: bool,
+            bitdepth_max: c_int,
+        ) {
+            let sy = SY as usize;
+            let pl = is_uv as usize;
+            let b8 = (bitdepth_max + 1).ilog2() - 8;
+            let uv = if data.chroma_scaling_from_luma {
+                None
+            } else {
+                Some((
+                    dword_pairs(data.uv_luma_mult[pl], data.uv_mult[pl]),
+                    _mm256_set1_epi16((data.uv_offset[pl] << b8) as i16),
+                ))
+            };
+            let wh = if SX {
+                _mm_setr_epi16(23, 22, 0, 32, 0, 32, 0, 32)
+            } else {
+                _mm_setr_epi16(27, 17, 17, 27, 0, 32, 0, 32)
+            };
+            with_table!(scaling, bitdepth_max, |t| {
+                let s = Strip { lut, wh, t, k: K::new(data, if is_id { 235 } else { 240 }, bitdepth_max), uv };
+                let ystart = if data.overlap_flag && row_num != 0 { cmp::min(2 >> sy, bh) } else { 0 };
+                let mut o = Offsets::new(data, row_num);
+                if !SX {
+                    let wv = [dword_pairs(27, 17), dword_pairs(17, 27)];
+                    if data.overlap_flag {
+                        strip32::<true, true>(&s, dst_row, src_row, luma_row, pw, bh, ystart, wv, &mut o);
+                    } else {
+                        strip32::<true, false>(&s, dst_row, src_row, luma_row, pw, bh, ystart, wv, &mut o);
+                    }
+                    return;
+                }
+                let wv = if SY {
+                    [dword_pairs(23, 22), dword_pairs(0, 32)]
+                } else {
+                    [dword_pairs(27, 17), dword_pairs(17, 27)]
+                };
+                let nb = pw.div_ceil(16);
+                for b0 in (0..nb).step_by(CHUNK) {
+                    let c = o.chunk(b0, cmp::min(CHUNK, nb - b0), SX, SY);
+                    let x0 = b0 * 16;
+                    let w = cmp::min(CHUNK * 16, pw - x0);
+                    let mut spare = [0; CHUNK * 16];
+                    for y in (0..bh).step_by(2) {
+                        let two = y + 1 < bh;
+                        let y1 = y + two as usize;
+                        let la = at(luma_row, y << sy, x0 << 1).slice::<BitDepth16>(w << 1);
+                        let lb = at(luma_row, y1 << sy, x0 << 1).slice::<BitDepth16>(w << 1);
+                        let sa = at(src_row, y, x0).slice::<BitDepth16>(w);
+                        let sb = at(src_row, y1, x0).slice::<BitDepth16>(w);
+                        let mut da = at(dst_row, y, x0).slice_mut::<BitDepth16>(w);
+                        let mut db;
+                        let db = if two {
+                            db = at(dst_row, y1, x0).slice_mut::<BitDepth16>(w);
+                            &mut *db
+                        } else {
+                            &mut spare[..w]
+                        };
+                        let (src, luma, dst) = ([&*sa, &*sb], [&*la, &*lb], [&mut *da, db]);
+                        match (y == 0 && ystart > 0, data.overlap_flag) {
+                            (true, true) => pair16::<true, true>(&s, &c, src, luma, dst, y, wv),
+                            (true, false) => pair16::<true, false>(&s, &c, src, luma, dst, y, wv),
+                            (false, true) => pair16::<false, true>(&s, &c, src, luma, dst, y, wv),
+                            (false, false) => pair16::<false, false>(&s, &c, src, luma, dst, y, wv),
+                        }
+                    }
+                }
+            })
         }
     }
 
@@ -1602,6 +2711,23 @@ mod rust_simd {
         // SAFETY: Casting back to the original type from the `fn` ptr call.
         let scaling: &BD::Scaling = unsafe { &*scaling.cast() };
         let (bh, row_num) = (bh as usize, row_num as usize);
+        #[cfg(target_arch = "x86_64")]
+        if AVX2 && BD::BITDEPTH == 8 {
+            // SAFETY: The 8 bpc LUT, of `i8`.
+            let lut = unsafe { &*grain_lut.cast::<GrainLut<i8>>() };
+            let t = avx2_8::Scaling::new(scaling.as_ref());
+            // SAFETY: AVX2 is checked before `AVX2` is chosen.
+            return unsafe { avx2_8::fgy(dst_row, src_row, data, pw, &t, lut, bh, row_num) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if AVX2 {
+            // SAFETY: The high bit depth LUT, of `i16`.
+            let lut = unsafe { &*grain_lut.cast::<GrainLut<i16>>() };
+            // SAFETY: AVX2 is checked before `AVX2` is chosen.
+            return unsafe {
+                avx2_16::fgy(dst_row, src_row, data, pw, scaling.as_ref(), lut, bh, row_num, bitdepth_max)
+            };
+        }
         with_px!(BD, |P| {
             // SAFETY: Casting back to the original type from the `fn` ptr call, `P::E` being `BD::Entry`.
             let lut: &GrainLut<<P as Px>::E> = unsafe { &*grain_lut.cast() };
@@ -1725,6 +2851,30 @@ mod rust_simd {
         let scaling: &BD::Scaling = unsafe { &*scaling.cast() };
         let (bh, row_num) = (bh as usize, row_num as usize);
         let (is_uv, is_id) = (uv_pl != 0, is_id != 0);
+        #[cfg(target_arch = "x86_64")]
+        if AVX2 && BD::BITDEPTH == 8 {
+            // SAFETY: The 8 bpc LUT, of `i8`.
+            let lut = unsafe { &*grain_lut.cast::<GrainLut<i8>>() };
+            let t = avx2_8::Scaling::new(scaling.as_ref());
+            // SAFETY: AVX2 is checked before `AVX2` is chosen.
+            return unsafe {
+                avx2_8::fguv::<IS_SX, IS_SY>(
+                    dst_row, src_row, data, pw, &t, lut, bh, row_num, luma_row, is_uv, is_id,
+                )
+            };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if AVX2 {
+            // SAFETY: The high bit depth LUT, of `i16`.
+            let lut = unsafe { &*grain_lut.cast::<GrainLut<i16>>() };
+            // SAFETY: AVX2 is checked before `AVX2` is chosen.
+            return unsafe {
+                avx2_16::fguv::<IS_SX, IS_SY>(
+                    dst_row, src_row, data, pw, scaling.as_ref(), lut, bh, row_num, luma_row,
+                    is_uv, is_id, bitdepth_max,
+                )
+            };
+        }
         with_px!(BD, |P| {
             // SAFETY: Casting back to the original type from the `fn` ptr call, `P::E` being `BD::Entry`.
             let lut: &GrainLut<<P as Px>::E> = unsafe { &*grain_lut.cast() };
@@ -2204,21 +3354,10 @@ mod tests {
                 );
                 call(&dsps[0].1, layout, &c, &dst, &src, &luma, bd);
                 let want = dst.pixels();
-                // The asm writes whole blocks: past `pw` into the stride's padding.
-                let y0 = c.row_num * 32 >> sub.1 as usize;
-                let visible = |p: &[BD::Pixel]| -> Vec<BD::Pixel> {
-                    (y0..y0 + c.bh)
-                        .flat_map(|y| p[y * STRIDE..][..c.pw].to_vec())
-                        .collect()
-                };
                 for (name, dsp) in &dsps[1..] {
                     dst.reset();
                     call(dsp, layout, &c, &dst, &src, &luma, bd);
-                    let same = if *name == "asm" {
-                        visible(&dst.pixels()) == visible(&want)
-                    } else {
-                        dst.pixels() == want
-                    };
+                    let same = dst.pixels() == want;
                     assert!(
                         same,
                         "{name} differs from scalar at {bits} bits, {sub:?}, case {i}: pw {} bh {} row {} overlap {} clip {} csfl {}",
@@ -2276,32 +3415,11 @@ mod tests {
             for (name, dsp) in &dsps[1..] {
                 let mut y = zero();
                 dsp.generate_grain_y.call(&mut y.0, &data, bd);
-                // The asm may write past the grain, into the LUT's padding.
-                let luma = |g: &GrainLut<BD::Entry>| -> Vec<c_int> {
-                    g[..GRAIN_HEIGHT].iter().flatten().map(|&e| e.as_::<c_int>()).collect()
-                };
-                let same = if *name == "asm" {
-                    luma(&y.0) == luma(&want_y.0)
-                } else {
-                    dump(&y.0) == dump(&want_y.0)
-                };
+                let same = dump(&y.0) == dump(&want_y.0);
                 assert!(same, "{name} grain y differs at {bits} bits, case {i}");
                 let mut uv = zero();
                 dsp.generate_grain_uv[layout].call(&mut uv.0, &want_y.0, &data, is_uv, bd);
-                // The asm may write past the subsampled grain.
-                let (h, w) = match layout {
-                    Rav1dPixelLayoutSubSampled::I420 => (SUB_GRAIN_HEIGHT, SUB_GRAIN_WIDTH),
-                    Rav1dPixelLayoutSubSampled::I422 => (GRAIN_HEIGHT, SUB_GRAIN_WIDTH),
-                    Rav1dPixelLayoutSubSampled::I444 => (GRAIN_HEIGHT, GRAIN_WIDTH),
-                };
-                let region = |g: &GrainLut<BD::Entry>| -> Vec<c_int> {
-                    g[..h].iter().flat_map(|r| r[..w].iter().map(|&e| e.as_::<c_int>())).collect()
-                };
-                let same = if *name == "asm" {
-                    region(&uv.0) == region(&want_uv.0)
-                } else {
-                    dump(&uv.0) == dump(&want_uv.0)
-                };
+                let same = dump(&uv.0) == dump(&want_uv.0);
                 assert!(
                     same,
                     "{name} grain uv differs at {bits} bits, case {i}, lag {}",
@@ -2348,6 +3466,17 @@ mod tests {
                 "{bits:2}-bit {:5}:",
                 layout.map_or("y".into(), |l| format!("uv{}", l as u8))
             );
+            // `FG_BENCH=<context>,<layout index>,<calls>`: only these calls, for perf.
+            if let Ok(only) = std::env::var("FG_BENCH") {
+                let f: Vec<&str> = only.split(',').collect();
+                if f[1].parse::<usize>().unwrap() == LAYOUTS.iter().position(|l| l.0 == layout).unwrap() {
+                    let dsp = contexts::<BD>().into_iter().find(|c| c.0 == f[0]).unwrap().1;
+                    for _ in 0..f[2].parse::<usize>().unwrap() {
+                        call(black_box(&dsp), layout, &c, &dst, &src, &luma, bd);
+                    }
+                }
+                continue;
+            }
             for (name, dsp) in contexts::<BD>() {
                 let mut best = f64::MAX;
                 for _ in 0..7 {
@@ -2360,6 +3489,9 @@ mod tests {
                 line += &format!("  {name} {best:8.0} ns");
             }
             println!("{line}");
+        }
+        if std::env::var("FG_BENCH").is_ok() {
+            return;
         }
         let mut data = Rav1dFilmGrainData::default();
         data.seed = 0x1234;
