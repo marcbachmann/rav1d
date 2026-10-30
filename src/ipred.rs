@@ -468,6 +468,7 @@ mod rust_simd {
     use zerocopy::{AsBytes, FromBytes};
 
     use super::*;
+    use crate::pixels::Pixels as _;
     use crate::simd128::{transpose8x8, I16x8, I32x4};
 
     pub const SMOOTH: u8 = 0;
@@ -595,29 +596,60 @@ mod rust_simd {
         fn put(&mut self, y: usize, x: usize, px: &[P]);
     }
 
-    /// A block of the picture, each row borrowed on its own as it is written: one borrow
-    /// over the block would also take the pixels between its rows, which belong to other
-    /// blocks that other threads may be writing.
-    struct Block<'a, BD> {
+    /// A `w` by `h` block of the picture, written a row at a time: one borrow over the block
+    /// would also take the pixels between its rows, which belong to other blocks that other
+    /// threads may be writing. The extent is checked once; each row is then stored through
+    /// the picture's pointer as the asm does, and borrowed on its own with debug assertions,
+    /// where the borrows are checked for overlap.
+    struct Block<'a, BD: BitDepth> {
+        #[cfg(debug_assertions)]
         dst: Rav1dPictureDataComponentOffset<'a>,
+        #[cfg(not(debug_assertions))]
+        at: *mut BD::Pixel,
         stride: isize,
-        _bd: std::marker::PhantomData<BD>,
+        w: usize,
+        h: usize,
+        _dst: std::marker::PhantomData<&'a BD>,
     }
 
     impl<'a, BD: BitDepth> Block<'a, BD> {
         #[inline(always)]
-        fn new(dst: Rav1dPictureDataComponentOffset<'a>) -> Self {
+        fn new(dst: Rav1dPictureDataComponentOffset<'a>, w: usize, h: usize) -> Self {
             let stride = dst.pixel_stride::<BD>();
-            Self { dst, stride, _bd: std::marker::PhantomData }
+            let len = dst.data.pixel_len::<BD>();
+            let last = dst.offset as isize + (h as isize - 1) * stride;
+            // The rows between the first and the last lie between them.
+            assert!(h > 0 && dst.offset + w <= len && last >= 0 && last as usize + w <= len);
+            Self {
+                #[cfg(debug_assertions)]
+                dst,
+                #[cfg(not(debug_assertions))]
+                at: dst.data.as_mut_ptr::<BD>().wrapping_add(dst.offset),
+                stride,
+                w,
+                h,
+                _dst: std::marker::PhantomData,
+            }
         }
     }
 
     impl<BD: BitDepth, P: Pix> Rows<P> for Block<'_, BD> {
         #[inline(always)]
         fn put(&mut self, y: usize, x: usize, px: &[P]) {
-            let at = self.dst + (y as isize * self.stride + x as isize);
-            let mut row = at.slice_mut::<BD>(px.len());
-            px_mut::<P>(row.as_bytes_mut()).copy_from_slice(px);
+            assert!(size_of::<P>() == size_of::<BD::Pixel>() && y < self.h && x + px.len() <= self.w);
+            #[cfg(debug_assertions)]
+            {
+                let at = self.dst + (y as isize * self.stride + x as isize);
+                let mut row = at.slice_mut::<BD>(px.len());
+                px_mut::<P>(row.as_bytes_mut()).copy_from_slice(px);
+            }
+            #[cfg(not(debug_assertions))]
+            // SAFETY: `new` checked that rows `..h` of `w` pixels lie in the picture, and the row
+            // is one of them. Only this block's thread writes these pixels, as for the asm.
+            unsafe {
+                let row = self.at.offset(y as isize * self.stride + x as isize);
+                std::ptr::copy_nonoverlapping(px.as_ptr(), row.cast::<P>(), px.len());
+            }
         }
     }
 
@@ -648,6 +680,23 @@ mod rust_simd {
         v
     }
 
+    /// The edge around `topleft[off]`, where it is at 64: the 64 pixels left of it, then the
+    /// 64 above. One bounds check for the edge.
+    #[inline(always)]
+    fn edge_window<P>(topleft: &[P], off: usize) -> &[P; 129] {
+        topleft[off - 64..][..129].try_into().unwrap()
+    }
+
+    /// The sum of `px[..N]`, `N` a power of two from 4.
+    #[inline(always)]
+    fn edge_sum<P: Pix, const N: usize>(px: &[P]) -> u32 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if size_of::<P>() == 1 {
+            return crate::simd128::sum_u8::<N>(px.as_bytes());
+        }
+        lanes::<P, N>(px).hsum_u()
+    }
+
     /// `half` is the DC_128 value, half the pixel range.
     #[inline(always)]
     fn dc_value<P: Pix, const W: usize, const H: usize, const GEN: u8>(
@@ -655,17 +704,19 @@ mod rust_simd {
         off: usize,
         half: u32,
     ) -> P {
+        let e = edge_window(topleft, off);
+        let (top, left) = (&e[65..][..W], &e[64 - H..][..H]);
         // No closures for the edges: they would not inherit the kernel's target features.
         let dc = match DcGen::from_repr(GEN) {
-            Some(DcGen::Top) => {
-                lanes::<P, W>(&topleft[off + 1..]).hsum_u() + (W >> 1) as u32 >> W.trailing_zeros()
-            }
-            Some(DcGen::Left) => {
-                lanes::<P, H>(&topleft[off - H..]).hsum_u() + (H >> 1) as u32 >> H.trailing_zeros()
-            }
+            Some(DcGen::Top) => edge_sum::<P, W>(top) + (W >> 1) as u32 >> W.trailing_zeros(),
+            Some(DcGen::Left) => edge_sum::<P, H>(left) + (H >> 1) as u32 >> H.trailing_zeros(),
             Some(DcGen::TopLeft) => {
-                let top = lanes::<P, W>(&topleft[off + 1..]);
-                let sum = top.add(lanes::<P, H>(&topleft[off - H..])).hsum_u();
+                let sum = if size_of::<P>() == 1 && cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+                    edge_sum::<P, W>(top) + edge_sum::<P, H>(left)
+                } else {
+                    // Up to 64 + 64 pixels fit the lanes as `u16` to 12 bpc.
+                    lanes::<P, W>(top).add(lanes::<P, H>(left)).hsum_u()
+                };
                 let dc = sum + ((W + H) >> 1) as u32 >> (W + H).trailing_zeros();
                 // 1/3 and 1/5 in fixed point, finer for the larger sums of `u16` pixels.
                 let (third, fifth, shift) =
@@ -689,7 +740,7 @@ mod rust_simd {
         half: u32,
     ) {
         let row = [dc_value::<P, W, H, GEN>(topleft, off, half); W];
-        let mut block = Block::<BD>::new(dst);
+        let mut block = Block::<BD>::new(dst, W, H);
         for y in 0..H {
             block.put(y, 0, &row);
         }
@@ -830,7 +881,7 @@ mod rust_simd {
         w: c_int,
         h: usize,
     ) {
-        let b = &mut Block::<BD>::new(dst);
+        let b = &mut Block::<BD>::new(dst, w as usize, h);
         with_px!(BD, |P| {
             let t = px::<P>(topleft.as_bytes());
             match w {
@@ -902,7 +953,7 @@ mod rust_simd {
         w: c_int,
         h: usize,
     ) {
-        let b = &mut Block::<BD>::new(dst);
+        let b = &mut Block::<BD>::new(dst, w as usize, h);
         with_px!(BD, |P| {
             let t = px::<P>(topleft.as_bytes());
             match w {
@@ -980,7 +1031,7 @@ mod rust_simd {
         max: i16,
     ) {
         let taps = &DAV1D_FILTER_INTRA_TAPS[(filt_idx & 511) as usize].0;
-        let b = &mut Block::<BD>::new(dst);
+        let b = &mut Block::<BD>::new(dst, w as usize, h);
         with_px!(BD, |P| {
             let t = px::<P>(topleft.as_bytes());
             match w {
@@ -1049,7 +1100,7 @@ mod rust_simd {
         alpha: c_int,
         bitdepth_max: c_int,
     ) {
-        let b = &mut Block::<BD>::new(dst);
+        let b = &mut Block::<BD>::new(dst, width as usize, height as usize);
         with_px!(BD, |P| {
             let t = px::<P>(topleft.as_bytes());
             by_size!(width, height, |W, H| cfl::<P, W, H, GEN, _>(
@@ -1360,7 +1411,7 @@ mod rust_simd {
         let (dx, max, upsample) =
             z1_edge::<BD, true>(&mut e, topleft, off, width, height, angle, bd);
         let (w, h, dx) = (width as usize, height as usize, dx as usize);
-        let block = &mut Block::<BD>::new(dst);
+        let block = &mut Block::<BD>::new(dst, w, h);
         with_px!(BD, |P| {
             let e = edge_px::<P, EXT>(e.as_bytes_mut());
             match (w, upsample) {
@@ -1537,7 +1588,7 @@ mod rust_simd {
             bd,
         );
         let (dx, dy) = (dx as usize, dy as usize);
-        let block = &mut Block::<BD>::new(dst);
+        let block = &mut Block::<BD>::new(dst, width as usize, height as usize);
         with_px!(BD, |P| {
             let edge = edge_px::<P, { 64 + 64 + 1 }>(edge.as_bytes_mut());
             by_size!(width, height, |W, H| z2::<P, W, H, _>(
@@ -1563,7 +1614,7 @@ mod rust_simd {
         let mut left = [0.into(); 64 + 64];
         let (dy, left_off, max, upsample) =
             z3_edge::<BD, true>(&mut left, topleft, off, width, height, angle, bd);
-        let block = &mut Block::<BD>::new(dst);
+        let block = &mut Block::<BD>::new(dst, width as usize, height as usize);
         with_px!(BD, |P| {
             let left = px::<P>(left.as_bytes());
             let mut e = [P::default(); EXT];

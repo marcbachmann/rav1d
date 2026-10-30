@@ -32,7 +32,8 @@ impl I16x8 {
     /// Bytes `b[..4]` zero-extended into the low four lanes.
     #[inline(always)]
     pub fn from_u8x4(b: &[u8]) -> Self {
-        Self::from_u8x8(&[b[0], b[1], b[2], b[3], 0, 0, 0, 0])
+        let v = u32::from_le_bytes(b[..4].try_into().unwrap()) as u64;
+        Self::from_u8x8(&v.to_le_bytes())
     }
 
     /// Little-endian lanes from `b[..8]` into the low four lanes.
@@ -428,6 +429,35 @@ pub fn transpose8x8<V: Lanes>(v: &mut [V; 8]) {
     for i in 0..4 {
         v[2 * i] = b[i].zip_lo64(b[i + 4]);
         v[2 * i + 1] = b[i].zip_hi64(b[i + 4]);
+    }
+}
+
+/// The sum of `b[..N]`, `N` a power of two from 4 to 64: one `psadbw` per 16 bytes.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn sum_u8<const N: usize>(b: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let b = &b[..N];
+    // SAFETY: SSE2 is the x86_64 baseline and checked with SSE4.1 on x86; the loads read `b`.
+    unsafe {
+        let z = _mm_setzero_si128();
+        let s = match N {
+            4 => _mm_cvtsi32_si128(i32::from_le_bytes(b[..4].try_into().unwrap())),
+            8 => _mm_loadl_epi64(b.as_ptr().cast()),
+            _ => _mm_loadu_si128(b.as_ptr().cast()),
+        };
+        let mut s = _mm_sad_epu8(s, z);
+        for i in 1..N / 16 {
+            s = _mm_add_epi32(s, _mm_sad_epu8(_mm_loadu_si128(b[16 * i..].as_ptr().cast()), z));
+        }
+        if N >= 16 {
+            s = _mm_add_epi32(s, _mm_unpackhi_epi64(s, s));
+        }
+        _mm_cvtsi128_si32(s) as u32
     }
 }
 
