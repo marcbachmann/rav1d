@@ -35,7 +35,7 @@ jobs:
           packages: meson gcc-multilib
           version: 4.0 # version of cache to load
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -67,7 +67,7 @@ jobs:
       - name: upload build artifacts
         # don't upload artifacts for all the test variants to keep names unique
         if: ${{ !cancelled() && matrix.variant == '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: meson-test-logs-${{ matrix.target }}-${{ matrix.build.name }}
           path: |
@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -102,7 +102,7 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: 1
         run: brew install meson
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -128,7 +128,7 @@ jobs:
               ${{ github.workspace }}/build/meson-logs/testlog-x86_64-apple-darwin.txt
       - name: upload build artifacts
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: meson-test-logs-x86_64-apple-darwin
           path: |
@@ -137,7 +137,7 @@ jobs:
     runs-on: windows-2022
     steps:
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -169,7 +169,7 @@ jobs:
           packages: meson
           version: 4.0 # version of cache to load
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -183,7 +183,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: cache argon test vectors
         id: cache-argon
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             tests/argon
@@ -229,7 +229,7 @@ jobs:
       - name: install prerequisites
         run: sudo apt-get install -y meson
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -256,7 +256,7 @@ jobs:
               ${{ matrix.variant }}
       - name: upload build artifacts
         if: ${{ !cancelled() && matrix.variant == '' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: meson-test-logs-aarch64-unknown-linux-gnu
           path: |
@@ -273,7 +273,7 @@ jobs:
         run: |
           brew install meson
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -329,7 +329,7 @@ jobs:
               ${{ github.workspace }}/build/meson-logs/testlog-aarch64-apple-darwin-${{ matrix.build.name }}.txt
       - name: upload build artifacts
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: meson-test-logs-aarch64-apple-darwin-${{ matrix.build.name }}
           path: |
@@ -342,7 +342,7 @@ jobs:
         run: |
             echo "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -366,7 +366,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -399,7 +399,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: git checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
       - name: install rust toolchain
@@ -421,7 +421,7 @@ jobs:
               sudo apt-get install -y linux-tools-common linux-tools-$(uname -r)
               sudo sysctl kernel.perf_event_paranoid=1
           - name: git checkout
-            uses: actions/checkout@v4
+            uses: actions/checkout@v7
           - name: install rust toolchain
             id: toolchain
             uses: dtolnay/rust-toolchain@master
@@ -464,7 +464,7 @@ jobs:
               REMOTE_URL: http://download.opencontent.netflix.com.s3.amazonaws.com/AV1/Chimera/Old/Chimera-AV1-10bit-1920x1080-6191kbps.ivf
               LOCAL_FILE: /tmp/rav1d/Chimera-AV1-10bit-1920x1080-6191kbps.ivf
           - name: upload benchmark data
-            uses: actions/upload-artifact@v4
+            uses: actions/upload-artifact@v7
             with:
               name: perf-data
               path:  ${{ github.workspace }}/perf.data.*
