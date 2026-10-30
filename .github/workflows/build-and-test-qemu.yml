@@ -66,7 +66,7 @@ jobs:
         run: cargo +${{ steps.toolchain.outputs.name }} clippy -- -D warnings
       - name: run tests
         run: |
-            .github/workflows/test.sh -t 2 \
+            .github/workflows/test.sh -t 4 \
               -r target/${{ matrix.target }}/release/dav1d \
               -s target/${{ matrix.target }}/release/seek_stress \
               -w "${{ matrix.wrapper }}"

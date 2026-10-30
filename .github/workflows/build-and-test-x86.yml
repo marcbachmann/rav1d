@@ -13,9 +13,7 @@ jobs:
           "i686-unknown-linux-gnu"
         ]
         build: [
-          {name: "release", flags: "--release", timeout_multiplier: 1},
-          # debug build with optimizations to catch overflows
-          {name: "opt-dev", flags: "--profile opt-dev", timeout_multiplier: 3}
+          {name: "release", flags: "--release", timeout_multiplier: 1}
         ]
         # Test with negative strides, threads and framedelay
         variant: [

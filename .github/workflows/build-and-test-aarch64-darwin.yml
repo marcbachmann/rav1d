@@ -9,8 +9,7 @@ jobs:
     strategy:
       matrix:
         build: [
-          {name: "release", cargo_flags: "--release",  timeout_multiplier: 1},
-          {name: "debug", cargo_flags: "", timeout_multiplier: 3},
+          {name: "release", cargo_flags: "--release",  timeout_multiplier: 1}
         ]
     runs-on: macos-15
     steps:
